@@ -166,6 +166,10 @@ agent-pocket pair --reset    # Fix pairing issues
 
 Issues and pull requests are welcome — please [open an issue](https://github.com/928PJY/agent-pocket-daemon/issues) before starting on anything substantial so we can align on direction.
 
+- [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, test, commit, release flow
+- [ARCHITECTURE.md](ARCHITECTURE.md) — internal layout and how the pieces fit together
+- [SECURITY.md](SECURITY.md) — private vulnerability disclosure
+
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE)
