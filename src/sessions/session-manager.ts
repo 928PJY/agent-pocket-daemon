@@ -709,6 +709,10 @@ export class SessionManager extends EventEmitter {
    * Remove a session from tracking entirely (e.g. after /clear replaces it).
    */
   removeSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    this.cleanupSession(session);
     this.sessions.delete(sessionId);
   }
 
