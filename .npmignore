@@ -1,0 +1,11 @@
+src/
+test/
+test-e2e.mjs
+tsconfig.json
+docs/
+.github/
+.gitignore
+*.log
+*.tsbuildinfo
+.env
+.env.*
