@@ -1,0 +1,80 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Before submitting, please check the [open issues](https://github.com/928PJY/agent-pocket-daemon/issues) to see if it's already being tracked.
+
+        > **Security issue?** Please don't file it here — see [SECURITY.md](https://github.com/928PJY/agent-pocket-daemon/blob/main/SECURITY.md) for the private disclosure path.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+      placeholder: |
+        I ran `agent-pocket start` and ...
+        I expected ...
+        Instead, ...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps that reliably trigger the bug.
+      placeholder: |
+        1. `npm install -g agent-pocket@0.1.0`
+        2. `agent-pocket start`
+        3. Open Claude Code in iTerm
+        4. ...
+    validations:
+      required: true
+  - type: input
+    id: daemon-version
+    attributes:
+      label: Daemon version
+      description: Output of `agent-pocket --version`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`
+      placeholder: "v20.11.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 14.4 (Apple Silicon)
+    validations:
+      required: true
+  - type: dropdown
+    id: terminal
+    attributes:
+      label: Terminal (if relevant)
+      options:
+        - Not applicable
+        - iTerm2
+        - tmux
+        - VS Code integrated terminal
+        - Terminal.app
+        - Other (describe in "What happened")
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon logs
+      description: |
+        Output of `agent-pocket logs --trace | tail -100` around the time of the bug.
+        Please redact any pairing tokens, peer IDs, or other sensitive identifiers.
+      render: text
+    validations:
+      required: false
