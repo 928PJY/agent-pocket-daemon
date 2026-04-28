@@ -31,15 +31,9 @@ Walk away from your desk — your session continues on your phone. Come back —
 
 When Claude spawns a team of agents, Agent Pocket gives you a visual overview of the entire multi-agent workflow — agent hierarchy, task assignments, progress, and inter-agent communication — all in a native iOS interface.
 
-## 📲 iOS App
+## 📲 Mobile App
 
-<p align="center">
-  <a href="https://apps.apple.com/app/pocket-agent/id0000000000">
-    <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" height="50" />
-  </a>
-</p>
-
-> Currently in TestFlight beta. Contact the developer for access.
+> Currently in TestFlight beta for iOS. [Open an issue](https://github.com/928PJY/agent-pocket-daemon/issues) or contact the developer for access. Android client on the roadmap.
 
 ## 📋 Requirements
 
@@ -53,10 +47,31 @@ When Claude spawns a team of agents, Agent Pocket gives you a visual overview of
 ```bash
 npm install -g agent-pocket
 agent-pocket start
-# Scan the QR code with the iOS app → verify the 6-digit code → done
+# Scan the QR code with the mobile app → verify the 6-digit code → done
 ```
 
 The daemon runs in the background. Open Claude Code in any terminal — it appears in the app automatically.
+
+### Build from source
+
+```bash
+git clone https://github.com/928PJY/agent-pocket-daemon.git
+cd agent-pocket-daemon
+npm install
+npm run build
+npm link              # exposes `agent-pocket` globally
+agent-pocket start
+```
+
+## 🔧 Configuration
+
+By default the daemon connects to the public relay at `wss://www.agent-pocket.com`. To point at your own relay, pass `--relay-url`:
+
+```bash
+agent-pocket pair --reset --relay-url wss://your-relay.example.com
+```
+
+The selected relay URL is persisted to `~/.agent-pocket/config.json` and reused on subsequent `start` invocations. See [the relay server source](https://github.com/928PJY/agent-pocket) (coming soon as a separate open-source repo) if you'd like to self-host.
 
 ## ✨ Features
 
@@ -142,10 +157,15 @@ agent-pocket pair --reset    # Fix pairing issues
 
 ## 🗺️ Roadmap
 
-- 🪟 **Windows support** — Daemon for Windows with PowerShell/Windows Terminal injection
+- 🪟 **Windows / Linux support** — Daemon for Windows and Linux with appropriate terminal injection
 - 🤖 **Gemini CLI / Codex** — Support for additional AI coding agents
 - 📱 **Android app** — Agent Pocket for Android
+- 🛰️ **Self-hostable relay** — Open-source relay server so you can run your own infrastructure
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome — please [open an issue](https://github.com/928PJY/agent-pocket-daemon/issues) before starting on anything substantial so we can align on direction.
 
 ## 📄 License
 
-MIT
+MIT — see [LICENSE](LICENSE)
