@@ -8,6 +8,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
+import { gcSessionMapEntries, removeSessionMapEntriesConservatively, type SessionMap } from './sessions/session-map-gc.js';
 import { RelayClient } from './relay/relay-client.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
@@ -2848,28 +2849,20 @@ export class AgentPocketDaemon extends EventEmitter {
     try {
       if (!fs.existsSync(mapFile)) return;
       const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number; transcript_path?: string }>;
-      const removed: string[] = [];
-      for (const [sid, entry] of Object.entries(map)) {
-        let dead = false;
-        // pid<=0 means the hook couldn't resolve a real Claude PID; the
-        // entry can never match a live process, so drop it.
-        if (!entry.pid || entry.pid <= 0) {
-          dead = true;
-        } else {
-          try { process.kill(entry.pid, 0); } catch { dead = true; }
-        }
-        if (!dead && entry.transcript_path && !fs.existsSync(entry.transcript_path)) {
-          dead = true;
-        }
-        if (dead) {
-          delete map[sid];
-          removed.push(sid);
-        }
-      }
-      if (removed.length > 0) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.debug('daemon', 'GC session-map', { removed: removed.length });
+      const result = gcSessionMapEntries(JSON.parse(raw) as SessionMap, {
+        now: Date.now(),
+        isPidAlive: (pid) => {
+          try { process.kill(pid, 0); return true; } catch { return false; }
+        },
+        transcriptExists: (transcriptPath) => fs.existsSync(transcriptPath),
+      });
+      if (result.changed) {
+        fs.writeFileSync(mapFile, JSON.stringify(result.map), 'utf-8');
+        logger.debug('daemon', 'GC session-map', {
+          removed: result.removed,
+          markedMissing: result.markedMissing,
+          markedDead: result.markedDead,
+        });
       }
     } catch {
       // Best effort
@@ -2884,18 +2877,19 @@ export class AgentPocketDaemon extends EventEmitter {
     try {
       if (!fs.existsSync(mapFile)) return;
       const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number }>;
       const deadSet = new Set(deadPids);
-      let changed = false;
-      for (const [sid, entry] of Object.entries(map)) {
-        if (entry.pid && deadSet.has(entry.pid)) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Cleaned session-map entries for dead PIDs', { deadPids });
+      const result = gcSessionMapEntries(JSON.parse(raw) as SessionMap, {
+        now: Date.now(),
+        isPidAlive: (pid) => !deadSet.has(pid),
+        transcriptExists: (transcriptPath) => fs.existsSync(transcriptPath),
+      });
+      if (result.changed) {
+        fs.writeFileSync(mapFile, JSON.stringify(result.map), 'utf-8');
+        logger.trace('daemon', 'Cleaned session-map entries for dead PIDs', {
+          deadPids,
+          removed: result.removed,
+          markedDead: result.markedDead,
+        });
       }
     } catch {
       // Best effort
@@ -2910,17 +2904,13 @@ export class AgentPocketDaemon extends EventEmitter {
     try {
       if (!fs.existsSync(mapFile)) return;
       const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, unknown>;
-      let changed = false;
-      for (const sid of sessionIds) {
-        if (sid in map) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Removed stale session-map entries', { sessionIds });
+      const result = removeSessionMapEntriesConservatively(JSON.parse(raw) as SessionMap, sessionIds);
+      if (result.changed) {
+        fs.writeFileSync(mapFile, JSON.stringify(result.map), 'utf-8');
+        logger.trace('daemon', 'Removed stale session-map entries', {
+          requested: sessionIds,
+          removed: result.removed,
+        });
       }
     } catch {
       // Best effort
