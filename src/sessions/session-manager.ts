@@ -25,6 +25,8 @@ import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterr
 import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { logger } from '../logger.js';
 
+const OBSERVED_RUNNING_STALE_MS = 10 * 60 * 1000;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -186,6 +188,7 @@ export class SessionManager extends EventEmitter {
    * Get all active sessions.
    */
   getAllSessions(): SessionState[] {
+    this.reconcileObservedSessionLiveness();
     return Array.from(this.sessions.values());
   }
 
@@ -781,6 +784,25 @@ export class SessionManager extends EventEmitter {
   private generateSessionId(): string {
     this.sessionCounter++;
     return `session_${Date.now()}_${this.sessionCounter}`;
+  }
+
+  private reconcileObservedSessionLiveness(now = Date.now()): void {
+    for (const session of this.sessions.values()) {
+      if (!session.isObserved) continue;
+      if (session.status !== SessionStatus.RUNNING) continue;
+      if (session.pendingPermissions.size > 0) continue;
+
+      const idleMs = now - session.lastActivity;
+      if (idleMs < OBSERVED_RUNNING_STALE_MS) continue;
+
+      session.status = SessionStatus.READY;
+      this.emit('session_status', session.sessionId, SessionStatus.READY);
+      logger.warn('session-manager', 'Marked stale observed session ready after no output', {
+        sessionId: session.sessionId,
+        idleMs,
+        thresholdMs: OBSERVED_RUNNING_STALE_MS,
+      });
+    }
   }
 
   private buildQueryOptions(state: SessionState, config: SessionConfig) {
