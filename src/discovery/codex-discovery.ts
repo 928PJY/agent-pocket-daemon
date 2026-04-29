@@ -114,7 +114,11 @@ export class CodexDiscovery {
   getSession(threadOrSessionId: string): CodexSession | undefined {
     const threadId = codexThreadIdFromSessionId(threadOrSessionId);
     const cached = this.cachedSessions ?? this.discoverSessions();
-    return cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
+    const session = cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
+    if (session) return session;
+
+    const refreshed = this.discoverSessions();
+    return refreshed.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
   }
 
   discoverLiveSessions(sessions = this.cachedSessions ?? this.discoverSessions()): Map<string, CodexLiveSession> {
@@ -123,25 +127,11 @@ export class CodexDiscovery {
     const live = new Map<string, CodexLiveSession>();
 
     for (const pid of findCodexPids()) {
-      // Codex TUI can hold multiple rollout files open for one process. The
-      // newest mtime is our best approximation of the thread currently in focus.
-      const openedRollouts = findOpenCodexRollouts(pid, this.codexDir)
-        .map((openedPath) => {
-          const session = byRolloutPath.get(normalizePath(openedPath));
-          const lastActivityMs = session ? getCodexRolloutMtimeMs(session.rolloutPath) : undefined;
-          return session && lastActivityMs !== undefined ? { session, lastActivityMs } : null;
-        })
-        .filter((entry): entry is { session: CodexSession; lastActivityMs: number } => entry !== null)
-        .sort((a, b) => b.lastActivityMs - a.lastActivityMs);
-      const current = openedRollouts[0];
-      if (!current || live.has(current.session.sessionId)) continue;
-      live.set(current.session.sessionId, {
-        sessionId: current.session.sessionId,
-        threadId: current.session.threadId,
-        pid,
-        rolloutPath: current.session.rolloutPath,
-        lastActivityMs: current.lastActivityMs,
-      });
+      for (const liveSession of codexLiveSessionsFromOpenedRollouts(pid, findOpenCodexRollouts(pid, this.codexDir), byRolloutPath)) {
+        if (!live.has(liveSession.sessionId)) {
+          live.set(liveSession.sessionId, liveSession);
+        }
+      }
     }
 
     return live;
@@ -209,6 +199,30 @@ export class CodexDiscovery {
       return { messages: [], totalCount: 0, offset, hasMore: false };
     }
   }
+}
+
+export function codexLiveSessionsFromOpenedRollouts(
+  pid: number,
+  openedPaths: string[],
+  byRolloutPath: Map<string, CodexSession>,
+): CodexLiveSession[] {
+  const live: CodexLiveSession[] = [];
+  const seen = new Set<string>();
+  for (const openedPath of openedPaths) {
+    const session = byRolloutPath.get(normalizePath(openedPath));
+    if (!session || seen.has(session.sessionId)) continue;
+    const lastActivityMs = getCodexRolloutMtimeMs(session.rolloutPath);
+    if (lastActivityMs === undefined) continue;
+    seen.add(session.sessionId);
+    live.push({
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      pid,
+      rolloutPath: session.rolloutPath,
+      lastActivityMs,
+    });
+  }
+  return live;
 }
 
 export function codexStateDbReadonlyUri(stateDb: string): string {

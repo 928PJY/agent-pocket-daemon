@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
+  codexLiveSessionsFromOpenedRollouts,
   codexStateDbReadonlyUri,
   codexHistoryMessageToEvent,
   codexExternalSessionId,
@@ -71,6 +75,38 @@ test('parseCodexHistoryEntry maps Codex response items to history messages', () 
 
 test('codexExternalSessionId namespaces Codex thread IDs', () => {
   assert.equal(codexExternalSessionId('thread-1'), 'codex:thread-1');
+});
+
+test('codexLiveSessionsFromOpenedRollouts keeps sibling rollouts for one PID', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-live-'));
+  try {
+    const rolloutA = path.join(dir, 'rollout-a.jsonl');
+    const rolloutB = path.join(dir, 'rollout-b.jsonl');
+    fs.writeFileSync(rolloutA, '{}\n');
+    fs.writeFileSync(rolloutB, '{}\n');
+
+    const byRolloutPath = new Map([
+      [path.resolve(rolloutA), {
+        threadId: 'thread-a',
+        sessionId: 'codex:thread-a',
+        rolloutPath: rolloutA,
+        cwd: dir,
+      }],
+      [path.resolve(rolloutB), {
+        threadId: 'thread-b',
+        sessionId: 'codex:thread-b',
+        rolloutPath: rolloutB,
+        cwd: dir,
+      }],
+    ]);
+
+    const live = codexLiveSessionsFromOpenedRollouts(1234, [rolloutA, rolloutB], byRolloutPath);
+
+    assert.deepEqual(live.map((session) => session.sessionId).sort(), ['codex:thread-a', 'codex:thread-b']);
+    assert.equal(live.every((session) => session.pid === 1234), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('codexHistoryMessageToEvent maps history messages to phone events', () => {

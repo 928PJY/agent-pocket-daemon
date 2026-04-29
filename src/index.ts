@@ -1875,7 +1875,7 @@ export class AgentPocketDaemon extends EventEmitter {
           const live = liveSessions.has(session.sessionId);
           const nextStatus = live
             ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
-            : SessionStatus.HISTORY;
+            : existing.status;
           if (existing.status !== nextStatus) {
             existing.status = nextStatus;
             existing.lastActivity = Date.now();
@@ -2629,7 +2629,7 @@ export class AgentPocketDaemon extends EventEmitter {
       }
 
       // ── Phase 4: Codex history/observe sessions ──
-      const codexSessions = this.codexDiscovery.getCachedSessions() ?? this.codexDiscovery.discoverSessions();
+      const codexSessions = this.codexDiscovery.discoverSessions();
       const liveCodexSessions = this.codexDiscovery.discoverLiveSessions(codexSessions);
       for (const codex of codexSessions) {
         if (claimedSessionIds.has(codex.sessionId)) continue;
@@ -2638,9 +2638,6 @@ export class AgentPocketDaemon extends EventEmitter {
         const codexStatus = liveCodex
           ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
           : observed?.status ?? SessionStatus.HISTORY;
-        if (observed && !liveCodex && observed.status === SessionStatus.RUNNING) {
-          observed.status = SessionStatus.HISTORY;
-        }
         const terminal = this.codexTerminalTargets.get(codex.sessionId);
         const capabilities = this.getCodexCapabilities(codex.sessionId);
         allSessions.push({
