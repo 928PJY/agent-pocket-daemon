@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
 import { RelayClient } from './relay/relay-client.js';
@@ -136,6 +137,16 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function detectClaudeVersion(): string | undefined {
+  try {
+    const output = execFileSync('claude', ['--version'], { encoding: 'utf-8', timeout: 2000 }).trim();
+    const match = output.match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/);
+    return match?.[1] ?? (output || undefined);
+  } catch {
+    return undefined;
+  }
+}
+
 export class AgentPocketDaemon extends EventEmitter {
   private config: DaemonConfig;
   private sessionManager: SessionManager;
@@ -144,6 +155,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private sessionDiscovery: SessionDiscovery;
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
+  private claudeAgentVersion?: string;
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
@@ -244,6 +256,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
     this.sessionDiscovery = new SessionDiscovery();
     this.codexDiscovery = new CodexDiscovery();
+    this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
   }
 
@@ -386,6 +399,7 @@ export class AgentPocketDaemon extends EventEmitter {
         project_name: customTitle ?? path.basename(workingDirectory),
         agent_type: 'claude_code',
         agent_display_name: 'Claude Code',
+        agent_version: this.claudeAgentVersion,
         capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
       };
 
@@ -1642,13 +1656,31 @@ export class AgentPocketDaemon extends EventEmitter {
   private discoverAndObserveCodexSessions(): void {
     try {
       const sessions = this.codexDiscovery.discoverSessions();
+      const liveSessions = this.codexDiscovery.discoverLiveSessions(sessions);
       for (const session of sessions) {
-        if (this.codexObservers.has(session.sessionId)) continue;
+        const existing = this.codexObservers.get(session.sessionId);
+        if (existing) {
+          const live = liveSessions.has(session.sessionId);
+          const nextStatus = live ? SessionStatus.RUNNING : SessionStatus.HISTORY;
+          if (existing.status !== nextStatus) {
+            existing.status = nextStatus;
+            existing.lastActivity = Date.now();
+            if (this.initialDiscoveryDone) {
+              this.sendToPhone({
+                type: 'session_status',
+                session_id: session.sessionId,
+                status: nextStatus,
+              } as unknown as PcEvent);
+            }
+          }
+          continue;
+        }
         const observer = new CodexObserver(session.sessionId, session.rolloutPath);
+        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.RUNNING : SessionStatus.HISTORY;
         const tracked = {
           observer,
           session,
-          status: SessionStatus.HISTORY,
+          status: initialStatus,
           lastActivity: session.updatedAtMs ?? Date.now(),
         };
         this.codexObservers.set(session.sessionId, tracked);
@@ -2278,6 +2310,7 @@ export class AgentPocketDaemon extends EventEmitter {
             session_id: externalId,
             agent_type: 'claude_code',
             agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
             capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
             status: effectiveStatus,
             action_type: actionType,
@@ -2331,6 +2364,7 @@ export class AgentPocketDaemon extends EventEmitter {
             session_id: pidInfo.sessionId,
             agent_type: 'claude_code',
             agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
             capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
             status: SessionStatus.READY,
             working_directory: pidInfo.cwd,
@@ -2355,6 +2389,7 @@ export class AgentPocketDaemon extends EventEmitter {
             session_id: discovered.sessionId,
             agent_type: 'claude_code',
             agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
             capabilities: ['observe'],
             status: SessionStatus.HISTORY,
             working_directory: discovered.projectDir,
@@ -2368,9 +2403,17 @@ export class AgentPocketDaemon extends EventEmitter {
 
       // ── Phase 4: Codex history/observe sessions ──
       const codexSessions = this.codexDiscovery.getCachedSessions() ?? this.codexDiscovery.discoverSessions();
+      const liveCodexSessions = this.codexDiscovery.discoverLiveSessions(codexSessions);
       for (const codex of codexSessions) {
         if (claimedSessionIds.has(codex.sessionId)) continue;
         const observed = this.codexObservers.get(codex.sessionId);
+        const liveCodex = liveCodexSessions.get(codex.sessionId);
+        const codexStatus = liveCodex
+          ? (observed?.status === SessionStatus.PENDING_ACTIONS ? SessionStatus.PENDING_ACTIONS : SessionStatus.RUNNING)
+          : observed?.status ?? SessionStatus.HISTORY;
+        if (observed && !liveCodex && observed.status === SessionStatus.RUNNING) {
+          observed.status = SessionStatus.HISTORY;
+        }
         allSessions.push({
           entry: {
             session_id: codex.sessionId,
@@ -2378,11 +2421,12 @@ export class AgentPocketDaemon extends EventEmitter {
             agent_display_name: 'Codex',
             agent_version: codex.cliVersion,
             capabilities: ['observe'],
-            status: observed?.status ?? SessionStatus.HISTORY,
+            status: codexStatus,
             working_directory: codex.cwd,
             project_name: codex.title ?? path.basename(codex.cwd),
             last_activity: observed?.lastActivity ?? codex.updatedAtMs,
             entrypoint: 'codex-cli',
+            pid: liveCodex?.pid,
           },
           historyKey: codex.sessionId,
         });

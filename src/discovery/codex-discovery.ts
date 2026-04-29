@@ -22,6 +22,13 @@ export interface CodexSession {
   model?: string;
 }
 
+export interface CodexLiveSession {
+  sessionId: string;
+  threadId: string;
+  pid: number;
+  rolloutPath: string;
+}
+
 export function isCodexSessionId(sessionId: string): boolean {
   return sessionId.startsWith(CODEX_PREFIX);
 }
@@ -105,6 +112,27 @@ export class CodexDiscovery {
     return cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
   }
 
+  discoverLiveSessions(sessions = this.cachedSessions ?? this.discoverSessions()): Map<string, CodexLiveSession> {
+    if (sessions.length === 0) return new Map();
+    const byRolloutPath = new Map(sessions.map((s) => [normalizePath(s.rolloutPath), s]));
+    const live = new Map<string, CodexLiveSession>();
+
+    for (const pid of findCodexPids()) {
+      for (const openedPath of findOpenCodexRollouts(pid, this.codexDir)) {
+        const session = byRolloutPath.get(normalizePath(openedPath));
+        if (!session || live.has(session.sessionId)) continue;
+        live.set(session.sessionId, {
+          sessionId: session.sessionId,
+          threadId: session.threadId,
+          pid,
+          rolloutPath: session.rolloutPath,
+        });
+      }
+    }
+
+    return live;
+  }
+
   getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number }): HistoryPage {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 30;
@@ -167,6 +195,55 @@ export class CodexDiscovery {
       return { messages: [], totalCount: 0, offset, hasMore: false };
     }
   }
+}
+
+export function findCodexPids(): number[] {
+  try {
+    const output = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf-8', timeout: 2000 });
+    return parseCodexProcessList(output);
+  } catch {
+    return [];
+  }
+}
+
+export function parseCodexProcessList(output: string): number[] {
+  const pids: number[] = [];
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = trimmed.match(/^(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isFinite(pid)) continue;
+    const command = match[2];
+    const executable = path.basename(command.split(/\s+/)[0] ?? '');
+    if (executable === 'codex' || executable === 'codex-cli') {
+      pids.push(pid);
+    }
+  }
+  return pids;
+}
+
+export function findOpenCodexRollouts(pid: number, codexDir = path.join(os.homedir(), '.codex')): string[] {
+  try {
+    const output = execFileSync('lsof', ['-p', String(pid), '-Fn'], { encoding: 'utf-8', timeout: 2000 });
+    const prefix = normalizePath(path.join(codexDir, 'sessions')) + path.sep;
+    const paths: string[] = [];
+    for (const line of output.split('\n')) {
+      if (!line.startsWith('n')) continue;
+      const filePath = normalizePath(line.slice(1));
+      if (filePath.startsWith(prefix) && path.basename(filePath).startsWith('rollout-') && filePath.endsWith('.jsonl')) {
+        paths.push(filePath);
+      }
+    }
+    return paths;
+  } catch {
+    return [];
+  }
+}
+
+function normalizePath(filePath: string): string {
+  return path.resolve(filePath);
 }
 
 export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryMessage[] {
