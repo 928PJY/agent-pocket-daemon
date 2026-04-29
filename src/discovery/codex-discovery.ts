@@ -320,9 +320,6 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
     if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'error') {
       return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
     }
-    if (payloadType === 'exec_command_end' && typeof payload.exit_code === 'number' && payload.exit_code !== 0) {
-      return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
-    }
   }
 
   if (type === 'response_item') {

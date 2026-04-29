@@ -101,12 +101,8 @@ test('parseCodexLifecycleEntry detects completed and failed Codex turns', () => 
     timestamp: undefined,
   });
 
-  assert.deepEqual(parseCodexLifecycleEntry({
+  assert.equal(parseCodexLifecycleEntry({
     type: 'event_msg',
     payload: { type: 'exec_command_end', call_id: 'call_2', exit_code: 1, aggregated_output: 'test failed' },
-  }), {
-    type: 'turn_failed',
-    message: 'test failed',
-    timestamp: undefined,
-  });
+  }), null);
 });
