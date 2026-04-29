@@ -7,6 +7,8 @@
 
 export type ConnectionMode = 'relay' | 'lan';
 
+export type AgentType = 'claude_code' | 'codex' | 'gemini' | 'unknown';
+
 // ============================================================================
 // Enums
 // ============================================================================
@@ -259,6 +261,10 @@ export interface SessionStartedEvent {
   request_id: string;
   working_directory: string;
   project_name?: string;
+  agent_type?: AgentType;
+  agent_display_name?: string;
+  agent_version?: string;
+  capabilities?: string[];
 }
 
 export interface SessionOutputEvent {
@@ -266,6 +272,7 @@ export interface SessionOutputEvent {
   session_id: string;
   event: ClaudeEvent;
   timestamp: number;
+  agent_type?: AgentType;
   /**
    * Per-session monotonically increasing sequence number assigned by the
    * daemon when the event is first emitted. Used by the phone to detect
@@ -285,6 +292,7 @@ export interface SessionEndedEvent {
 export interface PermissionRequestEvent {
   type: 'permission_request';
   session_id: string;
+  agent_type?: AgentType;
   request_id: string;
   tool_name: string;
   tool_input: Record<string, unknown>;
@@ -314,6 +322,10 @@ export interface SessionListEvent {
 
 export interface SessionInfo {
   session_id: string;
+  agent_type?: AgentType;
+  agent_display_name?: string;
+  agent_version?: string;
+  capabilities?: string[];
   status: SessionStatus;
   working_directory: string;
   project_name: string;
