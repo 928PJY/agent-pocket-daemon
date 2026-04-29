@@ -14,7 +14,7 @@ import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
 import { isProcessSuspendedOrZombie } from './discovery/session-discovery.js';
-import { CodexDiscovery, codexExternalSessionId, isCodexSessionId } from './discovery/codex-discovery.js';
+import { CodexDiscovery, codexExternalSessionId, findOpenCodexRollouts, isCodexSessionId } from './discovery/codex-discovery.js';
 import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
@@ -1496,10 +1496,12 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private recordCodexHookActivity(request: CodexHookRequest): string {
-    const threadId = request.threadId || request.sessionId;
-    const sessionId = isCodexSessionId(request.sessionId)
+    const hookThreadId = request.threadId || request.sessionId;
+    const requestedSessionId = isCodexSessionId(request.sessionId)
       ? request.sessionId
-      : codexExternalSessionId(threadId);
+      : codexExternalSessionId(hookThreadId);
+    const fallbackSession = this.registerCodexHookSession(request, requestedSessionId);
+    const sessionId = fallbackSession?.sessionId ?? requestedSessionId;
     const existing = this.codexTerminalTargets.get(sessionId);
     const pid = request.codexPid ?? existing?.pid;
     const target = pid ? (findTerminalForPid(pid) ?? existing?.target) : existing?.target;
@@ -1513,7 +1515,7 @@ export class AgentPocketDaemon extends EventEmitter {
       updatedAt: Date.now(),
     });
 
-    const session = this.codexDiscovery.getSession(sessionId);
+    const session = fallbackSession ?? this.codexDiscovery.getSession(sessionId);
     if (session && !this.codexObservers.has(sessionId)) {
       const observer = new CodexObserver(session.sessionId, session.rolloutPath);
       const tracked = {
@@ -1528,6 +1530,38 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     return sessionId;
+  }
+
+  private registerCodexHookSession(request: CodexHookRequest, requestedSessionId: string): CodexSession | undefined {
+    const rolloutPath = this.findCodexHookRolloutPath(request, requestedSessionId);
+    if (!rolloutPath) return undefined;
+    return this.codexDiscovery.registerSessionFromRollout({
+      sessionId: requestedSessionId,
+      threadId: request.threadId,
+      rolloutPath,
+      cwd: request.cwd,
+    });
+  }
+
+  private findCodexHookRolloutPath(request: CodexHookRequest, requestedSessionId: string): string | undefined {
+    if (request.transcriptPath && fs.existsSync(request.transcriptPath)) return request.transcriptPath;
+    if (!request.codexPid) return undefined;
+
+    const requestedThreadId = requestedSessionId.slice('codex:'.length);
+    const opened = findOpenCodexRollouts(request.codexPid);
+    const exact = opened.find((rolloutPath) => path.basename(rolloutPath).includes(requestedThreadId));
+    if (exact) return exact;
+
+    let newest: { rolloutPath: string; mtime: number } | undefined;
+    for (const rolloutPath of opened) {
+      try {
+        const mtime = fs.statSync(rolloutPath).mtimeMs;
+        if (!newest || mtime > newest.mtime) newest = { rolloutPath, mtime };
+      } catch {
+        // Ignore files that disappeared between lsof and stat.
+      }
+    }
+    return newest?.rolloutPath;
   }
 
   private recordCodexStopHook(sessionId: string): void {
@@ -1944,7 +1978,7 @@ export class AgentPocketDaemon extends EventEmitter {
           const live = liveSessions.has(session.sessionId);
           const nextStatus = live
             ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
-            : existing.status;
+            : SessionStatus.HISTORY;
           if (existing.status !== nextStatus) {
             existing.status = nextStatus;
             existing.lastActivity = Date.now();
@@ -2713,9 +2747,9 @@ export class AgentPocketDaemon extends EventEmitter {
         const liveCodex = liveCodexSessions.get(codex.sessionId);
         const codexStatus = liveCodex
           ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
-          : observed?.status ?? SessionStatus.HISTORY;
-        const terminal = this.resolveCodexTerminalTarget(codex.sessionId, liveCodex ?? null);
-        const capabilities = this.getCodexCapabilities(codex.sessionId);
+          : SessionStatus.HISTORY;
+        const terminal = liveCodex ? this.resolveCodexTerminalTarget(codex.sessionId, liveCodex) : undefined;
+        const capabilities = liveCodex ? this.getCodexCapabilities(codex.sessionId) : ['observe'];
         allSessions.push({
           entry: {
             session_id: codex.sessionId,

@@ -4,10 +4,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  CodexDiscovery,
   codexLiveSessionsFromOpenedRollouts,
   codexStateDbReadonlyUri,
   codexHistoryMessageToEvent,
   codexExternalSessionId,
+  extractThreadIdFromRolloutPath,
   parseCodexHistoryEntry,
   parseCodexLifecycleEntry,
   parseCodexProcessList,
@@ -83,13 +85,15 @@ test('codexExternalSessionId namespaces Codex thread IDs', () => {
   assert.equal(codexExternalSessionId('thread-1'), 'codex:thread-1');
 });
 
-test('codexLiveSessionsFromOpenedRollouts keeps sibling rollouts for one PID', () => {
+test('codexLiveSessionsFromOpenedRollouts returns only the newest rollout for one PID', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-live-'));
   try {
     const rolloutA = path.join(dir, 'rollout-a.jsonl');
     const rolloutB = path.join(dir, 'rollout-b.jsonl');
     fs.writeFileSync(rolloutA, '{}\n');
     fs.writeFileSync(rolloutB, '{}\n');
+    fs.utimesSync(rolloutA, new Date(1000), new Date(1000));
+    fs.utimesSync(rolloutB, new Date(2000), new Date(2000));
 
     const byRolloutPath = new Map([
       [path.resolve(rolloutA), {
@@ -108,11 +112,49 @@ test('codexLiveSessionsFromOpenedRollouts keeps sibling rollouts for one PID', (
 
     const live = codexLiveSessionsFromOpenedRollouts(1234, [rolloutA, rolloutB], byRolloutPath);
 
-    assert.deepEqual(live.map((session) => session.sessionId).sort(), ['codex:thread-a', 'codex:thread-b']);
-    assert.equal(live.every((session) => session.pid === 1234), true);
+    assert.deepEqual(live.map((session) => session.sessionId), ['codex:thread-b']);
+    assert.equal(live[0].pid, 1234);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('CodexDiscovery registers hook sessions from rollout before sqlite sees them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-hook-'));
+  try {
+    const codexDir = path.join(dir, '.codex');
+    const sessionsDir = path.join(codexDir, 'sessions', '2026', '04', '29');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const rolloutPath = path.join(sessionsDir, 'rollout-2026-04-29T23-01-05-019dd9c2-079a-79f0-91d2-ba359ad51711.jsonl');
+    fs.writeFileSync(rolloutPath, JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'ready' }],
+      },
+    }) + '\n');
+
+    const discovery = new CodexDiscovery(codexDir);
+    const session = discovery.registerSessionFromRollout({
+      sessionId: 'codex:placeholder',
+      rolloutPath,
+      cwd: dir,
+    });
+
+    assert.equal(session?.threadId, '019dd9c2-079a-79f0-91d2-ba359ad51711');
+    assert.equal(discovery.getSession('codex:019dd9c2-079a-79f0-91d2-ba359ad51711')?.rolloutPath, path.resolve(rolloutPath));
+    assert.equal(discovery.getSessionHistory('codex:019dd9c2-079a-79f0-91d2-ba359ad51711').messages[0].content, 'ready');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('extractThreadIdFromRolloutPath parses Codex rollout filenames', () => {
+  assert.equal(
+    extractThreadIdFromRolloutPath('/tmp/rollout-2026-04-29T23-01-05-019dd9c2-079a-79f0-91d2-ba359ad51711.jsonl'),
+    '019dd9c2-079a-79f0-91d2-ba359ad51711',
+  );
 });
 
 test('codexHistoryMessageToEvent maps history messages to phone events', () => {

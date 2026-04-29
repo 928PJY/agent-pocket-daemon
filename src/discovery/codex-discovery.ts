@@ -49,6 +49,7 @@ export function codexThreadIdFromSessionId(sessionId: string): string {
 export class CodexDiscovery {
   private codexDir: string;
   private cachedSessions: CodexSession[] | null = null;
+  private registeredSessions: Map<string, CodexSession> = new Map();
   private historyCache: Map<string, { messages: HistoryMessage[]; mtime: number }> = new Map();
 
   constructor(codexDir?: string) {
@@ -99,8 +100,8 @@ export class CodexDiscovery {
         })
         .filter((s): s is CodexSession => s !== null);
 
-      this.cachedSessions = sessions;
-      return sessions;
+      this.cachedSessions = this.mergeRegisteredSessions(sessions);
+      return this.cachedSessions;
     } catch (err) {
       logger.warn('codex-discovery', `Codex discovery failed: ${(err as Error).message}`);
       return [];
@@ -111,8 +112,39 @@ export class CodexDiscovery {
     return this.cachedSessions;
   }
 
+  registerSessionFromRollout(input: { sessionId?: string; threadId?: string; rolloutPath: string; cwd?: string; cliVersion?: string; title?: string }): CodexSession | undefined {
+    const rolloutPath = normalizePath(input.rolloutPath);
+    if (!fs.existsSync(rolloutPath)) return undefined;
+
+    const threadId = extractThreadIdFromRolloutPath(rolloutPath)
+      ?? (input.threadId ? codexThreadIdFromSessionId(input.threadId) : undefined)
+      ?? (input.sessionId ? codexThreadIdFromSessionId(input.sessionId) : undefined);
+    if (!threadId) return undefined;
+
+    const stat = fs.statSync(rolloutPath);
+    const existing = this.registeredSessions.get(threadId);
+    const session: CodexSession = {
+      threadId,
+      sessionId: codexExternalSessionId(threadId),
+      rolloutPath,
+      cwd: input.cwd || existing?.cwd || path.dirname(rolloutPath),
+      title: input.title ?? existing?.title,
+      createdAtMs: existing?.createdAtMs ?? stat.birthtimeMs,
+      updatedAtMs: Math.max(existing?.updatedAtMs ?? 0, stat.mtimeMs),
+      cliVersion: input.cliVersion ?? existing?.cliVersion,
+      model: existing?.model,
+    };
+
+    this.registeredSessions.set(threadId, session);
+    this.cachedSessions = this.mergeRegisteredSessions(this.cachedSessions ?? []);
+    return session;
+  }
+
   getSession(threadOrSessionId: string): CodexSession | undefined {
     const threadId = codexThreadIdFromSessionId(threadOrSessionId);
+    const registered = this.registeredSessions.get(threadId);
+    if (registered && fs.existsSync(registered.rolloutPath)) return registered;
+
     const cached = this.cachedSessions ?? this.discoverSessions();
     const session = cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
     if (session) return session;
@@ -199,6 +231,22 @@ export class CodexDiscovery {
       return { messages: [], totalCount: 0, offset, hasMore: false };
     }
   }
+
+  private mergeRegisteredSessions(sessions: CodexSession[]): CodexSession[] {
+    const merged = new Map<string, CodexSession>();
+    for (const session of sessions) {
+      merged.set(session.threadId, session);
+      this.registeredSessions.delete(session.threadId);
+    }
+    for (const [threadId, session] of this.registeredSessions) {
+      if (!fs.existsSync(session.rolloutPath)) {
+        this.registeredSessions.delete(threadId);
+        continue;
+      }
+      merged.set(threadId, session);
+    }
+    return Array.from(merged.values()).sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
+  }
 }
 
 export function codexLiveSessionsFromOpenedRollouts(
@@ -206,23 +254,28 @@ export function codexLiveSessionsFromOpenedRollouts(
   openedPaths: string[],
   byRolloutPath: Map<string, CodexSession>,
 ): CodexLiveSession[] {
-  const live: CodexLiveSession[] = [];
-  const seen = new Set<string>();
+  let current: CodexLiveSession | undefined;
   for (const openedPath of openedPaths) {
     const session = byRolloutPath.get(normalizePath(openedPath));
-    if (!session || seen.has(session.sessionId)) continue;
+    if (!session) continue;
     const lastActivityMs = getCodexRolloutMtimeMs(session.rolloutPath);
     if (lastActivityMs === undefined) continue;
-    seen.add(session.sessionId);
-    live.push({
+    const candidate = {
       sessionId: session.sessionId,
       threadId: session.threadId,
       pid,
       rolloutPath: session.rolloutPath,
       lastActivityMs,
-    });
+    };
+    if (!current || candidate.lastActivityMs > current.lastActivityMs) current = candidate;
   }
-  return live;
+  return current ? [current] : [];
+}
+
+export function extractThreadIdFromRolloutPath(rolloutPath: string): string | undefined {
+  const base = path.basename(rolloutPath);
+  const match = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1];
 }
 
 export function codexStateDbReadonlyUri(stateDb: string): string {
