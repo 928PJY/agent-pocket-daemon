@@ -1705,8 +1705,43 @@ export class AgentPocketDaemon extends EventEmitter {
             status: tracked.status,
           } as unknown as PcEvent);
         });
+        observer.on('completed', (summary?: string) => {
+          tracked.status = SessionStatus.READY;
+          tracked.lastActivity = Date.now();
+          if (!this.initialDiscoveryDone) return;
+          const body = summary?.trim() || 'Codex turn finished';
+          this.sendToPhone({
+            type: 'session_status',
+            session_id: session.sessionId,
+            status: SessionStatus.READY,
+            is_completion: true,
+            completion_body: body,
+          } as unknown as PcEvent, true, {
+            type: 'session_completed',
+            session_name: session.title ?? path.basename(session.cwd),
+            body: truncateUtf8(body, 256),
+            sound: 'completion.caf',
+            category: 'SESSION_COMPLETED',
+            session_id: session.sessionId,
+          });
+        });
         observer.on('error', (err: Error) => {
+          tracked.status = SessionStatus.ERROR;
+          tracked.lastActivity = Date.now();
           logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
+          if (!this.initialDiscoveryDone) return;
+          this.sendToPhone({
+            type: 'session_status',
+            session_id: session.sessionId,
+            status: SessionStatus.ERROR,
+          } as unknown as PcEvent, true, {
+            type: 'session_error',
+            session_name: session.title ?? path.basename(session.cwd),
+            body: truncateUtf8(err.message || 'Codex turn failed', 256),
+            sound: 'default',
+            category: 'SESSION_ERROR',
+            session_id: session.sessionId,
+          });
         });
         observer.start();
       }
