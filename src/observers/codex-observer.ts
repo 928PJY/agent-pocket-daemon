@@ -87,14 +87,15 @@ export class CodexObserver extends EventEmitter {
 
   private processEntry(entry: Record<string, unknown>): void {
     const messages = parseCodexHistoryEntry(entry);
-    if (messages.length === 0) return;
-    this.emit('status_change', 'running');
-    for (const message of messages) {
-      const event = codexHistoryMessageToEvent(message);
-      if (event) this.emit('output', event);
+    if (messages.length > 0) {
+      this.emit('status_change', 'running');
+      for (const message of messages) {
+        const event = codexHistoryMessageToEvent(message);
+        if (event) this.emit('output', event);
+      }
     }
     const payload = entry.payload as Record<string, unknown> | undefined;
-    if (entry.type === 'event_msg' && payload?.type === 'exec_command_end') {
+    if (entry.type === 'event_msg' && (payload?.type === 'exec_command_end' || payload?.type === 'turn_completed')) {
       this.emit('status_change', 'ready');
     }
   }

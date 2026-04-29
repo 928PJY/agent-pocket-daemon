@@ -1158,7 +1158,7 @@ async function cmdSessions(): Promise<void> {
     PID: live.pid,
     TTY: getTtyForPid(live.pid) ?? '-',
     'Session ID': session.sessionId.slice(0, 14) + '...',
-    Status: 'running',
+    Status: 'ready',
     Type: 'codex-cli',
     Title: session.title ?? '-',
     CWD: session.cwd.replace(os.homedir(), '~'),

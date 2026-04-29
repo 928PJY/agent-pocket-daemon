@@ -19,6 +19,7 @@ import type { CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
 import type { HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
@@ -1661,7 +1662,9 @@ export class AgentPocketDaemon extends EventEmitter {
         const existing = this.codexObservers.get(session.sessionId);
         if (existing) {
           const live = liveSessions.has(session.sessionId);
-          const nextStatus = live ? SessionStatus.RUNNING : SessionStatus.HISTORY;
+          const nextStatus = live
+            ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
+            : SessionStatus.HISTORY;
           if (existing.status !== nextStatus) {
             existing.status = nextStatus;
             existing.lastActivity = Date.now();
@@ -1676,7 +1679,7 @@ export class AgentPocketDaemon extends EventEmitter {
           continue;
         }
         const observer = new CodexObserver(session.sessionId, session.rolloutPath);
-        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.RUNNING : SessionStatus.HISTORY;
+        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.READY : SessionStatus.HISTORY;
         const tracked = {
           observer,
           session,
@@ -1957,9 +1960,25 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     if (isCodexSessionId(command.session_id)) {
-      const msg = 'Codex remote message is not available until a terminal target is attached for this Codex session.';
-      if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-      this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
+      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
+      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      if (!target) {
+        const msg = liveCodex
+          ? `Codex terminal target not found for PID ${liveCodex.pid}.`
+          : 'Codex session has no live terminal process.';
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
+        this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
+        return;
+      }
+      try {
+        terminalSendMessage(target, command.message);
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
+        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort, pid: liveCodex!.pid });
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
+        this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
+      }
       return;
     }
 
@@ -2232,7 +2251,18 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handleInterruptSession(command: InterruptSessionCommand): void {
     if (isCodexSessionId(command.session_id)) {
-      this.sendError(undefined, 'Codex interrupt is not available until a terminal target is attached for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
+      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
+      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      if (!target) {
+        this.sendError(undefined, 'Codex interrupt is not available because no live terminal target was found for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
+        return;
+      }
+      try {
+        terminalSendInterrupt(target);
+        logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
+      } catch (err) {
+        this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');
+      }
       return;
     }
     try {
@@ -2409,18 +2439,19 @@ export class AgentPocketDaemon extends EventEmitter {
         const observed = this.codexObservers.get(codex.sessionId);
         const liveCodex = liveCodexSessions.get(codex.sessionId);
         const codexStatus = liveCodex
-          ? (observed?.status === SessionStatus.PENDING_ACTIONS ? SessionStatus.PENDING_ACTIONS : SessionStatus.RUNNING)
+          ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
           : observed?.status ?? SessionStatus.HISTORY;
         if (observed && !liveCodex && observed.status === SessionStatus.RUNNING) {
           observed.status = SessionStatus.HISTORY;
         }
+        const codexCapabilities = liveCodex ? ['observe', 'terminal_remote_message', 'terminal_interrupt'] : ['observe'];
         allSessions.push({
           entry: {
             session_id: codex.sessionId,
             agent_type: 'codex',
             agent_display_name: 'Codex',
             agent_version: codex.cliVersion,
-            capabilities: ['observe'],
+            capabilities: codexCapabilities,
             status: codexStatus,
             working_directory: codex.cwd,
             project_name: codex.title ?? path.basename(codex.cwd),
