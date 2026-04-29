@@ -137,3 +137,68 @@ test('HookServer correlates concurrent same-tool permission prompts in FIFO orde
 
   await Promise.all([promptResponse1, promptResponse2]);
 });
+
+test('HookServer removes direct-correlated PreToolUse IDs from the fallback queue', async (t) => {
+  const server = new HookServer(0);
+  const port = await server.start();
+  t.after(() => server.stop());
+
+  const prompts: HookPermissionPrompt[] = [];
+  const dismissed: string[] = [];
+
+  server.on('permission_request', (request) => {
+    server.resolvePermissionEmpty(request.toolUseId);
+  });
+  server.on('permission_prompt', (request) => {
+    prompts.push(request);
+  });
+  server.on('permission_dismissed', (toolUseId) => {
+    dismissed.push(toolUseId);
+  });
+
+  await postHook(port, '/hooks/permission-request', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-direct',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo direct' },
+  });
+  const directPromptResponse = postHook(port, '/hooks/permission-prompt', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-direct',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo direct' },
+  });
+  await waitFor(() => prompts.length === 1);
+  const directPromptId = prompts[0].toolUseId;
+
+  await postHook(port, '/hooks/permission-request', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-fallback',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo fallback' },
+  });
+  const fallbackPromptResponse = postHook(port, '/hooks/permission-prompt', {
+    session_id: 'session-1',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo fallback' },
+  });
+  await waitFor(() => prompts.length === 2);
+  const fallbackPromptId = prompts[1].toolUseId;
+
+  await postHook(port, '/hooks/post-tool-use', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-fallback',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo fallback' },
+    tool_response: { output: 'fallback' },
+  });
+
+  await waitFor(() => dismissed.length === 1);
+  assert.equal(dismissed[0], fallbackPromptId);
+  assert.notEqual(fallbackPromptId, directPromptId);
+  assert.equal(server.hasPendingPermission(fallbackPromptId), false);
+  assert.equal(server.hasPendingPermission(directPromptId), true);
+
+  server.resolvePermissionPrompt(directPromptId, 'allow');
+  await Promise.all([directPromptResponse, fallbackPromptResponse]);
+});
