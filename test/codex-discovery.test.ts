@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   codexStateDbReadonlyUri,
   codexHistoryMessageToEvent,
+  codexExternalSessionId,
   parseCodexHistoryEntry,
   parseCodexLifecycleEntry,
   parseCodexProcessList,
@@ -66,6 +67,10 @@ test('parseCodexHistoryEntry maps Codex response items to history messages', () 
   assert.equal(toolResult[0].role, 'tool_result');
   assert.equal(toolResult[0].toolStatus, 'success');
   assert.equal(toolResult[0].toolResultContent, 'ok');
+});
+
+test('codexExternalSessionId namespaces Codex thread IDs', () => {
+  assert.equal(codexExternalSessionId('thread-1'), 'codex:thread-1');
 });
 
 test('codexHistoryMessageToEvent maps history messages to phone events', () => {

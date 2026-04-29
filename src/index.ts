@@ -14,12 +14,13 @@ import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
 import { isProcessSuspendedOrZombie } from './discovery/session-discovery.js';
-import { CodexDiscovery, isCodexSessionId } from './discovery/codex-discovery.js';
+import { CodexDiscovery, codexExternalSessionId, isCodexSessionId } from './discovery/codex-discovery.js';
 import type { CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
-import type { HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import type { CodexHookRequest, HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
 import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
+import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
@@ -157,6 +158,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
   private claudeAgentVersion?: string;
+  private codexTerminalTargets: Map<string, { pid?: number; target?: TerminalTarget; cwd?: string; transcriptPath?: string; turnId?: string; updatedAt: number }> = new Map();
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
@@ -914,7 +916,10 @@ export class AgentPocketDaemon extends EventEmitter {
 
     this.hookServer.on('permission_expired', (expired: HookPermissionExpired) => {
       const session = this.sessionManager.findByClaudeSessionId(expired.sessionId);
-      const externalId = session
+      const codexExternalId = this.resolveCodexExternalSessionId(expired.sessionId);
+      const externalId = codexExternalId
+        ? codexExternalId
+        : session
         ? this.resolveExternalSessionId(session.sessionId)
         : expired.sessionId;
 
@@ -934,6 +939,100 @@ export class AgentPocketDaemon extends EventEmitter {
         (blocking as any).expiredToTerminal = true;
       }
       logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
+    });
+
+    this.hookServer.on('codex_session_start', (request: CodexHookRequest) => {
+      const sessionId = this.recordCodexHookActivity(request);
+      const tracked = this.codexObservers.get(sessionId);
+      if (tracked) {
+        tracked.status = SessionStatus.READY;
+        tracked.lastActivity = Date.now();
+      }
+      logger.info('daemon', 'Codex SessionStart hook', { sessionId, source: request.source, pid: request.codexPid });
+    });
+
+    this.hookServer.on('codex_user_prompt_submit', (request: CodexHookRequest) => {
+      const sessionId = this.recordCodexHookActivity(request);
+      const tracked = this.codexObservers.get(sessionId);
+      if (tracked) {
+        tracked.status = SessionStatus.RUNNING;
+        tracked.lastActivity = Date.now();
+      }
+      this.sendToPhone({
+        type: 'session_status',
+        session_id: sessionId,
+        status: SessionStatus.RUNNING,
+      } as unknown as PcEvent);
+    });
+
+    this.hookServer.on('codex_stop', (request: CodexHookRequest) => {
+      const sessionId = this.recordCodexHookActivity(request);
+      const tracked = this.codexObservers.get(sessionId);
+      if (tracked) {
+        tracked.status = SessionStatus.READY;
+        tracked.lastActivity = Date.now();
+      }
+      this.sendToPhone({
+        type: 'session_status',
+        session_id: sessionId,
+        status: SessionStatus.READY,
+      } as unknown as PcEvent, true, {
+        type: 'session_completed',
+        session_name: this.getSessionName(sessionId),
+        body: truncateUtf8((request.toolInput?.last_assistant_message as string | undefined)?.trim() || 'Codex turn finished', 256),
+        sound: 'completion.caf',
+        category: 'SESSION_COMPLETED',
+        session_id: sessionId,
+      });
+    });
+
+    this.hookServer.on('codex_permission_request', (request: CodexHookRequest) => {
+      const sessionId = this.recordCodexHookActivity(request);
+      const requestId = request.toolUseId ?? `codex_hook_${Date.now()}`;
+      const toolName = request.toolName ?? 'unknown';
+      const toolInput = request.toolInput ?? {};
+      const riskLevel = (RISK_CLASSIFICATION[toolName] ?? RiskLevel.MEDIUM).toLowerCase();
+      const context = this.buildPermissionContext(toolName, toolInput);
+
+      let pcSignature: string;
+      try {
+        pcSignature = this.cryptoEngine.sign(JSON.stringify({
+          session_id: sessionId,
+          request_id: requestId,
+          tool_name: toolName,
+          seq: this.messageSeq,
+          timestamp: Date.now(),
+        }));
+      } catch {
+        pcSignature = '';
+      }
+
+      const event: PermissionRequestEvent = {
+        type: 'permission_request',
+        session_id: sessionId,
+        request_id: requestId,
+        tool_name: toolName,
+        tool_input: toolInput,
+        risk_level: riskLevel as unknown as RiskLevel,
+        context,
+        pc_signature: pcSignature,
+        seq: this.messageSeq++,
+        timestamp: new Date().toISOString() as unknown as number,
+        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
+        has_always_allow: false,
+      };
+
+      this.sendToPhone(event, true, {
+        type: 'permission_request',
+        session_name: this.getSessionName(sessionId),
+        body: truncateUtf8(`${toolName}: ${context}`, 256),
+        sound: 'default',
+        category: 'PERMISSION_REQUEST',
+        session_id: sessionId,
+        request_id: requestId,
+      });
+      this.trackBlockingRequest(requestId, sessionId, event, 'permission_request');
+      logger.debug('daemon', 'Forwarded Codex PermissionRequest', { tool: toolName, requestId, sessionId });
     });
 
     // Local API: return tracked sessions for CLI `sessions` command
@@ -1377,6 +1476,107 @@ export class AgentPocketDaemon extends EventEmitter {
     });
   }
 
+  private recordCodexHookActivity(request: CodexHookRequest): string {
+    const threadId = request.threadId || request.sessionId;
+    const sessionId = isCodexSessionId(request.sessionId)
+      ? request.sessionId
+      : codexExternalSessionId(threadId);
+    const existing = this.codexTerminalTargets.get(sessionId);
+    const pid = request.codexPid ?? existing?.pid;
+    const target = pid ? (findTerminalForPid(pid) ?? existing?.target) : existing?.target;
+
+    this.codexTerminalTargets.set(sessionId, {
+      pid,
+      target,
+      cwd: request.cwd || existing?.cwd,
+      transcriptPath: request.transcriptPath || existing?.transcriptPath,
+      turnId: request.turnId ?? existing?.turnId,
+      updatedAt: Date.now(),
+    });
+
+    const session = this.codexDiscovery.getSession(sessionId);
+    if (session && !this.codexObservers.has(sessionId)) {
+      const observer = new CodexObserver(session.sessionId, session.rolloutPath);
+      const tracked = {
+        observer,
+        session,
+        status: SessionStatus.READY,
+        lastActivity: Date.now(),
+      };
+      this.codexObservers.set(sessionId, tracked);
+      this.attachCodexObserverHandlers(tracked);
+      observer.start();
+    }
+
+    return sessionId;
+  }
+
+  private resolveCodexExternalSessionId(sessionId: string): string | undefined {
+    if (isCodexSessionId(sessionId)) return sessionId;
+    if (!sessionId) return undefined;
+    const externalId = codexExternalSessionId(sessionId);
+    if (this.codexTerminalTargets.has(externalId)) return externalId;
+    if (this.codexObservers.has(externalId)) return externalId;
+    if (this.codexDiscovery.getSession(externalId)) return externalId;
+    return undefined;
+  }
+
+  private attachCodexObserverHandlers(tracked: { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }): void {
+    const { observer, session } = tracked;
+    observer.on('output', (codexEvent: ClaudeEvent) => {
+      tracked.lastActivity = Date.now();
+      this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
+    });
+    observer.on('status_change', (status: 'running' | 'ready') => {
+      tracked.status = status as SessionStatus;
+      tracked.lastActivity = Date.now();
+      if (!this.initialDiscoveryDone) return;
+      this.sendToPhone({
+        type: 'session_status',
+        session_id: session.sessionId,
+        status: tracked.status,
+      } as unknown as PcEvent);
+    });
+    observer.on('completed', (summary?: string) => {
+      tracked.status = SessionStatus.READY;
+      tracked.lastActivity = Date.now();
+      if (!this.initialDiscoveryDone) return;
+      const body = summary?.trim() || 'Codex turn finished';
+      this.sendToPhone({
+        type: 'session_status',
+        session_id: session.sessionId,
+        status: SessionStatus.READY,
+        is_completion: true,
+        completion_body: body,
+      } as unknown as PcEvent, true, {
+        type: 'session_completed',
+        session_name: session.title ?? path.basename(session.cwd),
+        body: truncateUtf8(body, 256),
+        sound: 'completion.caf',
+        category: 'SESSION_COMPLETED',
+        session_id: session.sessionId,
+      });
+    });
+    observer.on('error', (err: Error) => {
+      tracked.status = SessionStatus.ERROR;
+      tracked.lastActivity = Date.now();
+      logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
+      if (!this.initialDiscoveryDone) return;
+      this.sendToPhone({
+        type: 'session_status',
+        session_id: session.sessionId,
+        status: SessionStatus.ERROR,
+      } as unknown as PcEvent, true, {
+        type: 'session_error',
+        session_name: session.title ?? path.basename(session.cwd),
+        body: truncateUtf8(err.message || 'Codex turn failed', 256),
+        sound: 'default',
+        category: 'SESSION_ERROR',
+        session_id: session.sessionId,
+      });
+    });
+  }
+
   // --------------------------------------------------------------------------
   // Session Discovery & Observation
   // --------------------------------------------------------------------------
@@ -1687,62 +1887,7 @@ export class AgentPocketDaemon extends EventEmitter {
           lastActivity: session.updatedAtMs ?? Date.now(),
         };
         this.codexObservers.set(session.sessionId, tracked);
-
-        observer.on('output', (codexEvent: ClaudeEvent) => {
-          tracked.lastActivity = Date.now();
-          // The phone already renders its own submitted Codex prompt locally.
-          // Suppress the rollout echo so the same user message is not shown twice.
-          if (codexEvent.type === 'user_message') return;
-          this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
-        });
-        observer.on('status_change', (status: 'running' | 'ready') => {
-          tracked.status = status as SessionStatus;
-          tracked.lastActivity = Date.now();
-          if (!this.initialDiscoveryDone) return;
-          this.sendToPhone({
-            type: 'session_status',
-            session_id: session.sessionId,
-            status: tracked.status,
-          } as unknown as PcEvent);
-        });
-        observer.on('completed', (summary?: string) => {
-          tracked.status = SessionStatus.READY;
-          tracked.lastActivity = Date.now();
-          if (!this.initialDiscoveryDone) return;
-          const body = summary?.trim() || 'Codex turn finished';
-          this.sendToPhone({
-            type: 'session_status',
-            session_id: session.sessionId,
-            status: SessionStatus.READY,
-            is_completion: true,
-            completion_body: body,
-          } as unknown as PcEvent, true, {
-            type: 'session_completed',
-            session_name: session.title ?? path.basename(session.cwd),
-            body: truncateUtf8(body, 256),
-            sound: 'completion.caf',
-            category: 'SESSION_COMPLETED',
-            session_id: session.sessionId,
-          });
-        });
-        observer.on('error', (err: Error) => {
-          tracked.status = SessionStatus.ERROR;
-          tracked.lastActivity = Date.now();
-          logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
-          if (!this.initialDiscoveryDone) return;
-          this.sendToPhone({
-            type: 'session_status',
-            session_id: session.sessionId,
-            status: SessionStatus.ERROR,
-          } as unknown as PcEvent, true, {
-            type: 'session_error',
-            session_name: session.title ?? path.basename(session.cwd),
-            body: truncateUtf8(err.message || 'Codex turn failed', 256),
-            sound: 'default',
-            category: 'SESSION_ERROR',
-            session_id: session.sessionId,
-          });
-        });
+        this.attachCodexObserverHandlers(tracked);
         observer.start();
       }
     } catch (err) {
@@ -1998,20 +2143,24 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     if (isCodexSessionId(command.session_id)) {
-      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
-      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      const target = this.codexTerminalTargets.get(command.session_id)?.target;
       if (!target) {
-        const msg = liveCodex
-          ? `Codex terminal target not found for PID ${liveCodex.pid}.`
-          : 'Codex session has no live terminal process.';
+        const msg = 'Codex remote message is not available until a terminal target is attached for this Codex session.';
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
         this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
+        return;
+      }
+      const observed = this.codexObservers.get(command.session_id);
+      if (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS) {
+        const msg = 'Codex session is busy. Wait until the current turn is ready before sending a new message.';
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
+        this.sendError(undefined, msg, 'SESSION_NOT_READY');
         return;
       }
       try {
         terminalSendMessage(target, command.message);
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
-        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort, pid: liveCodex!.pid });
+        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort });
       } catch (err) {
         const msg = (err as Error).message;
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
@@ -2289,14 +2438,18 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handleInterruptSession(command: InterruptSessionCommand): void {
     if (isCodexSessionId(command.session_id)) {
-      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
-      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      const target = this.codexTerminalTargets.get(command.session_id)?.target;
       if (!target) {
-        this.sendError(undefined, 'Codex interrupt is not available because no live terminal target was found for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
+        this.sendError(undefined, 'Codex interrupt is not available until a terminal target is attached for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
         return;
       }
       try {
         terminalSendInterrupt(target);
+        this.sendToPhone({
+          type: 'session_status',
+          session_id: command.session_id,
+          status: SessionStatus.READY,
+        } as unknown as PcEvent);
         logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
       } catch (err) {
         this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');
@@ -2482,20 +2635,23 @@ export class AgentPocketDaemon extends EventEmitter {
         if (observed && !liveCodex && observed.status === SessionStatus.RUNNING) {
           observed.status = SessionStatus.HISTORY;
         }
-        const codexCapabilities = liveCodex ? ['observe', 'terminal_remote_message', 'terminal_interrupt'] : ['observe'];
+        const terminal = this.codexTerminalTargets.get(codex.sessionId);
+        const capabilities = terminal?.target
+          ? ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions']
+          : ['observe'];
         allSessions.push({
           entry: {
             session_id: codex.sessionId,
             agent_type: 'codex',
             agent_display_name: 'Codex',
             agent_version: codex.cliVersion,
-            capabilities: codexCapabilities,
             status: codexStatus,
+            capabilities,
             working_directory: codex.cwd,
             project_name: codex.title ?? path.basename(codex.cwd),
             last_activity: observed?.lastActivity ?? codex.updatedAtMs,
             entrypoint: 'codex-cli',
-            pid: liveCodex?.pid,
+            pid: liveCodex?.pid ?? terminal?.pid,
           },
           historyKey: codex.sessionId,
         });

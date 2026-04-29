@@ -31,6 +31,8 @@ const PID_FILE = path.join(CONFIG_DIR, 'daemon.pid');
 const SESSION_MAP_FILE = path.join(CONFIG_DIR, 'session-map.json');
 const HOOKS_DIR = path.join(CONFIG_DIR, 'hooks');
 const CLAUDE_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json');
+const CODEX_CONFIG_FILE = path.join(os.homedir(), '.codex', 'config.toml');
+const CODEX_HOOKS_FILE = path.join(os.homedir(), '.codex', 'hooks.json');
 
 const DEFAULT_RELAY_URL = 'wss://www.agent-pocket.com';
 
@@ -127,6 +129,7 @@ function isDaemonRunning(): { running: boolean; pid: number | null } {
 
 const MANAGED_BY_TAG = 'agent-pocket';
 const SESSION_START_SCRIPT = path.join(HOOKS_DIR, 'session-start.sh');
+const CODEX_HOOK_SCRIPT = path.join(HOOKS_DIR, 'codex-hook.sh');
 
 interface ManagedHookEntry {
   _managedBy: string;
@@ -145,6 +148,30 @@ function persistentCommandEntry(scriptPath: string, timeout: number): ManagedHoo
     _managedBy: MANAGED_BY_TAG,
     hooks: [{ type: 'command', command: scriptPath, timeout }],
   };
+}
+
+function codexManagedGroup(command: string, timeout: number, statusMessage?: string): Record<string, unknown> {
+  return {
+    matcher: '*',
+    _managedBy: MANAGED_BY_TAG,
+    hooks: [{
+      type: 'command',
+      command,
+      timeout,
+      ...(statusMessage ? { statusMessage } : {}),
+      _managedBy: MANAGED_BY_TAG,
+    }],
+  };
+}
+
+function isCodexManagedGroup(entry: unknown): boolean {
+  if (typeof entry !== 'object' || entry === null) return false;
+  const e = entry as Record<string, unknown>;
+  if (e._managedBy === MANAGED_BY_TAG) return true;
+  const hooks = e.hooks as Array<Record<string, unknown>> | undefined;
+  if (!Array.isArray(hooks)) return false;
+  return hooks.some(h => h._managedBy === MANAGED_BY_TAG
+    || (typeof h.command === 'string' && h.command.includes(CODEX_HOOK_SCRIPT)));
 }
 
 function isHttpManagedEntry(entry: unknown): boolean {
@@ -304,6 +331,111 @@ function installClaudeHooks(hookPort: number): void {
   logger.info('cli', `Installed Claude hooks pointing to port ${hookPort}`);
 }
 
+function installCodexHookScript(hookPort: number): void {
+  fs.mkdirSync(HOOKS_DIR, { recursive: true });
+
+  const script = `#!/bin/bash
+# Agent Pocket — Codex hook bridge
+# Adds process-correlation metadata and forwards Codex hook JSON to the daemon.
+
+ENDPOINT="$1"
+INPUT=$(cat)
+
+CODEX_PID=0
+WALK_PID=$$
+while [ "$WALK_PID" -gt 1 ]; do
+  WALK_PID=$(ps -p "$WALK_PID" -o ppid= 2>/dev/null | tr -d ' ')
+  [ -z "$WALK_PID" ] && break
+  COMM=$(ps -p "$WALK_PID" -o comm= 2>/dev/null | awk '{print $1}')
+  BASE=$(basename "$COMM" 2>/dev/null)
+  if [ "$BASE" = "codex" ]; then
+    CODEX_PID=$WALK_PID
+    break
+  fi
+done
+
+python3 -c '
+import json, os, sys
+payload = json.loads(sys.argv[1] or "{}")
+payload["agent_pocket_hook_pid"] = int(sys.argv[2])
+try:
+    codex_pid = int(sys.argv[3])
+except Exception:
+    codex_pid = 0
+if codex_pid:
+    payload["agent_pocket_codex_pid"] = codex_pid
+print(json.dumps(payload, separators=(",", ":")))
+' "$INPUT" "$$" "$CODEX_PID" | curl -s -X POST -H 'Content-Type: application/json' \
+  --data-binary @- \
+  "http://127.0.0.1:${hookPort}/hooks/codex/$ENDPOINT" \
+  --connect-timeout 1 --max-time 600 || true
+`;
+
+  fs.writeFileSync(CODEX_HOOK_SCRIPT, script, { mode: 0o755 });
+}
+
+function installCodexHooks(hookPort: number): void {
+  installCodexHookScript(hookPort);
+  enableCodexHooksFeature();
+
+  let config: Record<string, unknown> = {};
+  try {
+    if (fs.existsSync(CODEX_HOOKS_FILE)) {
+      config = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')) as Record<string, unknown>;
+    }
+  } catch {
+    config = {};
+  }
+
+  const hooks: Record<string, unknown[]> = (config.hooks && typeof config.hooks === 'object')
+    ? config.hooks as Record<string, unknown[]>
+    : {};
+  const managed: Record<string, Record<string, unknown>> = {
+    SessionStart: codexManagedGroup(`${CODEX_HOOK_SCRIPT} session-start`, 5),
+    UserPromptSubmit: codexManagedGroup(`${CODEX_HOOK_SCRIPT} user-prompt-submit`, 5),
+    PermissionRequest: codexManagedGroup(`${CODEX_HOOK_SCRIPT} permission-request`, 600, 'Waiting for Agent Pocket approval'),
+    Stop: codexManagedGroup(`${CODEX_HOOK_SCRIPT} stop`, 10),
+  };
+
+  for (const [event, entry] of Object.entries(managed)) {
+    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+    hooks[event] = [...existing.filter(e => !isCodexManagedGroup(e)), entry];
+  }
+
+  config.hooks = hooks;
+  fs.mkdirSync(path.dirname(CODEX_HOOKS_FILE), { recursive: true });
+  fs.writeFileSync(CODEX_HOOKS_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  logger.info('cli', `Installed Codex hooks pointing to port ${hookPort}`);
+}
+
+function enableCodexHooksFeature(): void {
+  fs.mkdirSync(path.dirname(CODEX_CONFIG_FILE), { recursive: true });
+  let content = '';
+  try {
+    if (fs.existsSync(CODEX_CONFIG_FILE)) {
+      content = fs.readFileSync(CODEX_CONFIG_FILE, 'utf-8');
+    }
+  } catch {
+    content = '';
+  }
+
+  if (/^codex_hooks\s*=\s*true\s*$/m.test(content)) return;
+  if (/^codex_hooks\s*=\s*false\s*$/m.test(content)) {
+    fs.writeFileSync(CODEX_CONFIG_FILE, content.replace(/^codex_hooks\s*=\s*false\s*$/m, 'codex_hooks = true'), 'utf-8');
+    return;
+  }
+
+  const featuresMatch = content.match(/^\[features\]\s*$/m);
+  if (!featuresMatch || featuresMatch.index === undefined) {
+    const prefix = content.length > 0 && !content.endsWith('\n') ? '\n\n' : content.length > 0 ? '\n' : '';
+    fs.writeFileSync(CODEX_CONFIG_FILE, `${content}${prefix}[features]\ncodex_hooks = true\n`, 'utf-8');
+    return;
+  }
+
+  const insertAt = featuresMatch.index + featuresMatch[0].length;
+  fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, insertAt)}\ncodex_hooks = true${content.slice(insertAt)}`, 'utf-8');
+}
+
 function removeClaudeHooks(): void {
   try {
     if (!fs.existsSync(CLAUDE_SETTINGS_FILE)) return;
@@ -323,6 +455,29 @@ function removeClaudeHooks(): void {
     if (Object.keys(hooks).length === 0) delete settings.hooks;
     fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
     logger.info('cli', 'Removed Claude hooks from settings');
+  } catch {
+    // Best effort
+  }
+}
+
+function removeCodexHooks(): void {
+  try {
+    if (!fs.existsSync(CODEX_HOOKS_FILE)) return;
+    const config = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')) as Record<string, unknown>;
+    const hooks = config.hooks as Record<string, unknown[]> | undefined;
+    if (!hooks || typeof hooks !== 'object') return;
+
+    for (const event of Object.keys(hooks)) {
+      const entries = hooks[event];
+      if (!Array.isArray(entries)) continue;
+      const kept = entries.filter(e => !isCodexManagedGroup(e));
+      if (kept.length === 0) delete hooks[event];
+      else hooks[event] = kept;
+    }
+
+    if (Object.keys(hooks).length === 0) delete config.hooks;
+    fs.writeFileSync(CODEX_HOOKS_FILE, JSON.stringify(config, null, 2), 'utf-8');
+    logger.info('cli', 'Removed Codex hooks from settings');
   } catch {
     // Best effort
   }
@@ -566,6 +721,7 @@ async function runDaemon(flags: Record<string, string>): Promise<void> {
 
   const hookPort = await daemon.start();
   installClaudeHooks(hookPort);
+  installCodexHooks(hookPort);
 
   // Prevent idle sleep
   const caffeinated = spawn('caffeinate', ['-i', '-w', String(process.pid)], {
@@ -582,6 +738,7 @@ async function runDaemon(flags: Record<string, string>): Promise<void> {
     isShuttingDown = true;
     logger.info('cli', `Received ${signal}, shutting down...`);
     removeClaudeHooks();
+    removeCodexHooks();
     await daemon.stop();
     removePidFile();
     logger.info('cli', 'Shutdown complete.');
