@@ -1154,7 +1154,9 @@ export class AgentPocketDaemon extends EventEmitter {
       // the relevant chat isn't on screen. is_completion marks this as the
       // authoritative end-of-turn event (vs. the observer path which can fire
       // a status=ready transition without any completion data).
+      const completionRequestId = `completion_${externalId}_${firedAt}`;
       event.is_completion = true;
+      event.completion_request_id = completionRequestId;
       event.completion_body = completionBody;
       if (subtitle) event.completion_subtitle = subtitle;
 
@@ -1166,6 +1168,7 @@ export class AgentPocketDaemon extends EventEmitter {
         sound: 'completion.caf',
         category: 'SESSION_COMPLETED',
         session_id: externalId,
+        request_id: completionRequestId,
       });
 
       // Also append a chat-side metrics chip (rendered as a system message)
@@ -1586,11 +1589,13 @@ export class AgentPocketDaemon extends EventEmitter {
   private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
     if (!this.initialDiscoveryDone) return;
     const body = summary?.trim() || 'Codex turn finished';
+    const completionRequestId = `completion_${sessionId}_${Date.now()}`;
     this.sendToPhone({
       type: 'session_status',
       session_id: sessionId,
       status: SessionStatus.READY,
       is_completion: true,
+      completion_request_id: completionRequestId,
       completion_body: body,
     } as unknown as PcEvent, true, {
       type: 'session_completed',
@@ -1599,6 +1604,7 @@ export class AgentPocketDaemon extends EventEmitter {
       sound: 'completion.caf',
       category: 'SESSION_COMPLETED',
       session_id: sessionId,
+      request_id: completionRequestId,
     });
   }
 
