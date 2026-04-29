@@ -8,6 +8,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
+import { createSessionListReconcileIndexes, isObservedSessionPidBindingStale } from './sessions/session-list-reconcile.js';
 import { RelayClient } from './relay/relay-client.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
@@ -2227,8 +2228,20 @@ export class AgentPocketDaemon extends EventEmitter {
       for (const r of runningAll) {
         if (r.name) pidNameByPid.set(r.pid, r.name);
       }
+      const reconcileIndexes = createSessionListReconcileIndexes(runningAll);
 
       for (const active of activeSessions) {
+        if (isObservedSessionPidBindingStale(active, reconcileIndexes)) {
+          logger.warn('daemon', 'Skipping stale observed session PID binding in list', {
+            sessionId: active.sessionId,
+            claudeSessionId: active.claudeSessionId,
+            terminalPid: active.terminalPid,
+            livePidSessionId: active.terminalPid ? reconcileIndexes.runningByPid.get(active.terminalPid)?.sessionId : undefined,
+            liveSessionPid: active.claudeSessionId ? reconcileIndexes.runningPidBySessionId.get(active.claudeSessionId) : undefined,
+          });
+          continue;
+        }
+
         const externalId = this.resolveExternalSessionId(active.sessionId);
         const claudeId = active.claudeSessionId ?? externalId;
 
