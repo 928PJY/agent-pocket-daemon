@@ -71,6 +71,12 @@ test('parseCodexHistoryEntry maps Codex response items to history messages', () 
   assert.equal(toolResult[0].role, 'tool_result');
   assert.equal(toolResult[0].toolStatus, 'success');
   assert.equal(toolResult[0].toolResultContent, 'ok');
+
+  const agentMessage = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'agent_message', message: 'Done.' },
+  });
+  assert.deepEqual(agentMessage, []);
 });
 
 test('codexExternalSessionId namespaces Codex thread IDs', () => {

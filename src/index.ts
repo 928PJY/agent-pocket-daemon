@@ -168,6 +168,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private sessionDiscovery: SessionDiscovery;
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
+  private codexInjectedMessages: Map<string, Set<string>> = new Map();
   private recentCodexStopHooks: Map<string, number> = new Map();
   private claudeAgentVersion?: string;
   private codexTerminalTargets: Map<string, CodexTerminalTargetEntry> = new Map();
@@ -2237,10 +2238,17 @@ export class AgentPocketDaemon extends EventEmitter {
         return;
       }
       try {
+        let injected = this.codexInjectedMessages.get(command.session_id);
+        if (!injected) {
+          injected = new Set<string>();
+          this.codexInjectedMessages.set(command.session_id, injected);
+        }
+        injected.add(command.message);
         terminalSendMessage(target, command.message);
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
         logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort });
       } catch (err) {
+        this.codexInjectedMessages.get(command.session_id)?.delete(command.message);
         const msg = (err as Error).message;
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
         this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
@@ -2994,6 +3002,13 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
+    if (agentType === 'codex' && agentEvent.type === 'user_message') {
+      const injected = this.codexInjectedMessages.get(sessionId);
+      if (injected?.delete(agentEvent.message)) {
+        return;
+      }
+    }
+
     const flat: Record<string, unknown> = {
       type: 'session_output',
       session_id: sessionId,

@@ -311,9 +311,6 @@ export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryM
         timestamp,
       }];
     }
-    if (payloadType === 'agent_message' && typeof payload.message === 'string') {
-      return [{ role: 'assistant', content: payload.message, timestamp }];
-    }
   }
 
   return [];
