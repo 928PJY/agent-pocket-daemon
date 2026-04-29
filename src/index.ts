@@ -1579,12 +1579,19 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private resolveCodexTerminalTarget(sessionId: string): CodexTerminalTargetEntry | undefined {
     const existing = this.codexTerminalTargets.get(sessionId);
-    if (existing?.target) return existing;
+    if (existing?.target) {
+      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget hit map ${sessionId.slice(0, 14)} pid=${existing.pid ?? 'none'} target=${existing.target.type}:${existing.target.target}\n`);
+      return existing;
+    }
 
     const liveCodex = this.codexDiscovery.discoverLiveSessions().get(sessionId);
-    if (!liveCodex) return existing;
+    if (!liveCodex) {
+      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget no live session ${sessionId.slice(0, 14)} existingPid=${existing?.pid ?? 'none'} existingTarget=${existing?.target ? 'yes' : 'no'}\n`);
+      return existing;
+    }
 
     const target = findTerminalForPid(liveCodex.pid) ?? existing?.target;
+    fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget live ${sessionId.slice(0, 14)} pid=${liveCodex.pid} target=${target ? `${target.type}:${target.target}` : 'none'}\n`);
     const next: CodexTerminalTargetEntry = {
       pid: liveCodex.pid,
       target,
@@ -2746,7 +2753,7 @@ export class AgentPocketDaemon extends EventEmitter {
       });
 
       // Debug: log final sessions with PIDs
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Returning ${sessions.length} sessions: ${sessions.map((s: any) => `${s.session_id.slice(0,8)}(pid=${s.pid ?? 'none'})`).join(', ')}\n`);
+      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Returning ${sessions.length} sessions: ${sessions.map((s: any) => `${s.session_id.slice(0,14)}(pid=${s.pid ?? 'none'},caps=${Array.isArray(s.capabilities) ? s.capabilities.join('+') : 'none'})`).join(', ')}\n`);
 
       const event = {
         type: 'session_list',
