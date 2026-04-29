@@ -1,12 +1,13 @@
 import * as fs from 'node:fs';
 import { EventEmitter } from 'node:events';
 import type { ClaudeEvent } from '../shared/index.js';
-import { codexHistoryMessageToEvent, parseCodexHistoryEntry } from '../discovery/codex-discovery.js';
+import { codexHistoryMessageToEvent, parseCodexHistoryEntry, parseCodexLifecycleEntry } from '../discovery/codex-discovery.js';
 import { logger } from '../logger.js';
 
 export interface CodexObserverEvents {
   output: [event: ClaudeEvent];
   status_change: [status: 'running' | 'ready'];
+  completed: [summary?: string];
   error: [error: Error];
 }
 
@@ -86,6 +87,17 @@ export class CodexObserver extends EventEmitter {
   }
 
   private processEntry(entry: Record<string, unknown>): void {
+    const lifecycle = parseCodexLifecycleEntry(entry);
+    if (lifecycle?.type === 'turn_completed') {
+      this.emit('status_change', 'ready');
+      this.emit('completed', lifecycle.summary);
+      return;
+    }
+    if (lifecycle?.type === 'turn_failed') {
+      this.emit('error', new Error(lifecycle.message));
+      return;
+    }
+
     const messages = parseCodexHistoryEntry(entry);
     if (messages.length === 0) return;
     this.emit('status_change', 'running');

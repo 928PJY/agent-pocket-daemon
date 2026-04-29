@@ -10,6 +10,10 @@ const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
 
+export type CodexLifecycleEvent =
+  | { type: 'turn_completed'; summary?: string; timestamp?: string }
+  | { type: 'turn_failed'; message: string; timestamp?: string };
+
 export interface CodexSession {
   threadId: string;
   sessionId: string;
@@ -278,6 +282,38 @@ export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryM
   return [];
 }
 
+export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexLifecycleEvent | null {
+  const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
+  const type = entry.type as string | undefined;
+  const payload = entry.payload as Record<string, unknown> | undefined;
+  if (!payload) return null;
+
+  const payloadType = payload.type as string | undefined;
+
+  if (type === 'event_msg') {
+    if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed') {
+      return { type: 'turn_completed', summary: extractLifecycleSummary(payload), timestamp };
+    }
+    if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'error') {
+      return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
+    }
+    if (payloadType === 'exec_command_end' && typeof payload.exit_code === 'number' && payload.exit_code !== 0) {
+      return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
+    }
+  }
+
+  if (type === 'response_item') {
+    if (payloadType === 'error') {
+      return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
+    }
+    if (payloadType === 'message' && payload.status === 'failed') {
+      return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
+    }
+  }
+
+  return null;
+}
+
 export function parseCodexResponseItem(payload: Record<string, unknown>, timestamp?: string): HistoryMessage[] {
   const itemType = payload.type as string | undefined;
   if (itemType === 'message') {
@@ -376,4 +412,21 @@ function stringifyCodexOutput(value: unknown): string {
   } catch {
     return String(value ?? '');
   }
+}
+
+function extractLifecycleSummary(payload: Record<string, unknown>): string | undefined {
+  const candidates = [payload.summary, payload.message, payload.output, payload.text];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate;
+  }
+  return undefined;
+}
+
+function extractLifecycleError(payload: Record<string, unknown>): string {
+  const candidates = [payload.message, payload.error, payload.reason, payload.aggregated_output, payload.output];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate;
+    if (candidate && typeof candidate === 'object') return stringifyCodexOutput(candidate);
+  }
+  return 'Codex turn failed';
 }
