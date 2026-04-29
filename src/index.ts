@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
 import { RelayClient } from './relay/relay-client.js';
@@ -13,8 +14,12 @@ import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
 import { isProcessSuspendedOrZombie } from './discovery/session-discovery.js';
+import { CodexDiscovery, isCodexSessionId } from './discovery/codex-discovery.js';
+import type { CodexSession } from './discovery/codex-discovery.js';
+import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
 import type { HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
@@ -49,6 +54,7 @@ import type {
   ClaudeEvent,
   PeerHello,
   SessionInfo,
+  AgentType,
   WakeBlobPayload,
 } from './shared/index.js';
 import {
@@ -132,12 +138,25 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function detectClaudeVersion(): string | undefined {
+  try {
+    const output = execFileSync('claude', ['--version'], { encoding: 'utf-8', timeout: 2000 }).trim();
+    const match = output.match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/);
+    return match?.[1] ?? (output || undefined);
+  } catch {
+    return undefined;
+  }
+}
+
 export class AgentPocketDaemon extends EventEmitter {
   private config: DaemonConfig;
   private sessionManager: SessionManager;
   private relayClient: RelayClient | null = null;
   private cryptoEngine: CryptoEngine;
   private sessionDiscovery: SessionDiscovery;
+  private codexDiscovery: CodexDiscovery;
+  private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
+  private claudeAgentVersion?: string;
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
@@ -237,6 +256,8 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     this.sessionDiscovery = new SessionDiscovery();
+    this.codexDiscovery = new CodexDiscovery();
+    this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
   }
 
@@ -279,6 +300,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
     // Discover running CLI sessions and observe them
     await this.discoverAndObserveSessions();
+    this.discoverAndObserveCodexSessions();
     this.initialDiscoveryDone = true;
 
     // Sweep stale session-map.json entries (e.g. CLIs that ended before this
@@ -293,6 +315,7 @@ export class AgentPocketDaemon extends EventEmitter {
       this.discoverAndObserveSessions().catch((err) => {
         logger.error('daemon', `Periodic discovery error: ${(err as Error).message}`);
       });
+      this.discoverAndObserveCodexSessions();
     }, 5000);
 
     // Periodically retry blocking requests that haven't received a phone response
@@ -332,6 +355,10 @@ export class AgentPocketDaemon extends EventEmitter {
       this.bonjourAdvertiser = null;
     }
     await this.hookServer.stop();
+    for (const { observer } of this.codexObservers.values()) {
+      observer.stop();
+    }
+    this.codexObservers.clear();
     await this.sessionManager.shutdown();
   }
 
@@ -371,6 +398,10 @@ export class AgentPocketDaemon extends EventEmitter {
         request_id: requestId ?? externalId,
         working_directory: workingDirectory,
         project_name: customTitle ?? path.basename(workingDirectory),
+        agent_type: 'claude_code',
+        agent_display_name: 'Claude Code',
+        agent_version: this.claudeAgentVersion,
+        capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
       };
 
       this.sendToPhone(event);
@@ -396,70 +427,7 @@ export class AgentPocketDaemon extends EventEmitter {
         return;
       }
 
-      const externalId = this.resolveExternalSessionId(sessionId);
-      // Flatten ClaudeEvent into the format the iOS app expects:
-      // { type: "session_output", session_id, output_type, content, is_complete, ... }
-      const flat: Record<string, unknown> = {
-        type: 'session_output',
-        session_id: externalId,
-        timestamp: Date.now(),
-      };
-
-      switch (claudeEvent.type) {
-        case 'thinking':
-          flat.output_type = 'thinking';
-          flat.content = claudeEvent.thinking;
-          flat.is_complete = false;
-          break;
-
-        case 'assistant_message':
-          flat.output_type = 'assistant_message';
-          flat.content = claudeEvent.message;
-          flat.is_complete = false;
-          break;
-
-        case 'tool_use':
-          flat.output_type = 'tool_use';
-          flat.tool_name = claudeEvent.tool_name;
-          flat.tool_input = claudeEvent.tool_input;
-          flat.tool_use_id = claudeEvent.tool_id;
-          break;
-
-        case 'tool_result':
-          flat.output_type = 'tool_result';
-          flat.tool_use_id = claudeEvent.tool_id;
-          flat.output = claudeEvent.output;
-          flat.is_error = claudeEvent.status === 'error';
-          break;
-
-        case 'user_message':
-          flat.output_type = 'user_message';
-          flat.content = claudeEvent.message;
-          break;
-
-        case 'system_message':
-          flat.output_type = 'system_message';
-          flat.content = claudeEvent.message;
-          break;
-
-        case 'subagent_event':
-          flat.output_type = 'subagent_event';
-          flat.agent_id = claudeEvent.agent_id;
-          flat.agent_name = claudeEvent.agent_name;
-          flat.agent_type = claudeEvent.agent_type;
-          flat.inner_event = claudeEvent.inner_event;
-          flat.tool_use_count = claudeEvent.tool_use_count;
-          flat.token_count = claudeEvent.token_count;
-          flat.agent_status = claudeEvent.agent_status;
-          break;
-
-        default:
-          flat.output_type = claudeEvent.type;
-          flat.content = JSON.stringify(claudeEvent);
-          break;
-      }
-
-      this.sendToPhone(flat as unknown as PcEvent);
+      this.sendFlattenedSessionOutput(this.resolveExternalSessionId(sessionId), claudeEvent, 'claude_code');
     });
 
     this.sessionManager.on('session_ended', (sessionId: string, exitCode: number) => {
@@ -1686,6 +1654,67 @@ export class AgentPocketDaemon extends EventEmitter {
     }
   }
 
+  private discoverAndObserveCodexSessions(): void {
+    try {
+      const sessions = this.codexDiscovery.discoverSessions();
+      const liveSessions = this.codexDiscovery.discoverLiveSessions(sessions);
+      for (const session of sessions) {
+        const existing = this.codexObservers.get(session.sessionId);
+        if (existing) {
+          const live = liveSessions.has(session.sessionId);
+          const nextStatus = live
+            ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
+            : SessionStatus.HISTORY;
+          if (existing.status !== nextStatus) {
+            existing.status = nextStatus;
+            existing.lastActivity = Date.now();
+            if (this.initialDiscoveryDone) {
+              this.sendToPhone({
+                type: 'session_status',
+                session_id: session.sessionId,
+                status: nextStatus,
+              } as unknown as PcEvent);
+            }
+          }
+          continue;
+        }
+        const observer = new CodexObserver(session.sessionId, session.rolloutPath);
+        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.READY : SessionStatus.HISTORY;
+        const tracked = {
+          observer,
+          session,
+          status: initialStatus,
+          lastActivity: session.updatedAtMs ?? Date.now(),
+        };
+        this.codexObservers.set(session.sessionId, tracked);
+
+        observer.on('output', (codexEvent: ClaudeEvent) => {
+          tracked.lastActivity = Date.now();
+          // The phone already renders its own submitted Codex prompt locally.
+          // Suppress the rollout echo so the same user message is not shown twice.
+          if (codexEvent.type === 'user_message') return;
+          this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
+        });
+        observer.on('status_change', (status: 'running' | 'ready') => {
+          tracked.status = status as SessionStatus;
+          tracked.lastActivity = Date.now();
+          if (!this.initialDiscoveryDone) return;
+          this.sendToPhone({
+            type: 'session_status',
+            session_id: session.sessionId,
+            status: tracked.status,
+          } as unknown as PcEvent);
+        });
+        observer.on('error', (err: Error) => {
+          logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
+        });
+        observer.start();
+      }
+    } catch (err) {
+      logger.warn('codex-discovery', `Error discovering Codex sessions: ${(err as Error).message}`);
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Hook Server Crash Monitoring
   // --------------------------------------------------------------------------
@@ -1933,6 +1962,29 @@ export class AgentPocketDaemon extends EventEmitter {
       this.sendMessageAck(clientMessageId, command.session_id, 'received');
     }
 
+    if (isCodexSessionId(command.session_id)) {
+      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
+      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      if (!target) {
+        const msg = liveCodex
+          ? `Codex terminal target not found for PID ${liveCodex.pid}.`
+          : 'Codex session has no live terminal process.';
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
+        this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
+        return;
+      }
+      try {
+        terminalSendMessage(target, command.message);
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
+        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort, pid: liveCodex!.pid });
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
+        this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
+      }
+      return;
+    }
+
     try {
       // Resolve the external session ID to our internal ID
       const internalId = this.resolveInternalSessionId(command.session_id);
@@ -2175,6 +2227,19 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleKillSession(command: KillSessionCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      const observed = this.codexObservers.get(command.session_id);
+      if (observed) {
+        observed.observer.stop();
+        observed.status = SessionStatus.HISTORY;
+        this.sendToPhone({
+          type: 'session_status',
+          session_id: command.session_id,
+          status: SessionStatus.HISTORY,
+        } as unknown as PcEvent);
+      }
+      return;
+    }
     try {
       const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
       await this.sessionManager.killSession(internalId);
@@ -2188,6 +2253,21 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handleInterruptSession(command: InterruptSessionCommand): void {
+    if (isCodexSessionId(command.session_id)) {
+      const liveCodex = this.codexDiscovery.discoverLiveSessions().get(command.session_id);
+      const target = liveCodex ? findTerminalForPid(liveCodex.pid) : null;
+      if (!target) {
+        this.sendError(undefined, 'Codex interrupt is not available because no live terminal target was found for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
+        return;
+      }
+      try {
+        terminalSendInterrupt(target);
+        logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
+      } catch (err) {
+        this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');
+      }
+      return;
+    }
     try {
       const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
       this.sessionManager.interruptSession(internalId);
@@ -2261,6 +2341,10 @@ export class AgentPocketDaemon extends EventEmitter {
         allSessions.push({
           entry: {
             session_id: externalId,
+            agent_type: 'claude_code',
+            agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
+            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
             status: effectiveStatus,
             action_type: actionType,
             working_directory: active.workingDirectory,
@@ -2311,6 +2395,10 @@ export class AgentPocketDaemon extends EventEmitter {
         allSessions.push({
           entry: {
             session_id: pidInfo.sessionId,
+            agent_type: 'claude_code',
+            agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
+            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
             status: SessionStatus.READY,
             working_directory: pidInfo.cwd,
             project_name: customTitle ?? pidInfo.name ?? path.basename(pidInfo.cwd),
@@ -2332,6 +2420,10 @@ export class AgentPocketDaemon extends EventEmitter {
         allSessions.push({
           entry: {
             session_id: discovered.sessionId,
+            agent_type: 'claude_code',
+            agent_display_name: 'Claude Code',
+            agent_version: this.claudeAgentVersion,
+            capabilities: ['observe'],
             status: SessionStatus.HISTORY,
             working_directory: discovered.projectDir,
             project_name: discovered.customTitle ?? path.basename(discovered.projectDir),
@@ -2340,6 +2432,39 @@ export class AgentPocketDaemon extends EventEmitter {
           historyKey: discovered.sessionId,
         });
         claimedSessionIds.add(discovered.sessionId);
+      }
+
+      // ── Phase 4: Codex history/observe sessions ──
+      const codexSessions = this.codexDiscovery.getCachedSessions() ?? this.codexDiscovery.discoverSessions();
+      const liveCodexSessions = this.codexDiscovery.discoverLiveSessions(codexSessions);
+      for (const codex of codexSessions) {
+        if (claimedSessionIds.has(codex.sessionId)) continue;
+        const observed = this.codexObservers.get(codex.sessionId);
+        const liveCodex = liveCodexSessions.get(codex.sessionId);
+        const codexStatus = liveCodex
+          ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
+          : observed?.status ?? SessionStatus.HISTORY;
+        if (observed && !liveCodex && observed.status === SessionStatus.RUNNING) {
+          observed.status = SessionStatus.HISTORY;
+        }
+        const codexCapabilities = liveCodex ? ['observe', 'terminal_remote_message', 'terminal_interrupt'] : ['observe'];
+        allSessions.push({
+          entry: {
+            session_id: codex.sessionId,
+            agent_type: 'codex',
+            agent_display_name: 'Codex',
+            agent_version: codex.cliVersion,
+            capabilities: codexCapabilities,
+            status: codexStatus,
+            working_directory: codex.cwd,
+            project_name: codex.title ?? path.basename(codex.cwd),
+            last_activity: observed?.lastActivity ?? codex.updatedAtMs,
+            entrypoint: 'codex-cli',
+            pid: liveCodex?.pid,
+          },
+          historyKey: codex.sessionId,
+        });
+        claimedSessionIds.add(codex.sessionId);
       }
 
       // Sort: active sessions first, then by last_activity descending
@@ -2356,7 +2481,9 @@ export class AgentPocketDaemon extends EventEmitter {
 
       // Only fetch history for sessions in the current page
       const sessions = pageSlice.map(({ entry, historyKey }) => {
-        const historyPage = this.sessionDiscovery.getSessionHistory(historyKey, { limit: 3 });
+        const historyPage = isCodexSessionId(historyKey)
+          ? this.codexDiscovery.getSessionHistory(historyKey, { limit: 3 })
+          : this.sessionDiscovery.getSessionHistory(historyKey, { limit: 3 });
         return {
           ...entry,
           recent_messages: historyPage.messages.map((m) => ({
@@ -2509,7 +2636,12 @@ export class AgentPocketDaemon extends EventEmitter {
   private handleVerifyHistory(command: VerifyHistoryCommand): void {
     // Read entire history (limit large enough to cover any session) to compare
     // against the phone's claimed count/tail. Silence = match.
-    const result = this.sessionDiscovery.getSessionHistory(command.session_id, {
+    const result = isCodexSessionId(command.session_id)
+      ? this.codexDiscovery.getSessionHistory(command.session_id, {
+          offset: 0,
+          limit: 100_000,
+        })
+      : this.sessionDiscovery.getSessionHistory(command.session_id, {
       offset: 0,
       limit: 100_000,
     });
@@ -2599,6 +2731,71 @@ export class AgentPocketDaemon extends EventEmitter {
       }
       this.relayClient.send(event, wake, wakePayload);
     }
+  }
+
+  private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
+    const flat: Record<string, unknown> = {
+      type: 'session_output',
+      session_id: sessionId,
+      agent_type: agentType,
+      timestamp: Date.now(),
+    };
+
+    switch (agentEvent.type) {
+      case 'thinking':
+        flat.output_type = 'thinking';
+        flat.content = agentEvent.thinking;
+        flat.is_complete = false;
+        break;
+
+      case 'assistant_message':
+        flat.output_type = 'assistant_message';
+        flat.content = agentEvent.message;
+        flat.is_complete = false;
+        break;
+
+      case 'tool_use':
+        flat.output_type = 'tool_use';
+        flat.tool_name = agentEvent.tool_name;
+        flat.tool_input = agentEvent.tool_input;
+        flat.tool_use_id = agentEvent.tool_id;
+        break;
+
+      case 'tool_result':
+        flat.output_type = 'tool_result';
+        flat.tool_use_id = agentEvent.tool_id;
+        flat.output = agentEvent.output;
+        flat.is_error = agentEvent.status === 'error';
+        break;
+
+      case 'user_message':
+        flat.output_type = 'user_message';
+        flat.content = agentEvent.message;
+        break;
+
+      case 'system_message':
+        flat.output_type = 'system_message';
+        flat.content = agentEvent.message;
+        break;
+
+      case 'subagent_event':
+        flat.output_type = 'subagent_event';
+        flat.agent_id = agentEvent.agent_id;
+        flat.agent_name = agentEvent.agent_name;
+        flat.agent_type = agentEvent.agent_type;
+        flat.inner_event = agentEvent.inner_event;
+        flat.tool_use_count = agentEvent.tool_use_count;
+        flat.token_count = agentEvent.token_count;
+        flat.agent_status = agentEvent.agent_status;
+        break;
+
+      default:
+        flat.output_type = agentEvent.type;
+        flat.content = JSON.stringify(agentEvent);
+        break;
+    }
+
+    this.sendToPhone(flat as unknown as PcEvent);
   }
 
   private sendError(requestId: string | undefined, message: string, code: string): void {
@@ -3107,7 +3304,14 @@ export class AgentPocketDaemon extends EventEmitter {
     const defaultLimit = incremental ? 200 : 2000;
     const isFullHistory = !incremental && !options?.offset;
 
-    const result = this.sessionDiscovery.getSessionHistory(claudeSessionId, {
+    const result = isCodexSessionId(claudeSessionId)
+      ? this.codexDiscovery.getSessionHistory(claudeSessionId, {
+          offset: options?.offset ?? 0,
+          limit: options?.limit ?? defaultLimit,
+          since: options?.since,
+          sinceSeq: options?.sinceSeq,
+        })
+      : this.sessionDiscovery.getSessionHistory(claudeSessionId, {
       offset: options?.offset ?? 0,
       limit: options?.limit ?? defaultLimit,
       since: options?.since,
@@ -3128,6 +3332,7 @@ export class AgentPocketDaemon extends EventEmitter {
     const event = {
       type: 'session_history',
       session_id: claudeSessionId,
+      agent_type: isCodexSessionId(claudeSessionId) ? 'codex' : 'claude_code',
       messages: filtered,
       total_count: result.totalCount,
       offset: result.offset,

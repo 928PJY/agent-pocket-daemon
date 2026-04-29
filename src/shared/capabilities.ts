@@ -22,6 +22,21 @@ export const PEER_CAPABILITIES = {
    * not block UI on ack arrival — old daemons will never send one.
    */
   MESSAGE_ACKS: 'messages.delivery_acks',
+
+  /**
+   * Peers understand explicit per-session agent identity fields such as
+   * agent_type, agent_display_name, and agent_version.
+   */
+  AGENT_IDENTITY: 'agent.identity',
+
+  /** Daemon can list and read local Codex sessions in observe mode. */
+  CODEX_OBSERVE: 'codex.observe',
+
+  /** Daemon can inject user text into an attached terminal session. */
+  TERMINAL_REMOTE_MESSAGE: 'terminal.remote_message',
+
+  /** Daemon can send an interrupt key sequence to an attached terminal. */
+  TERMINAL_INTERRUPT: 'terminal.interrupt',
 } as const;
 
 export type PeerCapability = typeof PEER_CAPABILITIES[keyof typeof PEER_CAPABILITIES];
@@ -33,4 +48,8 @@ export type PeerCapability = typeof PEER_CAPABILITIES[keyof typeof PEER_CAPABILI
 export const CURRENT_PEER_CAPABILITIES: PeerCapability[] = [
   PEER_CAPABILITIES.HISTORY_VERIFY,
   PEER_CAPABILITIES.MESSAGE_ACKS,
+  PEER_CAPABILITIES.AGENT_IDENTITY,
+  PEER_CAPABILITIES.CODEX_OBSERVE,
+  PEER_CAPABILITIES.TERMINAL_REMOTE_MESSAGE,
+  PEER_CAPABILITIES.TERMINAL_INTERRUPT,
 ];
