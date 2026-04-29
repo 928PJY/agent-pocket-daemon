@@ -15,7 +15,7 @@ import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
 import { isProcessSuspendedOrZombie } from './discovery/session-discovery.js';
 import { CodexDiscovery, codexExternalSessionId, isCodexSessionId } from './discovery/codex-discovery.js';
-import type { CodexSession } from './discovery/codex-discovery.js';
+import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
 import type { CodexHookRequest, HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
@@ -1577,14 +1577,16 @@ export class AgentPocketDaemon extends EventEmitter {
     return undefined;
   }
 
-  private resolveCodexTerminalTarget(sessionId: string): CodexTerminalTargetEntry | undefined {
+  private resolveCodexTerminalTarget(sessionId: string, knownLiveCodex?: CodexLiveSession | null): CodexTerminalTargetEntry | undefined {
     const existing = this.codexTerminalTargets.get(sessionId);
     if (existing?.target) {
       fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget hit map ${sessionId.slice(0, 14)} pid=${existing.pid ?? 'none'} target=${existing.target.type}:${existing.target.target}\n`);
       return existing;
     }
 
-    const liveCodex = this.codexDiscovery.discoverLiveSessions().get(sessionId);
+    const liveCodex = knownLiveCodex === undefined
+      ? this.codexDiscovery.discoverLiveSessions().get(sessionId)
+      : knownLiveCodex;
     if (!liveCodex) {
       fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget no live session ${sessionId.slice(0, 14)} existingPid=${existing?.pid ?? 'none'} existingTarget=${existing?.target ? 'yes' : 'no'}\n`);
       return existing;
@@ -2704,7 +2706,7 @@ export class AgentPocketDaemon extends EventEmitter {
         const codexStatus = liveCodex
           ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
           : observed?.status ?? SessionStatus.HISTORY;
-        const terminal = this.resolveCodexTerminalTarget(codex.sessionId);
+        const terminal = this.resolveCodexTerminalTarget(codex.sessionId, liveCodex ?? null);
         const capabilities = this.getCodexCapabilities(codex.sessionId);
         allSessions.push({
           entry: {
