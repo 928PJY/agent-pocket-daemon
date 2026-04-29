@@ -9,6 +9,7 @@ import { logger } from '../logger.js';
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
+export const CODEX_LIVE_SESSION_MAX_IDLE_MS = 2 * 60 * 60 * 1000;
 
 export type CodexLifecycleEvent =
   | { type: 'turn_completed'; summary?: string; timestamp?: string }
@@ -153,13 +154,18 @@ export class CodexDiscovery {
     return refreshed.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
   }
 
-  discoverLiveSessions(sessions = this.cachedSessions ?? this.discoverSessions()): Map<string, CodexLiveSession> {
+  discoverLiveSessions(
+    sessions = this.cachedSessions ?? this.discoverSessions(),
+    options: { maxIdleMs?: number; nowMs?: number } = {},
+  ): Map<string, CodexLiveSession> {
     if (sessions.length === 0) return new Map();
     const byRolloutPath = new Map(sessions.map((s) => [normalizePath(s.rolloutPath), s]));
     const live = new Map<string, CodexLiveSession>();
+    const nowMs = options.nowMs ?? Date.now();
+    const maxIdleMs = options.maxIdleMs ?? CODEX_LIVE_SESSION_MAX_IDLE_MS;
 
     for (const pid of findCodexPids()) {
-      for (const liveSession of codexLiveSessionsFromOpenedRollouts(pid, findOpenCodexRollouts(pid, this.codexDir), byRolloutPath)) {
+      for (const liveSession of codexLiveSessionsFromOpenedRollouts(pid, findOpenCodexRollouts(pid, this.codexDir), byRolloutPath, { maxIdleMs, nowMs })) {
         if (!live.has(liveSession.sessionId)) {
           live.set(liveSession.sessionId, liveSession);
         }
@@ -253,13 +259,16 @@ export function codexLiveSessionsFromOpenedRollouts(
   pid: number,
   openedPaths: string[],
   byRolloutPath: Map<string, CodexSession>,
+  options: { maxIdleMs?: number; nowMs?: number } = {},
 ): CodexLiveSession[] {
   let current: CodexLiveSession | undefined;
+  const nowMs = options.nowMs ?? Date.now();
   for (const openedPath of openedPaths) {
     const session = byRolloutPath.get(normalizePath(openedPath));
     if (!session) continue;
     const lastActivityMs = getCodexRolloutMtimeMs(session.rolloutPath);
     if (lastActivityMs === undefined) continue;
+    if (options.maxIdleMs !== undefined && nowMs - lastActivityMs > options.maxIdleMs) continue;
     const candidate = {
       sessionId: session.sessionId,
       threadId: session.threadId,

@@ -110,10 +110,33 @@ test('codexLiveSessionsFromOpenedRollouts returns only the newest rollout for on
       }],
     ]);
 
-    const live = codexLiveSessionsFromOpenedRollouts(1234, [rolloutA, rolloutB], byRolloutPath);
+    const live = codexLiveSessionsFromOpenedRollouts(1234, [rolloutA, rolloutB], byRolloutPath, { nowMs: 2500 });
 
     assert.deepEqual(live.map((session) => session.sessionId), ['codex:thread-b']);
     assert.equal(live[0].pid, 1234);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('codexLiveSessionsFromOpenedRollouts ignores idle open rollouts', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-idle-'));
+  try {
+    const rolloutPath = path.join(dir, 'rollout-idle.jsonl');
+    fs.writeFileSync(rolloutPath, '{}\n');
+    fs.utimesSync(rolloutPath, new Date(1000), new Date(1000));
+    const byRolloutPath = new Map([
+      [path.resolve(rolloutPath), {
+        threadId: 'thread-idle',
+        sessionId: 'codex:thread-idle',
+        rolloutPath,
+        cwd: dir,
+      }],
+    ]);
+
+    const live = codexLiveSessionsFromOpenedRollouts(1234, [rolloutPath], byRolloutPath, { nowMs: 10_000, maxIdleMs: 1_000 });
+
+    assert.deepEqual(live, []);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
