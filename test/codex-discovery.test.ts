@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCodexProcessList } from '../src/discovery/codex-discovery.js';
+import { codexStateDbReadonlyUri, parseCodexProcessList } from '../src/discovery/codex-discovery.js';
 
 test('parseCodexProcessList matches terminal Codex executables', () => {
   const pids = parseCodexProcessList(`
@@ -13,4 +13,11 @@ test('parseCodexProcessList matches terminal Codex executables', () => {
   `);
 
   assert.deepEqual(pids, [101, 102, 105]);
+});
+
+test('codexStateDbReadonlyUri opens immutable read-only snapshots', () => {
+  assert.equal(
+    codexStateDbReadonlyUri('/Users/test user/.codex/state_5.sqlite'),
+    'file:///Users/test%20user/.codex/state_5.sqlite?mode=ro&immutable=1',
+  );
 });

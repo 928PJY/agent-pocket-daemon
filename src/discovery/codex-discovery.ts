@@ -72,7 +72,7 @@ export class CodexDiscovery {
     `;
 
     try {
-      const out = execFileSync('sqlite3', ['-readonly', '-separator', FIELD_SEP, stateDb, query], {
+      const out = execFileSync('sqlite3', [codexStateDbReadonlyUri(stateDb), '-separator', FIELD_SEP, query], {
         encoding: 'utf-8',
         timeout: 2000,
       });
@@ -119,6 +119,8 @@ export class CodexDiscovery {
     const live = new Map<string, CodexLiveSession>();
 
     for (const pid of findCodexPids()) {
+      // Codex TUI can hold multiple rollout files open for one process. The
+      // newest mtime is our best approximation of the thread currently in focus.
       const openedRollouts = findOpenCodexRollouts(pid, this.codexDir)
         .map((openedPath) => {
           const session = byRolloutPath.get(normalizePath(openedPath));
@@ -203,6 +205,11 @@ export class CodexDiscovery {
       return { messages: [], totalCount: 0, offset, hasMore: false };
     }
   }
+}
+
+export function codexStateDbReadonlyUri(stateDb: string): string {
+  const normalized = path.resolve(stateDb).split(path.sep).map(encodeURIComponent).join('/');
+  return `file://${normalized}?mode=ro&immutable=1`;
 }
 
 export function findCodexPids(): number[] {
