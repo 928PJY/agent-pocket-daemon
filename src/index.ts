@@ -1690,6 +1690,9 @@ export class AgentPocketDaemon extends EventEmitter {
 
         observer.on('output', (codexEvent: ClaudeEvent) => {
           tracked.lastActivity = Date.now();
+          // The phone already renders its own submitted Codex prompt locally.
+          // Suppress the rollout echo so the same user message is not shown twice.
+          if (codexEvent.type === 'user_message') return;
           this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
         });
         observer.on('status_change', (status: 'running' | 'ready') => {
