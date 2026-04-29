@@ -2214,6 +2214,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
       // ── Phase 1: Daemon-tracked sessions (SessionManager) ──
       // These have observers attached and carry rich status.
+      this.sessionManager.reconcileObservedSessionLiveness();
       const activeSessions = this.sessionManager.getAllSessions();
       fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Phase 1 has ${activeSessions.length} sessions: ${activeSessions.map(s => `${s.claudeSessionId?.slice(0,8)}(status=${s.status},pid=${s.terminalPid})`).join(', ')}\n`);
       const claimedPids = new Set<number>();
