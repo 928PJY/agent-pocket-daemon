@@ -6,6 +6,8 @@ import { VERSION, DAEMON_DEFAULT_PORT, HOOK_SERVER_PORT } from './shared/index.j
 import type { ConnectionMode } from './shared/index.js';
 import { AgentPocketDaemon } from './index.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
+import { CodexDiscovery } from './discovery/codex-discovery.js';
+import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { LanServer } from './lan/lan-server.js';
 import { runLanPairing } from './lan/lan-pairing.js';
@@ -1124,12 +1126,22 @@ async function cmdSessions(): Promise<void> {
     return;
   }
 
-  if (sessions.length === 0) {
+  const codexDiscovery = new CodexDiscovery();
+  const codexSessions = codexDiscovery.discoverSessions();
+  const liveCodexSessions = Array.from(codexDiscovery.discoverLiveSessions(codexSessions).values())
+    .map((live) => {
+      const session = codexSessions.find(s => s.sessionId === live.sessionId);
+      return session ? { live, session } : null;
+    })
+    .filter((entry): entry is { live: CodexLiveSession; session: CodexSession } => entry !== null);
+
+  if (sessions.length === 0 && liveCodexSessions.length === 0) {
     console.log('No active sessions tracked by daemon.');
     return;
   }
 
-  const rows = sessions.map(s => ({
+  const claudeRows = sessions.map(s => ({
+    Agent: 'Claude',
     PID: s.pid ?? '-',
     TTY: s.pid ? getTtyForPid(s.pid) ?? '-' : '-',
     'Session ID': s.sessionId.slice(0, 8) + '...',
@@ -1141,7 +1153,23 @@ async function cmdSessions(): Promise<void> {
     'Last Activity': s.lastActivity ? new Date(s.lastActivity).toLocaleTimeString() : '-',
   }));
 
-  console.log(`${sessions.length} tracked session(s):\n`);
+  const codexRows = liveCodexSessions.map(({ live, session }) => ({
+    Agent: 'Codex',
+    PID: live.pid,
+    TTY: getTtyForPid(live.pid) ?? '-',
+    'Session ID': session.sessionId.slice(0, 14) + '...',
+    Status: 'running',
+    Type: 'codex-cli',
+    Title: session.title ?? '-',
+    CWD: session.cwd.replace(os.homedir(), '~'),
+    Mode: 'observer',
+    'Last Activity': new Date(live.lastActivityMs).toLocaleTimeString(),
+  }));
+
+  const rows = [...claudeRows, ...codexRows]
+    .sort((a, b) => String(a.Agent).localeCompare(String(b.Agent)) || Number(a.PID) - Number(b.PID));
+
+  console.log(`${rows.length} active session(s): ${claudeRows.length} Claude, ${codexRows.length} Codex\n`);
   console.table(rows);
 }
 
