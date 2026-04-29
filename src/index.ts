@@ -93,6 +93,15 @@ export interface DaemonConfig {
   sessionSasKey?: string;
 }
 
+type CodexTerminalTargetEntry = {
+  pid?: number;
+  target?: TerminalTarget;
+  cwd?: string;
+  transcriptPath?: string;
+  turnId?: string;
+  updatedAt: number;
+};
+
 // ============================================================================
 // AgentPocketDaemon
 // ============================================================================
@@ -161,7 +170,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
   private recentCodexStopHooks: Map<string, number> = new Map();
   private claudeAgentVersion?: string;
-  private codexTerminalTargets: Map<string, { pid?: number; target?: TerminalTarget; cwd?: string; transcriptPath?: string; turnId?: string; updatedAt: number }> = new Map();
+  private codexTerminalTargets: Map<string, CodexTerminalTargetEntry> = new Map();
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
@@ -1568,6 +1577,26 @@ export class AgentPocketDaemon extends EventEmitter {
     return undefined;
   }
 
+  private resolveCodexTerminalTarget(sessionId: string): CodexTerminalTargetEntry | undefined {
+    const existing = this.codexTerminalTargets.get(sessionId);
+    if (existing?.target) return existing;
+
+    const liveCodex = this.codexDiscovery.discoverLiveSessions().get(sessionId);
+    if (!liveCodex) return existing;
+
+    const target = findTerminalForPid(liveCodex.pid) ?? existing?.target;
+    const next: CodexTerminalTargetEntry = {
+      pid: liveCodex.pid,
+      target,
+      cwd: existing?.cwd,
+      transcriptPath: existing?.transcriptPath,
+      turnId: existing?.turnId,
+      updatedAt: Date.now(),
+    };
+    this.codexTerminalTargets.set(sessionId, next);
+    return next;
+  }
+
   private attachCodexObserverHandlers(tracked: { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }): void {
     const { observer, session } = tracked;
     observer.on('output', (codexEvent: ClaudeEvent) => {
@@ -2184,7 +2213,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     if (isCodexSessionId(command.session_id)) {
-      const target = this.codexTerminalTargets.get(command.session_id)?.target;
+      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
       if (!target) {
         const msg = 'Codex remote message is not available until a terminal target is attached for this Codex session.';
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
@@ -2479,7 +2508,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handleInterruptSession(command: InterruptSessionCommand): void {
     if (isCodexSessionId(command.session_id)) {
-      const target = this.codexTerminalTargets.get(command.session_id)?.target;
+      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
       if (!target) {
         this.sendError(undefined, 'Codex interrupt is not available until a terminal target is attached for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
         return;
@@ -2668,7 +2697,7 @@ export class AgentPocketDaemon extends EventEmitter {
         const codexStatus = liveCodex
           ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
           : observed?.status ?? SessionStatus.HISTORY;
-        const terminal = this.codexTerminalTargets.get(codex.sessionId);
+        const terminal = this.resolveCodexTerminalTarget(codex.sessionId);
         const capabilities = this.getCodexCapabilities(codex.sessionId);
         allSessions.push({
           entry: {
