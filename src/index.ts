@@ -149,6 +149,8 @@ function detectClaudeVersion(): string | undefined {
   }
 }
 
+const CODEX_STOP_DEDUPE_MS = 5000;
+
 export class AgentPocketDaemon extends EventEmitter {
   private config: DaemonConfig;
   private sessionManager: SessionManager;
@@ -157,6 +159,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private sessionDiscovery: SessionDiscovery;
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
+  private recentCodexStopHooks: Map<string, number> = new Map();
   private claudeAgentVersion?: string;
   private codexTerminalTargets: Map<string, { pid?: number; target?: TerminalTarget; cwd?: string; transcriptPath?: string; turnId?: string; updatedAt: number }> = new Map();
   private hookServer: HookServer;
@@ -987,6 +990,8 @@ export class AgentPocketDaemon extends EventEmitter {
         tracked.status = SessionStatus.READY;
         tracked.lastActivity = Date.now();
       }
+      this.recordCodexStopHook(sessionId);
+      this.sendCodexCompletion(sessionId, tracked?.session);
     });
 
     this.hookServer.on('codex_permission_request', (request: CodexHookRequest) => {
@@ -1515,6 +1520,44 @@ export class AgentPocketDaemon extends EventEmitter {
     return sessionId;
   }
 
+  private recordCodexStopHook(sessionId: string): void {
+    const now = Date.now();
+    for (const [id, at] of this.recentCodexStopHooks.entries()) {
+      if (now - at > CODEX_STOP_DEDUPE_MS) this.recentCodexStopHooks.delete(id);
+    }
+    this.recentCodexStopHooks.set(sessionId, now);
+  }
+
+  private consumeRecentCodexStopHook(sessionId: string): boolean {
+    const stoppedAt = this.recentCodexStopHooks.get(sessionId);
+    if (stoppedAt === undefined) return false;
+    if (Date.now() - stoppedAt > CODEX_STOP_DEDUPE_MS) {
+      this.recentCodexStopHooks.delete(sessionId);
+      return false;
+    }
+    this.recentCodexStopHooks.delete(sessionId);
+    return true;
+  }
+
+  private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
+    if (!this.initialDiscoveryDone) return;
+    const body = summary?.trim() || 'Codex turn finished';
+    this.sendToPhone({
+      type: 'session_status',
+      session_id: sessionId,
+      status: SessionStatus.READY,
+      is_completion: true,
+      completion_body: body,
+    } as unknown as PcEvent, true, {
+      type: 'session_completed',
+      session_name: session?.title ?? (session?.cwd ? path.basename(session.cwd) : this.getSessionName(sessionId)),
+      body: truncateUtf8(body, 256),
+      sound: 'completion.caf',
+      category: 'SESSION_COMPLETED',
+      session_id: sessionId,
+    });
+  }
+
   private resolveCodexExternalSessionId(sessionId: string): string | undefined {
     if (isCodexSessionId(sessionId)) return sessionId;
     if (!sessionId) return undefined;
@@ -1545,21 +1588,8 @@ export class AgentPocketDaemon extends EventEmitter {
       tracked.status = SessionStatus.READY;
       tracked.lastActivity = Date.now();
       if (!this.initialDiscoveryDone) return;
-      const body = summary?.trim() || 'Codex turn finished';
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: session.sessionId,
-        status: SessionStatus.READY,
-        is_completion: true,
-        completion_body: body,
-      } as unknown as PcEvent, true, {
-        type: 'session_completed',
-        session_name: session.title ?? path.basename(session.cwd),
-        body: truncateUtf8(body, 256),
-        sound: 'completion.caf',
-        category: 'SESSION_COMPLETED',
-        session_id: session.sessionId,
-      });
+      if (this.consumeRecentCodexStopHook(session.sessionId)) return;
+      this.sendCodexCompletion(session.sessionId, session, summary);
     });
     observer.on('error', (err: Error) => {
       tracked.status = SessionStatus.ERROR;

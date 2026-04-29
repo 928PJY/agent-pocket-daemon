@@ -142,6 +142,25 @@ test('parseCodexLifecycleEntry detects completed and failed Codex turns', () => 
     timestamp: undefined,
   });
 
+  assert.deepEqual(parseCodexLifecycleEntry({
+    timestamp: '2026-04-29T00:00:02.000Z',
+    type: 'event_msg',
+    payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done.' },
+  }), {
+    type: 'turn_completed',
+    summary: 'Done.',
+    timestamp: '2026-04-29T00:00:02.000Z',
+  });
+
+  assert.deepEqual(parseCodexLifecycleEntry({
+    type: 'event_msg',
+    payload: { type: 'task_failed', error: { message: 'tool failed' } },
+  }), {
+    type: 'turn_failed',
+    message: '{"message":"tool failed"}',
+    timestamp: undefined,
+  });
+
   assert.equal(parseCodexLifecycleEntry({
     type: 'event_msg',
     payload: { type: 'exec_command_end', call_id: 'call_2', exit_code: 1, aggregated_output: 'test failed' },

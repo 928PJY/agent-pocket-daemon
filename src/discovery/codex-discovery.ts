@@ -328,10 +328,10 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
   const payloadType = payload.type as string | undefined;
 
   if (type === 'event_msg') {
-    if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed') {
+    if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed' || payloadType === 'task_complete') {
       return { type: 'turn_completed', summary: extractLifecycleSummary(payload), timestamp };
     }
-    if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'error') {
+    if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'task_failed' || payloadType === 'error') {
       return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
     }
   }
@@ -449,7 +449,7 @@ function stringifyCodexOutput(value: unknown): string {
 }
 
 function extractLifecycleSummary(payload: Record<string, unknown>): string | undefined {
-  const candidates = [payload.summary, payload.message, payload.output, payload.text];
+  const candidates = [payload.last_agent_message, payload.summary, payload.message, payload.output, payload.text];
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate;
   }
