@@ -972,18 +972,6 @@ export class AgentPocketDaemon extends EventEmitter {
         tracked.status = SessionStatus.READY;
         tracked.lastActivity = Date.now();
       }
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: sessionId,
-        status: SessionStatus.READY,
-      } as unknown as PcEvent, true, {
-        type: 'session_completed',
-        session_name: this.getSessionName(sessionId),
-        body: truncateUtf8((request.toolInput?.last_assistant_message as string | undefined)?.trim() || 'Codex turn finished', 256),
-        sound: 'completion.caf',
-        category: 'SESSION_COMPLETED',
-        session_id: sessionId,
-      });
     });
 
     this.hookServer.on('codex_permission_request', (request: CodexHookRequest) => {
@@ -1019,6 +1007,7 @@ export class AgentPocketDaemon extends EventEmitter {
         seq: this.messageSeq++,
         timestamp: new Date().toISOString() as unknown as number,
         ttl: HOOK_HOLD_TIMEOUT_SECONDS,
+        // Codex PermissionRequest hook payloads do not expose always-allow suggestions yet.
         has_always_allow: false,
       };
 
@@ -2445,11 +2434,6 @@ export class AgentPocketDaemon extends EventEmitter {
       }
       try {
         terminalSendInterrupt(target);
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: command.session_id,
-          status: SessionStatus.READY,
-        } as unknown as PcEvent);
         logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
       } catch (err) {
         this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');

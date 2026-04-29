@@ -737,6 +737,12 @@ export class HookServer extends EventEmitter {
     eventName: 'codex_session_start' | 'codex_user_prompt_submit' | 'codex_stop',
   ): void {
     const request = parseCodexHookRequest(json);
+    if (!request.sessionId) {
+      logger.warn('hook', 'Rejected Codex hook without session id', { eventName, hookEventName: request.hookEventName });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end('{"error":"missing session id"}');
+      return;
+    }
     debugLog(`Codex ${request.hookEventName} hook fired: session=${request.sessionId}`);
     logger.debug('hook', 'Codex hook', { eventName, sessionId: request.sessionId, hookEventName: request.hookEventName });
     this.emit(eventName, request);
@@ -750,6 +756,12 @@ export class HookServer extends EventEmitter {
     res: http.ServerResponse,
   ): void {
     const request = parseCodexHookRequest(json);
+    if (!request.sessionId) {
+      logger.warn('hook', 'Rejected Codex PermissionRequest without session id', { hookEventName: request.hookEventName });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end('{"error":"missing session id"}');
+      return;
+    }
     const toolUseId = request.toolUseId ?? `codex_hook_${Date.now()}`;
     const toolName = request.toolName ?? 'unknown';
 

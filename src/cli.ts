@@ -30,6 +30,7 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const PID_FILE = path.join(CONFIG_DIR, 'daemon.pid');
 const SESSION_MAP_FILE = path.join(CONFIG_DIR, 'session-map.json');
 const HOOKS_DIR = path.join(CONFIG_DIR, 'hooks');
+const HOOK_DEBUG_LOG_FILE = path.join(CONFIG_DIR, 'hook-debug.log');
 const CLAUDE_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json');
 const CODEX_CONFIG_FILE = path.join(os.homedir(), '.codex', 'config.toml');
 const CODEX_HOOKS_FILE = path.join(os.homedir(), '.codex', 'hooks.json');
@@ -340,6 +341,7 @@ function installCodexHookScript(hookPort: number): void {
 
 ENDPOINT="$1"
 INPUT=$(cat)
+DEBUG_LOG="${HOOK_DEBUG_LOG_FILE}"
 
 CODEX_PID=0
 WALK_PID=$$
@@ -368,7 +370,13 @@ print(json.dumps(payload, separators=(",", ":")))
 ' "$INPUT" "$$" "$CODEX_PID" | curl -s -X POST -H 'Content-Type: application/json' \
   --data-binary @- \
   "http://127.0.0.1:${hookPort}/hooks/codex/$ENDPOINT" \
-  --connect-timeout 1 --max-time 600 || true
+  --connect-timeout 1 --max-time 600
+STATUS=$?
+if [ "$STATUS" -ne 0 ]; then
+  mkdir -p "$(dirname "$DEBUG_LOG")"
+  printf '%s Codex hook bridge failed endpoint=%s status=%s port=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ENDPOINT" "$STATUS" "${hookPort}" >> "$DEBUG_LOG" 2>/dev/null || true
+fi
+exit 0
 `;
 
   fs.writeFileSync(CODEX_HOOK_SCRIPT, script, { mode: 0o755 });
@@ -419,21 +427,37 @@ function enableCodexHooksFeature(): void {
     content = '';
   }
 
-  if (/^codex_hooks\s*=\s*true\s*$/m.test(content)) return;
-  if (/^codex_hooks\s*=\s*false\s*$/m.test(content)) {
-    fs.writeFileSync(CODEX_CONFIG_FILE, content.replace(/^codex_hooks\s*=\s*false\s*$/m, 'codex_hooks = true'), 'utf-8');
+  const features = findTomlSection(content, 'features');
+  if (features) {
+    const section = content.slice(features.bodyStart, features.bodyEnd);
+    if (/^codex_hooks\s*=\s*true\s*$/m.test(section)) return;
+    if (/^codex_hooks\s*=\s*false\s*$/m.test(section)) {
+      const updatedSection = section.replace(/^codex_hooks\s*=\s*false\s*$/m, 'codex_hooks = true');
+      fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, features.bodyStart)}${updatedSection}${content.slice(features.bodyEnd)}`, 'utf-8');
+      return;
+    }
+
+    const needsNewline = section.length > 0 && !section.endsWith('\n') ? '\n' : '';
+    fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, features.bodyEnd)}${needsNewline}codex_hooks = true\n${content.slice(features.bodyEnd)}`, 'utf-8');
     return;
   }
 
-  const featuresMatch = content.match(/^\[features\]\s*$/m);
-  if (!featuresMatch || featuresMatch.index === undefined) {
-    const prefix = content.length > 0 && !content.endsWith('\n') ? '\n\n' : content.length > 0 ? '\n' : '';
-    fs.writeFileSync(CODEX_CONFIG_FILE, `${content}${prefix}[features]\ncodex_hooks = true\n`, 'utf-8');
-    return;
-  }
+  const prefix = content.length > 0 && !content.endsWith('\n') ? '\n\n' : content.length > 0 ? '\n' : '';
+  fs.writeFileSync(CODEX_CONFIG_FILE, `${content}${prefix}[features]\ncodex_hooks = true\n`, 'utf-8');
+}
 
-  const insertAt = featuresMatch.index + featuresMatch[0].length;
-  fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, insertAt)}\ncodex_hooks = true${content.slice(insertAt)}`, 'utf-8');
+function findTomlSection(content: string, sectionName: string): { bodyStart: number; bodyEnd: number } | null {
+  const headerRe = /^\[([^\]]+)\]\s*$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = headerRe.exec(content)) !== null) {
+    if (match[1].trim() !== sectionName) continue;
+    const bodyStart = match.index + match[0].length + (content[match.index + match[0].length] === '\n' ? 1 : 0);
+    const nextHeaderRe = /^\[[^\]]+\]\s*$/gm;
+    nextHeaderRe.lastIndex = bodyStart;
+    const next = nextHeaderRe.exec(content);
+    return { bodyStart, bodyEnd: next?.index ?? content.length };
+  }
+  return null;
 }
 
 function removeClaudeHooks(): void {
