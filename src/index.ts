@@ -948,6 +948,21 @@ export class AgentPocketDaemon extends EventEmitter {
         tracked.status = SessionStatus.READY;
         tracked.lastActivity = Date.now();
       }
+      if (this.initialDiscoveryDone) {
+        const cwd = request.cwd || tracked?.session.cwd || '';
+        const event: SessionStartedEvent = {
+          type: 'session_started',
+          session_id: sessionId,
+          request_id: sessionId,
+          working_directory: cwd,
+          project_name: tracked?.session.title ?? (cwd ? path.basename(cwd) : 'Codex'),
+          agent_type: 'codex',
+          agent_display_name: 'Codex',
+          agent_version: tracked?.session.cliVersion,
+          capabilities: this.getCodexCapabilities(sessionId),
+        };
+        this.sendToPhone(event);
+      }
       logger.info('daemon', 'Codex SessionStart hook', { sessionId, source: request.source, pid: request.codexPid });
     });
 
@@ -1564,6 +1579,13 @@ export class AgentPocketDaemon extends EventEmitter {
         session_id: session.sessionId,
       });
     });
+  }
+
+  private getCodexCapabilities(sessionId: string): string[] {
+    const terminal = this.codexTerminalTargets.get(sessionId);
+    return terminal?.target
+      ? ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions']
+      : ['observe'];
   }
 
   // --------------------------------------------------------------------------
@@ -2620,9 +2642,7 @@ export class AgentPocketDaemon extends EventEmitter {
           observed.status = SessionStatus.HISTORY;
         }
         const terminal = this.codexTerminalTargets.get(codex.sessionId);
-        const capabilities = terminal?.target
-          ? ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions']
-          : ['observe'];
+        const capabilities = this.getCodexCapabilities(codex.sessionId);
         allSessions.push({
           entry: {
             session_id: codex.sessionId,
