@@ -27,6 +27,7 @@ export interface CodexLiveSession {
   threadId: string;
   pid: number;
   rolloutPath: string;
+  lastActivityMs: number;
 }
 
 export function isCodexSessionId(sessionId: string): boolean {
@@ -118,16 +119,23 @@ export class CodexDiscovery {
     const live = new Map<string, CodexLiveSession>();
 
     for (const pid of findCodexPids()) {
-      for (const openedPath of findOpenCodexRollouts(pid, this.codexDir)) {
-        const session = byRolloutPath.get(normalizePath(openedPath));
-        if (!session || live.has(session.sessionId)) continue;
-        live.set(session.sessionId, {
-          sessionId: session.sessionId,
-          threadId: session.threadId,
-          pid,
-          rolloutPath: session.rolloutPath,
-        });
-      }
+      const openedRollouts = findOpenCodexRollouts(pid, this.codexDir)
+        .map((openedPath) => {
+          const session = byRolloutPath.get(normalizePath(openedPath));
+          const lastActivityMs = session ? getCodexRolloutMtimeMs(session.rolloutPath) : undefined;
+          return session && lastActivityMs !== undefined ? { session, lastActivityMs } : null;
+        })
+        .filter((entry): entry is { session: CodexSession; lastActivityMs: number } => entry !== null)
+        .sort((a, b) => b.lastActivityMs - a.lastActivityMs);
+      const current = openedRollouts[0];
+      if (!current || live.has(current.session.sessionId)) continue;
+      live.set(current.session.sessionId, {
+        sessionId: current.session.sessionId,
+        threadId: current.session.threadId,
+        pid,
+        rolloutPath: current.session.rolloutPath,
+        lastActivityMs: current.lastActivityMs,
+      });
     }
 
     return live;
@@ -215,9 +223,9 @@ export function parseCodexProcessList(output: string): number[] {
     if (!match) continue;
     const pid = Number(match[1]);
     if (!Number.isFinite(pid)) continue;
-    const command = match[2];
-    const executable = path.basename(command.split(/\s+/)[0] ?? '');
-    if (executable === 'codex' || executable === 'codex-cli') {
+    const args = match[2].split(/\s+/);
+    const executable = path.basename(args[0] ?? '');
+    if ((executable === 'codex' || executable === 'codex-cli') && args[1] !== 'app-server') {
       pids.push(pid);
     }
   }
@@ -239,6 +247,14 @@ export function findOpenCodexRollouts(pid: number, codexDir = path.join(os.homed
     return paths;
   } catch {
     return [];
+  }
+}
+
+export function getCodexRolloutMtimeMs(rolloutPath: string): number | undefined {
+  try {
+    return fs.statSync(rolloutPath).mtimeMs;
+  } catch {
+    return undefined;
   }
 }
 
