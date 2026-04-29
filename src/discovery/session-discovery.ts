@@ -5,6 +5,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { readlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { findTerminalForPid } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
@@ -131,6 +132,29 @@ export function isProcessSuspendedOrZombie(pid: number): boolean {
   }
 }
 
+export function getLiveProcessCwd(pid: number): string | undefined {
+  if (pid <= 0) return undefined;
+
+  if (process.platform === 'linux') {
+    try {
+      return readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  try {
+    const output = execFileSync('lsof', ['-a', '-d', 'cwd', '-Fn', '-p', String(pid)], {
+      encoding: 'utf-8',
+      timeout: 2000,
+    });
+    const line = output.split('\n').find((part) => part.startsWith('n'));
+    return line && line.length > 1 ? line.slice(1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ============================================================================
 // SessionDiscovery
 // ============================================================================
@@ -212,7 +236,7 @@ export class SessionDiscovery {
           return {
             pid,
             sessionId: data.sessionId as string,
-            cwd: (data.cwd as string) ?? '',
+            cwd: getLiveProcessCwd(pid) ?? (data.cwd as string) ?? '',
             entrypoint: (data.entrypoint as string) ?? 'unknown',
             isAlive,
             name: typeof data.name === 'string' ? (data.name as string) : undefined,
@@ -856,7 +880,7 @@ export class SessionDiscovery {
           results.push({
             pid,
             sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
+            cwd: getLiveProcessCwd(pid) ?? (data.cwd as string) ?? '',
             terminalTarget: findTerminalForPid(pid) ?? undefined,
             entrypoint: 'cli',
             name: typeof data.name === 'string' ? (data.name as string) : undefined,
@@ -903,7 +927,7 @@ export class SessionDiscovery {
           results.push({
             pid,
             sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
+            cwd: getLiveProcessCwd(pid) ?? (data.cwd as string) ?? '',
             terminalTarget: entrypoint === 'cli' ? (findTerminalForPid(pid) ?? undefined) : undefined,
             entrypoint,
             name: typeof data.name === 'string' ? (data.name as string) : undefined,
