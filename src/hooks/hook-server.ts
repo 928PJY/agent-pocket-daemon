@@ -107,8 +107,9 @@ export class HookServer extends EventEmitter {
   private pendingPermissions: Map<string, PendingPermission> = new Map();
   // Map PreToolUse tool_use_id → PermissionRequest hook_id for correlation
   private toolUseToHookId: Map<string, string> = new Map();
-  // Last PreToolUse tool_use_id per session+toolName (for correlating with PermissionRequest)
-  private lastPreToolUse: Map<string, string> = new Map();
+  // FIFO PreToolUse tool_use_id queue per session+toolName (for PermissionRequest correlation)
+  private preToolUseQueues: Map<string, string[]> = new Map();
+  private hookCounter: number = 0;
   private readonly DEFAULT_TIMEOUT_MS = HOOK_HOLD_TIMEOUT_MS;
 
   constructor(port: number = 0) {
@@ -420,7 +421,9 @@ export class HookServer extends EventEmitter {
     // Store correlation: PreToolUse tool_use_id for later PermissionRequest matching
     if (json.tool_use_id) {
       const key = `${sessionId}:${toolName}`;
-      this.lastPreToolUse.set(key, toolUseId);
+      const queue = this.preToolUseQueues.get(key) ?? [];
+      queue.push(toolUseId);
+      this.preToolUseQueues.set(key, queue);
     }
 
     const request: HookPermissionRequest = {
@@ -530,16 +533,17 @@ export class HookServer extends EventEmitter {
     json: Record<string, unknown>,
     res: http.ServerResponse,
   ): void {
-    const hookId = `hook_${Date.now()}`;
+    const hookId = `hook_${Date.now()}_${++this.hookCounter}`;
     const sessionId = json.session_id as string ?? '';
     const toolName = json.tool_name as string ?? 'unknown';
 
     // Correlate with the PreToolUse tool_use_id that fired just before this
     const preToolKey = `${sessionId}:${toolName}`;
-    const preToolUseId = this.lastPreToolUse.get(preToolKey);
+    const preToolUseId = typeof json.tool_use_id === 'string'
+      ? json.tool_use_id
+      : this.shiftPreToolUseId(preToolKey);
     if (preToolUseId) {
       this.toolUseToHookId.set(preToolUseId, hookId);
-      this.lastPreToolUse.delete(preToolKey);
     }
 
     const request: HookPermissionPrompt = {
@@ -638,6 +642,17 @@ export class HookServer extends EventEmitter {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
+  }
+
+  private shiftPreToolUseId(key: string): string | undefined {
+    const queue = this.preToolUseQueues.get(key);
+    if (!queue || queue.length === 0) return undefined;
+
+    const toolUseId = queue.shift();
+    if (queue.length === 0) {
+      this.preToolUseQueues.delete(key);
+    }
+    return toolUseId;
   }
 
   private handleStopHook(
