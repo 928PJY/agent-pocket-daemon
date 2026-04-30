@@ -12,9 +12,15 @@ import { formatTimestamp, logger } from '../logger.js';
 import { HOOK_HOLD_TIMEOUT_MS } from '../shared/index.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.agent-pocket', 'hook-debug.log');
+const MAX_PRE_TOOL_USE_QUEUE_SIZE = 32;
+
 function debugLog(msg: string): void {
   const line = `[${formatTimestamp()}] ${msg}\n`;
   try { fs.appendFileSync(DEBUG_LOG, line); } catch { /* ignore */ }
+}
+
+function sameToolInput(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 // ============================================================================
@@ -47,6 +53,12 @@ interface PendingPermission {
   sessionId: string;
   toolInput?: Record<string, unknown>;
   permissionSuggestions?: unknown[];
+}
+
+interface QueuedPreToolUse {
+  toolUseId: string;
+  toolInput: Record<string, unknown>;
+  createdAt: number;
 }
 
 export interface HookPermissionPrompt {
@@ -107,8 +119,9 @@ export class HookServer extends EventEmitter {
   private pendingPermissions: Map<string, PendingPermission> = new Map();
   // Map PreToolUse tool_use_id → PermissionRequest hook_id for correlation
   private toolUseToHookId: Map<string, string> = new Map();
-  // Last PreToolUse tool_use_id per session+toolName (for correlating with PermissionRequest)
-  private lastPreToolUse: Map<string, string> = new Map();
+  // FIFO PreToolUse tool_use_id queue per session+toolName (for PermissionRequest correlation)
+  private preToolUseQueues: Map<string, QueuedPreToolUse[]> = new Map();
+  private hookCounter: number = 0;
   private readonly DEFAULT_TIMEOUT_MS = HOOK_HOLD_TIMEOUT_MS;
 
   constructor(port: number = 0) {
@@ -420,7 +433,7 @@ export class HookServer extends EventEmitter {
     // Store correlation: PreToolUse tool_use_id for later PermissionRequest matching
     if (json.tool_use_id) {
       const key = `${sessionId}:${toolName}`;
-      this.lastPreToolUse.set(key, toolUseId);
+      this.enqueuePreToolUseId(key, toolUseId, (json.tool_input as Record<string, unknown>) ?? {});
     }
 
     const request: HookPermissionRequest = {
@@ -530,16 +543,17 @@ export class HookServer extends EventEmitter {
     json: Record<string, unknown>,
     res: http.ServerResponse,
   ): void {
-    const hookId = `hook_${Date.now()}`;
+    const hookId = `hook_${Date.now()}_${++this.hookCounter}`;
     const sessionId = json.session_id as string ?? '';
     const toolName = json.tool_name as string ?? 'unknown';
 
     // Correlate with the PreToolUse tool_use_id that fired just before this
     const preToolKey = `${sessionId}:${toolName}`;
-    const preToolUseId = this.lastPreToolUse.get(preToolKey);
+    const preToolUseId = typeof json.tool_use_id === 'string'
+      ? this.removePreToolUseId(preToolKey, json.tool_use_id) ?? json.tool_use_id
+      : this.shiftPreToolUseId(preToolKey, (json.tool_input as Record<string, unknown>) ?? {});
     if (preToolUseId) {
       this.toolUseToHookId.set(preToolUseId, hookId);
-      this.lastPreToolUse.delete(preToolKey);
     }
 
     const request: HookPermissionPrompt = {
@@ -638,6 +652,63 @@ export class HookServer extends EventEmitter {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
+  }
+
+  private shiftPreToolUseId(key: string, toolInput: Record<string, unknown>): string | undefined {
+    const queue = this.prunePreToolUseQueue(key);
+    if (!queue || queue.length === 0) return undefined;
+
+    let entry: QueuedPreToolUse | undefined;
+    const matchingIndex = queue.findIndex((candidate) => sameToolInput(candidate.toolInput, toolInput));
+    if (matchingIndex >= 0) {
+      [entry] = queue.splice(matchingIndex, 1);
+    } else {
+      entry = queue.shift();
+    }
+    if (queue.length === 0) {
+      this.preToolUseQueues.delete(key);
+    }
+    return entry?.toolUseId;
+  }
+
+  private enqueuePreToolUseId(key: string, toolUseId: string, toolInput: Record<string, unknown>): void {
+    const queue = this.prunePreToolUseQueue(key) ?? [];
+    queue.push({ toolUseId, toolInput, createdAt: Date.now() });
+    while (queue.length > MAX_PRE_TOOL_USE_QUEUE_SIZE) {
+      queue.shift();
+    }
+    this.preToolUseQueues.set(key, queue);
+  }
+
+  private removePreToolUseId(key: string, toolUseId: string): string | undefined {
+    const queue = this.prunePreToolUseQueue(key);
+    if (!queue) return undefined;
+
+    const index = queue.findIndex((entry) => entry.toolUseId === toolUseId);
+    if (index === -1) return undefined;
+
+    const [entry] = queue.splice(index, 1);
+    if (queue.length === 0) {
+      this.preToolUseQueues.delete(key);
+    }
+    return entry.toolUseId;
+  }
+
+  private prunePreToolUseQueue(key: string): QueuedPreToolUse[] | undefined {
+    const queue = this.preToolUseQueues.get(key);
+    if (!queue) return undefined;
+
+    const cutoff = Date.now() - this.DEFAULT_TIMEOUT_MS;
+    const fresh = queue.filter((entry) => entry.createdAt >= cutoff);
+    if (fresh.length === 0) {
+      this.preToolUseQueues.delete(key);
+      return undefined;
+    }
+
+    if (fresh.length !== queue.length) {
+      this.preToolUseQueues.set(key, fresh);
+    }
+    return fresh;
   }
 
   private handleStopHook(
