@@ -170,6 +170,62 @@ test('codexHistoryMessageToEvent maps history messages to phone events', () => {
   });
 });
 
+test('parseCodexHistoryEntry maps Codex interrupt markers to system messages', () => {
+  const claudeStyleMessages = parseCodexHistoryEntry({
+    timestamp: '2026-04-30T00:00:00.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: '[Request interrupted by user]' }],
+    },
+  });
+
+  assert.deepEqual(claudeStyleMessages, [{
+    role: 'system',
+    content: 'Interrupted by user.',
+    timestamp: '2026-04-30T00:00:00.000Z',
+  }]);
+  assert.deepEqual(codexHistoryMessageToEvent(claudeStyleMessages[0]), {
+    type: 'system_message',
+    message: 'Interrupted by user.',
+  });
+
+  const codexAbortedMessages = parseCodexHistoryEntry({
+    timestamp: '2026-04-30T00:00:01.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }],
+    },
+  });
+
+  assert.deepEqual(codexAbortedMessages, [{
+    role: 'system',
+    content: 'Interrupted by user.',
+    timestamp: '2026-04-30T00:00:01.000Z',
+  }]);
+  assert.deepEqual(codexHistoryMessageToEvent(codexAbortedMessages[0]), {
+    type: 'system_message',
+    message: 'Interrupted by user.',
+  });
+});
+
+test('parseCodexHistoryEntry drops Codex runtime warnings recorded as user messages', () => {
+  const messages = parseCodexHistoryEntry({
+    timestamp: '2026-04-30T00:00:02.000Z',
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.' }],
+    },
+  });
+
+  assert.deepEqual(messages, []);
+});
+
 test('parseCodexLifecycleEntry detects completed and failed Codex turns', () => {
   assert.deepEqual(parseCodexLifecycleEntry({
     timestamp: '2026-04-29T00:00:01.000Z',
@@ -207,6 +263,15 @@ test('parseCodexLifecycleEntry detects completed and failed Codex turns', () => 
     type: 'turn_failed',
     message: '{"message":"tool failed"}',
     timestamp: undefined,
+  });
+
+  assert.deepEqual(parseCodexLifecycleEntry({
+    timestamp: '2026-04-30T00:00:03.000Z',
+    type: 'event_msg',
+    payload: { type: 'turn_aborted', reason: 'interrupted' },
+  }), {
+    type: 'turn_aborted',
+    timestamp: '2026-04-30T00:00:03.000Z',
   });
 
   assert.equal(parseCodexLifecycleEntry({

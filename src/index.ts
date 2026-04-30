@@ -1588,7 +1588,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
     if (!this.initialDiscoveryDone) return;
-    const body = summary?.trim() || 'Codex turn finished';
+    const body = summary?.trim() || this.codexDiscovery.getLastAssistantMessage(sessionId) || 'Codex turn finished';
     const completionRequestId = `completion_${sessionId}_${Date.now()}`;
     this.sendToPhone({
       type: 'session_status',

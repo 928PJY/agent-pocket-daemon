@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import type { ClaudeEvent } from '../shared/index.js';
 import type { HistoryMessage, HistoryPage } from './session-discovery.js';
 import { logger } from '../logger.js';
+import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
 
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
@@ -12,6 +13,7 @@ const HISTORY_TOOL_OUTPUT_CAP = 5000;
 
 export type CodexLifecycleEvent =
   | { type: 'turn_completed'; summary?: string; timestamp?: string }
+  | { type: 'turn_aborted'; timestamp?: string }
   | { type: 'turn_failed'; message: string; timestamp?: string };
 
 export interface CodexSession {
@@ -232,6 +234,17 @@ export class CodexDiscovery {
     }
   }
 
+  getLastAssistantMessage(sessionId: string): string | undefined {
+    const history = this.getSessionHistory(sessionId, { limit: 100 });
+    for (let i = history.messages.length - 1; i >= 0; i--) {
+      const message = history.messages[i];
+      if (message.role === 'assistant' && message.content.trim().length > 0) {
+        return message.content.trim();
+      }
+    }
+    return undefined;
+  }
+
   private mergeRegisteredSessions(sessions: CodexSession[]): CodexSession[] {
     const merged = new Map<string, CodexSession>();
     for (const session of sessions) {
@@ -381,6 +394,9 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
     if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed' || payloadType === 'task_complete') {
       return { type: 'turn_completed', summary: extractLifecycleSummary(payload), timestamp };
     }
+    if (payloadType === 'turn_aborted' || payloadType === 'turn.abort' || payloadType === 'turn.aborted') {
+      return { type: 'turn_aborted', timestamp };
+    }
     if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'task_failed' || payloadType === 'error') {
       return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
     }
@@ -404,6 +420,13 @@ export function parseCodexResponseItem(payload: Record<string, unknown>, timesta
     const role = payload.role === 'user' ? 'user' : 'assistant';
     const content = extractCodexContentText(payload.content);
     if (!content) return [];
+    if (role === 'user') {
+      if (isCodexRuntimeWarningMessage(content)) return [];
+      const interruptReason = detectInterruptText(content);
+      if (interruptReason || isCodexTurnAbortedMessage(content)) {
+        return [{ role: 'system', content: interruptMessageText(interruptReason ?? 'streaming'), timestamp }];
+      }
+    }
     return [{ role, content, timestamp }];
   }
 
@@ -474,6 +497,14 @@ function extractCodexContentText(content: unknown): string {
     if (typeof b.content === 'string') return b.content;
     return '';
   }).filter(Boolean).join('\n');
+}
+
+function isCodexTurnAbortedMessage(text: string): boolean {
+  return /^<turn_aborted>[\s\S]*<\/turn_aborted>$/.test(text.trim());
+}
+
+function isCodexRuntimeWarningMessage(text: string): boolean {
+  return text.trim() === 'Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.';
 }
 
 function parseToolArguments(value: unknown): Record<string, unknown> {

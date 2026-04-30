@@ -93,6 +93,10 @@ export class CodexObserver extends EventEmitter {
       this.emit('completed', lifecycle.summary);
       return;
     }
+    if (lifecycle?.type === 'turn_aborted') {
+      this.emit('status_change', 'ready');
+      return;
+    }
     if (lifecycle?.type === 'turn_failed') {
       this.emit('error', new Error(lifecycle.message));
       return;
@@ -104,6 +108,9 @@ export class CodexObserver extends EventEmitter {
       for (const message of messages) {
         const event = codexHistoryMessageToEvent(message);
         if (event) this.emit('output', event);
+      }
+      if (messages.some((message) => message.role === 'system' && message.content === 'Interrupted by user.')) {
+        this.emit('status_change', 'ready');
       }
     }
     const payload = entry.payload as Record<string, unknown> | undefined;

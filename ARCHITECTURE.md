@@ -92,6 +92,10 @@ Claude Code can call out to external processes for permission decisions and life
 
 When Claude wants to run a tool, the `PermissionRequest` hook fires → daemon forwards the request to the phone → phone returns approve/deny → daemon returns the verdict to Claude. The whole round-trip is bounded by Claude's hook timeout (10 minutes max — see `HOOK_HOLD_TIMEOUT_MS`).
 
+Codex lifecycle hooks follow the same local-daemon shape for session start, user prompt, stop, and permission forwarding, but the permission UX is not yet equivalent to Claude Code. The current Codex `PermissionRequest` hook is held while the app approves or denies it, so the actionable request is visible in the app rather than in both the Codex terminal and the app. Track the terminal/app dual-approval investigation in [#17](https://github.com/928PJY/agent-pocket-daemon/issues/17).
+
+Codex terminal permission prompts can include an "always allow"-style option, but Codex CLI 0.125.0 does not expose the required `available_decisions` / `additional_permissions` data through the installed shell hook payload. Those fields appear to be part of Codex's internal approval protocol rather than the `PermissionRequest` hook stdin. Until Codex exposes a hook-supported permission amendment response, the daemon keeps `has_always_allow=false` for Codex requests so the app only offers one-time approve/deny actions.
+
 ### End-to-end encryption
 
 The relay server is *intentionally* unable to read session content. Pairing establishes:
