@@ -552,44 +552,48 @@ export class HookServer extends EventEmitter {
     const preToolUseId = typeof json.tool_use_id === 'string'
       ? this.removePreToolUseId(preToolKey, json.tool_use_id) ?? json.tool_use_id
       : this.shiftPreToolUseId(preToolKey, (json.tool_input as Record<string, unknown>) ?? {});
+    // Prefer the Claude tool_use_id as the wire request_id so live events and
+    // JSONL history replay carry the same identity — otherwise iOS sees the
+    // same logical card under two different ids and renders it twice.
+    const requestId = preToolUseId ?? hookId;
     if (preToolUseId) {
-      this.toolUseToHookId.set(preToolUseId, hookId);
+      this.toolUseToHookId.set(preToolUseId, requestId);
     }
 
     const request: HookPermissionPrompt = {
       sessionId,
-      toolUseId: hookId,
+      toolUseId: requestId,
       toolName,
       toolInput: (json.tool_input as Record<string, unknown>) ?? {},
       cwd: json.cwd as string ?? '',
       permissionSuggestions: json.permission_suggestions as unknown[] | undefined,
     };
 
-    debugLog(`PermissionRequest hook for ${request.toolName} (${hookId})${preToolUseId ? ` correlated with ${preToolUseId}` : ''}`);
-    logger.debug('hook', `PermissionRequest hook for ${request.toolName} (${hookId})`);
-    logger.debug('hook', 'PermissionRequest hook received', { hookId, tool: request.toolName, sessionId, preToolUseId });
+    debugLog(`PermissionRequest hook for ${request.toolName} (${requestId})${preToolUseId ? '' : ' [no PreToolUse correlation]'}`);
+    logger.debug('hook', `PermissionRequest hook for ${request.toolName} (${requestId})`);
+    logger.debug('hook', 'PermissionRequest hook received', { requestId, tool: request.toolName, sessionId, preToolUseId });
 
     // Hold the HTTP connection open until the daemon resolves it
     const timer = setTimeout(() => {
-      const expired = this.pendingPermissions.get(hookId);
-      this.pendingPermissions.delete(hookId);
+      const expired = this.pendingPermissions.get(requestId);
+      this.pendingPermissions.delete(requestId);
       if (expired) {
         this.emit('permission_expired', {
           sessionId: request.sessionId,
-          toolUseId: hookId,
+          toolUseId: requestId,
           toolName: request.toolName,
         });
       }
-      debugLog(`PermissionRequest timeout for ${hookId} (${request.toolName})`);
+      debugLog(`PermissionRequest timeout for ${requestId} (${request.toolName})`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{}');
       // Don't emit permission_dismissed here — wait for PostToolUse when terminal user acts.
     }, this.DEFAULT_TIMEOUT_MS);
 
-    this.pendingPermissions.set(hookId, {
+    this.pendingPermissions.set(requestId, {
       resolve: (responseBody: string) => {
-        debugLog(`Sending PermissionRequest response for ${hookId}: ${responseBody.substring(0, 300)}`);
-        logger.debug('hook', `Sending PermissionRequest response for ${hookId}: ${responseBody.substring(0, 300)}`);
+        debugLog(`Sending PermissionRequest response for ${requestId}: ${responseBody.substring(0, 300)}`);
+        logger.debug('hook', `Sending PermissionRequest response for ${requestId}: ${responseBody.substring(0, 300)}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(responseBody);
       },
@@ -603,13 +607,13 @@ export class HookServer extends EventEmitter {
     // Detect when Claude Code aborts the HTTP connection (user approved/denied in terminal).
     // Also dismissed via PostToolUse correlation (more reliable than res.close with keep-alive).
     const onClose = (): void => {
-      if (this.pendingPermissions.has(hookId)) {
+      if (this.pendingPermissions.has(requestId)) {
         clearTimeout(timer);
-        this.pendingPermissions.delete(hookId);
-        debugLog(`Connection closed for ${hookId} (${request.toolName}) — terminal won the race`);
-        logger.debug('hook', `Connection closed for ${hookId} (${request.toolName}) — terminal won the race`);
-        logger.warn('hook', 'Connection closed — terminal won race', { hookId, tool: request.toolName });
-        this.emit('permission_dismissed', hookId, request.toolName, request.sessionId);
+        this.pendingPermissions.delete(requestId);
+        debugLog(`Connection closed for ${requestId} (${request.toolName}) — terminal won the race`);
+        logger.debug('hook', `Connection closed for ${requestId} (${request.toolName}) — terminal won the race`);
+        logger.warn('hook', 'Connection closed — terminal won race', { requestId, tool: request.toolName });
+        this.emit('permission_dismissed', requestId, request.toolName, request.sessionId);
       }
     };
     res.on('close', onClose);
@@ -633,18 +637,18 @@ export class HookServer extends EventEmitter {
     // PostToolUse means the tool already executed — the permission was resolved
     // (either by terminal or phone). Dismiss any stale pending permissions for this tool.
     // We match by tool_use_id via the correlation map set in PreToolUse.
-    const hookId = this.toolUseToHookId.get(result.toolUseId);
-    if (hookId) {
-      const pending = this.pendingPermissions.get(hookId);
+    const requestId = this.toolUseToHookId.get(result.toolUseId);
+    if (requestId) {
+      const pending = this.pendingPermissions.get(requestId);
       if (pending) {
         clearTimeout(pending.timer);
-        this.pendingPermissions.delete(hookId);
+        this.pendingPermissions.delete(requestId);
         try { pending.resolve('{}'); } catch { /* connection may already be closed */ }
       }
       this.toolUseToHookId.delete(result.toolUseId);
       const sessionId = pending?.sessionId ?? result.sessionId;
-      debugLog(`PostToolUse dismissed ${hookId} (${result.toolName}), pending=${!!pending}`);
-      this.emit('permission_dismissed', hookId, result.toolName, sessionId, result.toolResponse);
+      debugLog(`PostToolUse dismissed ${requestId} (${result.toolName}), pending=${!!pending}`);
+      this.emit('permission_dismissed', requestId, result.toolName, sessionId, result.toolResponse);
     }
 
     // Emit and respond immediately (PostToolUse is informational)
