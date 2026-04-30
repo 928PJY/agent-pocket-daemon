@@ -289,6 +289,17 @@ export interface SessionEndedEvent {
   end_reason?: string;
 }
 
+export interface SessionStatusEvent {
+  type: 'session_status';
+  session_id: string;
+  status: SessionStatus;
+  action_type?: 'permission_request' | 'user_question' | 'plan_review';
+  is_completion?: boolean;
+  completion_request_id?: string;
+  completion_body?: string;
+  completion_subtitle?: string;
+}
+
 export interface PermissionRequestEvent {
   type: 'permission_request';
   session_id: string;
@@ -390,6 +401,7 @@ export type PcEvent =
   | SessionStartedEvent
   | SessionOutputEvent
   | SessionEndedEvent
+  | SessionStatusEvent
   | PermissionRequestEvent
   | PermissionDismissedEvent
   | SessionListEvent
