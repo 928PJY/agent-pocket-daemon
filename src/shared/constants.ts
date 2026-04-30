@@ -3,7 +3,6 @@
 export const PERMISSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 export const HOOK_HOLD_TIMEOUT_MS = 595_000; // 595s — just under Claude Code's 10min hook max
 export const HOOK_HOLD_TIMEOUT_SECONDS = HOOK_HOLD_TIMEOUT_MS / 1000;
-export const PERMISSION_TIME_WINDOW_SECONDS = 30;
 
 export const SESSION_TOKEN_EXPIRY_HOURS = 24;
 export const DEVICE_TOKEN_EXPIRY_DAYS = 90;
