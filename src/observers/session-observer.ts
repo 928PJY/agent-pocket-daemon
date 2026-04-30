@@ -20,6 +20,10 @@ import { SubagentObserver } from './subagent-observer.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText, type InterruptReason } from '../utils/interrupt-messages.js';
 
+function isMissingFileError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT';
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -233,6 +237,14 @@ export class SessionObserver extends EventEmitter {
       }
     } catch (err) {
       if (this.active) {
+        if (isMissingFileError(err)) {
+          logger.debug('observer', 'JSONL file disappeared; stopping observer', {
+            sessionId: this.sessionId,
+            path: this.jsonlPath,
+          });
+          this.stop();
+          return;
+        }
         logger.error('observer', `Read error: ${(err as Error).message}`, { sessionId: this.sessionId });
         this.emit('error', err instanceof Error ? err : new Error(String(err)));
       }
