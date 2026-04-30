@@ -148,6 +148,18 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function incrementInjectedMessageCount(injected: Map<string, number>, message: string): void {
+  injected.set(message, (injected.get(message) ?? 0) + 1);
+}
+
+function consumeInjectedMessage(injected: Map<string, number> | undefined, message: string): boolean {
+  const count = injected?.get(message) ?? 0;
+  if (count <= 0) return false;
+  if (count === 1) injected?.delete(message);
+  else injected?.set(message, count - 1);
+  return true;
+}
+
 function detectClaudeVersion(): string | undefined {
   try {
     const output = execFileSync('claude', ['--version'], { encoding: 'utf-8', timeout: 2000 }).trim();
@@ -168,8 +180,9 @@ export class AgentPocketDaemon extends EventEmitter {
   private sessionDiscovery: SessionDiscovery;
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
-  private codexInjectedMessages: Map<string, Set<string>> = new Map();
+  private codexInjectedMessages: Map<string, Map<string, number>> = new Map();
   private recentCodexStopHooks: Map<string, number> = new Map();
+  private completionRequestCounter = 0;
   private claudeAgentVersion?: string;
   private codexTerminalTargets: Map<string, CodexTerminalTargetEntry> = new Map();
   private hookServer: HookServer;
@@ -1154,7 +1167,7 @@ export class AgentPocketDaemon extends EventEmitter {
       // the relevant chat isn't on screen. is_completion marks this as the
       // authoritative end-of-turn event (vs. the observer path which can fire
       // a status=ready transition without any completion data).
-      const completionRequestId = `completion_${externalId}_${firedAt}`;
+      const completionRequestId = this.nextCompletionRequestId(externalId, firedAt);
       event.is_completion = true;
       event.completion_request_id = completionRequestId;
       event.completion_body = completionBody;
@@ -1586,10 +1599,15 @@ export class AgentPocketDaemon extends EventEmitter {
     return true;
   }
 
+  private nextCompletionRequestId(sessionId: string, timestamp: number = Date.now()): string {
+    this.completionRequestCounter = (this.completionRequestCounter + 1) % Number.MAX_SAFE_INTEGER;
+    return `completion_${sessionId}_${timestamp}_${this.completionRequestCounter}`;
+  }
+
   private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
     if (!this.initialDiscoveryDone) return;
     const body = summary?.trim() || this.codexDiscovery.getLastAssistantMessage(sessionId) || 'Codex turn finished';
-    const completionRequestId = `completion_${sessionId}_${Date.now()}`;
+    const completionRequestId = this.nextCompletionRequestId(sessionId);
     this.sendToPhone({
       type: 'session_status',
       session_id: sessionId,
@@ -1621,7 +1639,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private resolveCodexTerminalTarget(sessionId: string, knownLiveCodex?: CodexLiveSession | null): CodexTerminalTargetEntry | undefined {
     const existing = this.codexTerminalTargets.get(sessionId);
     if (existing?.target) {
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget hit map ${sessionId.slice(0, 14)} pid=${existing.pid ?? 'none'} target=${existing.target.type}:${existing.target.target}\n`);
+      logger.debug('daemon', 'resolveCodexTerminalTarget hit cached target', { sessionId, pid: existing.pid, target: existing.target });
       return existing;
     }
 
@@ -1629,12 +1647,12 @@ export class AgentPocketDaemon extends EventEmitter {
       ? this.codexDiscovery.discoverLiveSessions().get(sessionId)
       : knownLiveCodex;
     if (!liveCodex) {
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget no live session ${sessionId.slice(0, 14)} existingPid=${existing?.pid ?? 'none'} existingTarget=${existing?.target ? 'yes' : 'no'}\n`);
+      logger.debug('daemon', 'resolveCodexTerminalTarget found no live session', { sessionId, existingPid: existing?.pid, hasExistingTarget: !!existing?.target });
       return existing;
     }
 
     const target = findTerminalForPid(liveCodex.pid) ?? existing?.target;
-    fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} resolveCodexTerminalTarget live ${sessionId.slice(0, 14)} pid=${liveCodex.pid} target=${target ? `${target.type}:${target.target}` : 'none'}\n`);
+    logger.debug('daemon', 'resolveCodexTerminalTarget resolved live session', { sessionId, pid: liveCodex.pid, target });
     const next: CodexTerminalTargetEntry = {
       pid: liveCodex.pid,
       target,
@@ -2280,15 +2298,15 @@ export class AgentPocketDaemon extends EventEmitter {
       try {
         let injected = this.codexInjectedMessages.get(command.session_id);
         if (!injected) {
-          injected = new Set<string>();
+          injected = new Map<string, number>();
           this.codexInjectedMessages.set(command.session_id, injected);
         }
-        injected.add(command.message);
+        incrementInjectedMessageCount(injected, command.message);
         terminalSendMessage(target, command.message);
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
         logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort });
       } catch (err) {
-        this.codexInjectedMessages.get(command.session_id)?.delete(command.message);
+        consumeInjectedMessage(this.codexInjectedMessages.get(command.session_id), command.message);
         const msg = (err as Error).message;
         if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
         this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
@@ -2802,8 +2820,14 @@ export class AgentPocketDaemon extends EventEmitter {
         };
       });
 
-      // Debug: log final sessions with PIDs
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Returning ${sessions.length} sessions: ${sessions.map((s: any) => `${s.session_id.slice(0,14)}(pid=${s.pid ?? 'none'},caps=${Array.isArray(s.capabilities) ? s.capabilities.join('+') : 'none'})`).join(', ')}\n`);
+      logger.debug('daemon', 'handleListSessions returning page', {
+        count: sessions.length,
+        sessions: pageSlice.map(({ entry }) => ({
+          sessionId: entry.session_id,
+          pid: entry.pid,
+          capabilities: entry.capabilities,
+        })),
+      });
 
       const event = {
         type: 'session_list',
@@ -3044,7 +3068,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
     if (agentType === 'codex' && agentEvent.type === 'user_message') {
       const injected = this.codexInjectedMessages.get(sessionId);
-      if (injected?.delete(agentEvent.message)) {
+      if (consumeInjectedMessage(injected, agentEvent.message)) {
         return;
       }
     }
