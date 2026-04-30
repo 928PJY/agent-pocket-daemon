@@ -37,6 +37,9 @@ export const PEER_CAPABILITIES = {
 
   /** Daemon can send an interrupt key sequence to an attached terminal. */
   TERMINAL_INTERRUPT: 'terminal.interrupt',
+
+  /** Completion events include a stable per-turn request id for deduplication. */
+  COMPLETION_REQUEST_ID: 'completion.request_id',
 } as const;
 
 export type PeerCapability = typeof PEER_CAPABILITIES[keyof typeof PEER_CAPABILITIES];
@@ -52,4 +55,5 @@ export const CURRENT_PEER_CAPABILITIES: PeerCapability[] = [
   PEER_CAPABILITIES.CODEX_OBSERVE,
   PEER_CAPABILITIES.TERMINAL_REMOTE_MESSAGE,
   PEER_CAPABILITIES.TERMINAL_INTERRUPT,
+  PEER_CAPABILITIES.COMPLETION_REQUEST_ID,
 ];

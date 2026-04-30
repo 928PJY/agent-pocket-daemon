@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import type { ClaudeEvent } from '../shared/index.js';
 import type { HistoryMessage, HistoryPage } from './session-discovery.js';
 import { logger } from '../logger.js';
+import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
 
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
@@ -12,6 +13,7 @@ const HISTORY_TOOL_OUTPUT_CAP = 5000;
 
 export type CodexLifecycleEvent =
   | { type: 'turn_completed'; summary?: string; timestamp?: string }
+  | { type: 'turn_aborted'; timestamp?: string }
   | { type: 'turn_failed'; message: string; timestamp?: string };
 
 export interface CodexSession {
@@ -49,6 +51,7 @@ export function codexThreadIdFromSessionId(sessionId: string): string {
 export class CodexDiscovery {
   private codexDir: string;
   private cachedSessions: CodexSession[] | null = null;
+  private registeredSessions: Map<string, CodexSession> = new Map();
   private historyCache: Map<string, { messages: HistoryMessage[]; mtime: number }> = new Map();
 
   constructor(codexDir?: string) {
@@ -99,8 +102,8 @@ export class CodexDiscovery {
         })
         .filter((s): s is CodexSession => s !== null);
 
-      this.cachedSessions = sessions;
-      return sessions;
+      this.cachedSessions = this.mergeRegisteredSessions(sessions);
+      return this.cachedSessions;
     } catch (err) {
       logger.warn('codex-discovery', `Codex discovery failed: ${(err as Error).message}`);
       return [];
@@ -111,10 +114,45 @@ export class CodexDiscovery {
     return this.cachedSessions;
   }
 
+  registerSessionFromRollout(input: { sessionId?: string; threadId?: string; rolloutPath: string; cwd?: string; cliVersion?: string; title?: string }): CodexSession | undefined {
+    const rolloutPath = normalizePath(input.rolloutPath);
+    if (!fs.existsSync(rolloutPath)) return undefined;
+
+    const threadId = extractThreadIdFromRolloutPath(rolloutPath)
+      ?? (input.threadId ? codexThreadIdFromSessionId(input.threadId) : undefined)
+      ?? (input.sessionId ? codexThreadIdFromSessionId(input.sessionId) : undefined);
+    if (!threadId) return undefined;
+
+    const stat = fs.statSync(rolloutPath);
+    const existing = this.registeredSessions.get(threadId);
+    const session: CodexSession = {
+      threadId,
+      sessionId: codexExternalSessionId(threadId),
+      rolloutPath,
+      cwd: input.cwd || existing?.cwd || path.dirname(rolloutPath),
+      title: input.title ?? existing?.title,
+      createdAtMs: existing?.createdAtMs ?? stat.birthtimeMs,
+      updatedAtMs: Math.max(existing?.updatedAtMs ?? 0, stat.mtimeMs),
+      cliVersion: input.cliVersion ?? existing?.cliVersion,
+      model: existing?.model,
+    };
+
+    this.registeredSessions.set(threadId, session);
+    this.cachedSessions = this.mergeRegisteredSessions(this.cachedSessions ?? []);
+    return session;
+  }
+
   getSession(threadOrSessionId: string): CodexSession | undefined {
     const threadId = codexThreadIdFromSessionId(threadOrSessionId);
+    const registered = this.registeredSessions.get(threadId);
+    if (registered && fs.existsSync(registered.rolloutPath)) return registered;
+
     const cached = this.cachedSessions ?? this.discoverSessions();
-    return cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
+    const session = cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
+    if (session) return session;
+
+    const refreshed = this.discoverSessions();
+    return refreshed.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
   }
 
   discoverLiveSessions(sessions = this.cachedSessions ?? this.discoverSessions()): Map<string, CodexLiveSession> {
@@ -123,25 +161,11 @@ export class CodexDiscovery {
     const live = new Map<string, CodexLiveSession>();
 
     for (const pid of findCodexPids()) {
-      // Codex TUI can hold multiple rollout files open for one process. The
-      // newest mtime is our best approximation of the thread currently in focus.
-      const openedRollouts = findOpenCodexRollouts(pid, this.codexDir)
-        .map((openedPath) => {
-          const session = byRolloutPath.get(normalizePath(openedPath));
-          const lastActivityMs = session ? getCodexRolloutMtimeMs(session.rolloutPath) : undefined;
-          return session && lastActivityMs !== undefined ? { session, lastActivityMs } : null;
-        })
-        .filter((entry): entry is { session: CodexSession; lastActivityMs: number } => entry !== null)
-        .sort((a, b) => b.lastActivityMs - a.lastActivityMs);
-      const current = openedRollouts[0];
-      if (!current || live.has(current.session.sessionId)) continue;
-      live.set(current.session.sessionId, {
-        sessionId: current.session.sessionId,
-        threadId: current.session.threadId,
-        pid,
-        rolloutPath: current.session.rolloutPath,
-        lastActivityMs: current.lastActivityMs,
-      });
+      for (const liveSession of codexLiveSessionsFromOpenedRollouts(pid, findOpenCodexRollouts(pid, this.codexDir), byRolloutPath)) {
+        if (!live.has(liveSession.sessionId)) {
+          live.set(liveSession.sessionId, liveSession);
+        }
+      }
     }
 
     return live;
@@ -209,6 +233,62 @@ export class CodexDiscovery {
       return { messages: [], totalCount: 0, offset, hasMore: false };
     }
   }
+
+  getLastAssistantMessage(sessionId: string): string | undefined {
+    const history = this.getSessionHistory(sessionId, { limit: 100 });
+    for (let i = history.messages.length - 1; i >= 0; i--) {
+      const message = history.messages[i];
+      if (message.role === 'assistant' && message.content.trim().length > 0) {
+        return message.content.trim();
+      }
+    }
+    return undefined;
+  }
+
+  private mergeRegisteredSessions(sessions: CodexSession[]): CodexSession[] {
+    const merged = new Map<string, CodexSession>();
+    for (const session of sessions) {
+      merged.set(session.threadId, session);
+      this.registeredSessions.delete(session.threadId);
+    }
+    for (const [threadId, session] of this.registeredSessions) {
+      if (!fs.existsSync(session.rolloutPath)) {
+        this.registeredSessions.delete(threadId);
+        continue;
+      }
+      merged.set(threadId, session);
+    }
+    return Array.from(merged.values()).sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
+  }
+}
+
+export function codexLiveSessionsFromOpenedRollouts(
+  pid: number,
+  openedPaths: string[],
+  byRolloutPath: Map<string, CodexSession>,
+): CodexLiveSession[] {
+  let current: CodexLiveSession | undefined;
+  for (const openedPath of openedPaths) {
+    const session = byRolloutPath.get(normalizePath(openedPath));
+    if (!session) continue;
+    const lastActivityMs = getCodexRolloutMtimeMs(session.rolloutPath);
+    if (lastActivityMs === undefined) continue;
+    const candidate = {
+      sessionId: session.sessionId,
+      threadId: session.threadId,
+      pid,
+      rolloutPath: session.rolloutPath,
+      lastActivityMs,
+    };
+    if (!current || candidate.lastActivityMs > current.lastActivityMs) current = candidate;
+  }
+  return current ? [current] : [];
+}
+
+export function extractThreadIdFromRolloutPath(rolloutPath: string): string | undefined {
+  const base = path.basename(rolloutPath);
+  const match = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1];
 }
 
 export function codexStateDbReadonlyUri(stateDb: string): string {
@@ -297,9 +377,6 @@ export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryM
         timestamp,
       }];
     }
-    if (payloadType === 'agent_message' && typeof payload.message === 'string') {
-      return [{ role: 'assistant', content: payload.message, timestamp }];
-    }
   }
 
   return [];
@@ -314,10 +391,13 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
   const payloadType = payload.type as string | undefined;
 
   if (type === 'event_msg') {
-    if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed') {
+    if (payloadType === 'turn_completed' || payloadType === 'turn.complete' || payloadType === 'turn.completed' || payloadType === 'task_complete') {
       return { type: 'turn_completed', summary: extractLifecycleSummary(payload), timestamp };
     }
-    if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'error') {
+    if (payloadType === 'turn_aborted' || payloadType === 'turn.abort' || payloadType === 'turn.aborted') {
+      return { type: 'turn_aborted', timestamp };
+    }
+    if (payloadType === 'turn_failed' || payloadType === 'turn.fail' || payloadType === 'turn.failed' || payloadType === 'task_failed' || payloadType === 'error') {
       return { type: 'turn_failed', message: extractLifecycleError(payload), timestamp };
     }
   }
@@ -340,6 +420,13 @@ export function parseCodexResponseItem(payload: Record<string, unknown>, timesta
     const role = payload.role === 'user' ? 'user' : 'assistant';
     const content = extractCodexContentText(payload.content);
     if (!content) return [];
+    if (role === 'user') {
+      if (isCodexRuntimeWarningMessage(content)) return [];
+      const interruptReason = detectInterruptText(content);
+      if (interruptReason || isCodexTurnAbortedMessage(content)) {
+        return [{ role: 'system', content: interruptMessageText(interruptReason ?? 'streaming'), timestamp }];
+      }
+    }
     return [{ role, content, timestamp }];
   }
 
@@ -412,6 +499,14 @@ function extractCodexContentText(content: unknown): string {
   }).filter(Boolean).join('\n');
 }
 
+function isCodexTurnAbortedMessage(text: string): boolean {
+  return /^<turn_aborted>[\s\S]*<\/turn_aborted>$/.test(text.trim());
+}
+
+function isCodexRuntimeWarningMessage(text: string): boolean {
+  return text.trim() === 'Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.';
+}
+
 function parseToolArguments(value: unknown): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -435,7 +530,7 @@ function stringifyCodexOutput(value: unknown): string {
 }
 
 function extractLifecycleSummary(payload: Record<string, unknown>): string | undefined {
-  const candidates = [payload.summary, payload.message, payload.output, payload.text];
+  const candidates = [payload.last_agent_message, payload.summary, payload.message, payload.output, payload.text];
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate;
   }

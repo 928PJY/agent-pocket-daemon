@@ -64,6 +64,22 @@ export interface HookPermissionExpired {
   toolName: string;
 }
 
+export interface CodexHookRequest {
+  sessionId: string;
+  threadId?: string;
+  turnId?: string;
+  cwd: string;
+  transcriptPath: string;
+  hookEventName: string;
+  source?: string;
+  prompt?: string;
+  toolUseId?: string;
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  hookPid?: number;
+  codexPid?: number;
+}
+
 export interface HookServerEvents {
   permission_request: [request: HookPermissionRequest];
   permission_prompt: [request: HookPermissionPrompt];
@@ -74,6 +90,10 @@ export interface HookServerEvents {
   session_end: [sessionId: string, reason: string, cwd: string, transcriptPath: string];
   subagent_start: [sessionId: string, agentId: string, agentType: string, transcriptPath: string];
   subagent_stop: [sessionId: string, agentId: string, agentType: string, transcriptPath: string];
+  codex_session_start: [request: CodexHookRequest];
+  codex_user_prompt_submit: [request: CodexHookRequest];
+  codex_permission_request: [request: CodexHookRequest];
+  codex_stop: [request: CodexHookRequest];
   error: [error: Error];
 }
 
@@ -368,6 +388,14 @@ export class HookServer extends EventEmitter {
           this.handleSubagentStopHook(json, res);
         } else if (url === '/hooks/subagent-start') {
           this.handleSubagentStartHook(json, res);
+        } else if (url === '/hooks/codex/session-start') {
+          this.handleCodexInformationalHook(json, res, 'codex_session_start');
+        } else if (url === '/hooks/codex/user-prompt-submit') {
+          this.handleCodexInformationalHook(json, res, 'codex_user_prompt_submit');
+        } else if (url === '/hooks/codex/stop') {
+          this.handleCodexInformationalHook(json, res, 'codex_stop');
+        } else if (url === '/hooks/codex/permission-request') {
+          this.handleCodexPermissionRequestHook(json, res);
         } else {
           debugLog(`Unknown URL: ${url}`);
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -702,4 +730,114 @@ export class HookServer extends EventEmitter {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
   }
+
+  private handleCodexInformationalHook(
+    json: Record<string, unknown>,
+    res: http.ServerResponse,
+    eventName: 'codex_session_start' | 'codex_user_prompt_submit' | 'codex_stop',
+  ): void {
+    const request = parseCodexHookRequest(json);
+    if (!request.sessionId) {
+      logger.warn('hook', 'Rejected Codex hook without session id', { eventName, hookEventName: request.hookEventName });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end('{"error":"missing session id"}');
+      return;
+    }
+    debugLog(`Codex ${request.hookEventName} hook fired: session=${request.sessionId}`);
+    logger.debug('hook', 'Codex hook', { eventName, sessionId: request.sessionId, hookEventName: request.hookEventName });
+    this.emit(eventName, request);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+  }
+
+  private handleCodexPermissionRequestHook(
+    json: Record<string, unknown>,
+    res: http.ServerResponse,
+  ): void {
+    const request = parseCodexHookRequest(json);
+    if (!request.sessionId) {
+      logger.warn('hook', 'Rejected Codex PermissionRequest without session id', { hookEventName: request.hookEventName });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end('{"error":"missing session id"}');
+      return;
+    }
+    const toolUseId = request.toolUseId ?? `codex_hook_${Date.now()}`;
+    const toolName = request.toolName ?? 'unknown';
+
+    const timer = setTimeout(() => {
+      const expired = this.pendingPermissions.get(toolUseId);
+      this.pendingPermissions.delete(toolUseId);
+      if (expired) {
+        this.emit('permission_expired', {
+          sessionId: request.sessionId,
+          toolUseId,
+          toolName,
+        });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }, this.DEFAULT_TIMEOUT_MS);
+
+    this.pendingPermissions.set(toolUseId, {
+      resolve: (responseBody: string) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(responseBody);
+      },
+      timer,
+      toolName,
+      sessionId: request.sessionId,
+      toolInput: request.toolInput ?? {},
+    });
+
+    res.on('close', () => {
+      if (!this.pendingPermissions.has(toolUseId)) return;
+      clearTimeout(timer);
+      this.pendingPermissions.delete(toolUseId);
+      logger.warn('hook', 'Codex PermissionRequest connection closed', { toolUseId, tool: toolName });
+      this.emit('permission_dismissed', toolUseId, toolName, request.sessionId);
+    });
+
+    this.emit('codex_permission_request', { ...request, toolUseId, toolName });
+  }
+}
+
+function parseCodexHookRequest(json: Record<string, unknown>): CodexHookRequest {
+  const sessionId = pickString(json, ['session_id', 'thread_id', 'conversation_id']) ?? '';
+  const hookEventName = pickString(json, ['hook_event_name', 'hookEventName']) ?? 'CodexHook';
+  const toolInput = json.tool_input && typeof json.tool_input === 'object' && !Array.isArray(json.tool_input)
+    ? json.tool_input as Record<string, unknown>
+    : undefined;
+  return {
+    sessionId,
+    threadId: pickString(json, ['thread_id', 'session_id']),
+    turnId: pickString(json, ['turn_id']),
+    cwd: pickString(json, ['cwd']) ?? '',
+    transcriptPath: pickString(json, ['transcript_path', 'rollout_path']) ?? '',
+    hookEventName,
+    source: pickString(json, ['source']),
+    prompt: pickString(json, ['prompt']),
+    toolUseId: pickString(json, ['tool_use_id', 'call_id']),
+    toolName: pickString(json, ['tool_name', 'name']),
+    toolInput,
+    hookPid: pickNumber(json, ['agent_pocket_hook_pid', 'hook_pid']),
+    codexPid: pickNumber(json, ['agent_pocket_codex_pid', 'codex_pid']),
+  };
+}
+
+function pickString(json: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = json[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function pickNumber(json: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = json[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
+  }
+  return undefined;
 }

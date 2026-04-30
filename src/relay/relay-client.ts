@@ -142,6 +142,12 @@ export class RelayClient extends EventEmitter {
       if (wakePayload && this.config.encryptWakeBlob) {
         envelope.wake_blob = this.config.encryptWakeBlob(JSON.stringify(wakePayload));
       }
+      logger.trace('relay', 'TX wake envelope prepared', {
+        payload_type: (payload as { type?: string })?.type,
+        wake_payload_type: wakePayload?.type,
+        wake_body_bytes: wakePayload?.body ? Buffer.byteLength(wakePayload.body, 'utf-8') : 0,
+        has_wake_blob: typeof envelope.wake_blob === 'string',
+      });
     }
 
     if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
