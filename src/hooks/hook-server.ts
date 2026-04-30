@@ -479,8 +479,12 @@ export class HookServer extends EventEmitter {
         if (this.pendingPermissions.has(toolUseId)) {
           clearTimeout(timer);
           this.pendingPermissions.delete(toolUseId);
-          logger.warn('hook', 'AskUserQuestion connection closed — terminal won race', { toolUseId });
-          this.emit('permission_dismissed', toolUseId, request.toolName, request.sessionId);
+          logger.warn('hook', 'AskUserQuestion connection closed before phone response', { toolUseId });
+          this.emit('permission_expired', {
+            sessionId: request.sessionId,
+            toolUseId,
+            toolName: request.toolName,
+          });
         }
       };
       res.on('close', onCloseAsk);
@@ -518,16 +522,20 @@ export class HookServer extends EventEmitter {
       toolInput: request.toolInput,
     });
 
-    // If Claude Code aborts the HTTP connection before the phone responds
-    // (e.g. terminal user pressed Esc / Ctrl+C), clean up the pending entry.
-    // Without this the entry sits until DEFAULT_TIMEOUT_MS and
-    // pendingBlockingRequests on the daemon leaks.
+    // If Claude Code aborts the HTTP connection before the phone responds,
+    // keep the phone card as expired instead of dismissing it silently.
+    // PostToolUse remains the authoritative signal that terminal-side action
+    // actually completed and should remove the card.
     const onClose = (): void => {
       if (this.pendingPermissions.has(toolUseId)) {
         clearTimeout(permTimer);
         this.pendingPermissions.delete(toolUseId);
-        logger.warn('hook', 'PreToolUse connection closed — terminal won race', { toolUseId, tool: request.toolName });
-        this.emit('permission_dismissed', toolUseId, request.toolName, request.sessionId);
+        logger.warn('hook', 'PreToolUse connection closed before phone response', { toolUseId, tool: request.toolName });
+        this.emit('permission_expired', {
+          sessionId: request.sessionId,
+          toolUseId,
+          toolName: request.toolName,
+        });
       }
     };
     res.on('close', onClose);
@@ -604,16 +612,22 @@ export class HookServer extends EventEmitter {
       permissionSuggestions: request.permissionSuggestions,
     });
 
-    // Detect when Claude Code aborts the HTTP connection (user approved/denied in terminal).
-    // Also dismissed via PostToolUse correlation (more reliable than res.close with keep-alive).
+    // Detect when Claude Code aborts the HTTP connection before the phone
+    // responds. Do not dismiss the phone card here: close can race with APNs
+    // wake and app launch, so PostToolUse is the reliable terminal-completed
+    // signal that should remove the request.
     const onClose = (): void => {
       if (this.pendingPermissions.has(requestId)) {
         clearTimeout(timer);
         this.pendingPermissions.delete(requestId);
-        debugLog(`Connection closed for ${requestId} (${request.toolName}) — terminal won the race`);
-        logger.debug('hook', `Connection closed for ${requestId} (${request.toolName}) — terminal won the race`);
-        logger.warn('hook', 'Connection closed — terminal won race', { requestId, tool: request.toolName });
-        this.emit('permission_dismissed', requestId, request.toolName, request.sessionId);
+        debugLog(`Connection closed for ${requestId} (${request.toolName}) before phone response`);
+        logger.debug('hook', `Connection closed for ${requestId} (${request.toolName}) before phone response`);
+        logger.warn('hook', 'PermissionRequest connection closed before phone response', { requestId, tool: request.toolName });
+        this.emit('permission_expired', {
+          sessionId: request.sessionId,
+          toolUseId: requestId,
+          toolName: request.toolName,
+        });
       }
     };
     res.on('close', onClose);
