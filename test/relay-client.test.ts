@@ -33,6 +33,26 @@ test('RelayClient sets envelope wake bit only when caller requests it', () => {
   assert.equal(queue[1].wake, true);
 });
 
+test('RelayClient sets force_wake only on forced wake messages', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+
+  client.send({ type: 'permission_request', request_id: 'req-1' }, false, undefined, true);
+  client.send({ type: 'permission_request', request_id: 'req-2' }, true);
+  client.send({ type: 'permission_request', request_id: 'req-3' }, true, undefined, true);
+
+  const queue = (client as unknown as { offlineQueue: Array<{ wake?: boolean; force_wake?: boolean }> }).offlineQueue;
+  assert.equal(queue[0].wake, undefined);
+  assert.equal(queue[0].force_wake, undefined);
+  assert.equal(queue[1].wake, true);
+  assert.equal(queue[1].force_wake, undefined);
+  assert.equal(queue[2].wake, true);
+  assert.equal(queue[2].force_wake, true);
+});
+
 test('RelayClient serializes encrypted wake blob only for wake messages', () => {
   const payload: WakeBlobPayload = {
     type: 'plan_review',
