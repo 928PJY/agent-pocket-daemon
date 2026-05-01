@@ -231,6 +231,7 @@ export class AgentPocketDaemon extends EventEmitter {
     type: 'permission_request' | 'user_question' | 'plan_review';
     toolName?: string;
     expiredToTerminal?: boolean;
+    expiredSystemMessageSent?: boolean;
   }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -791,6 +792,7 @@ export class AgentPocketDaemon extends EventEmitter {
             toolName: expiredToolName,
             actionType: entry.type,
           });
+          this.sendExpiredPendingSystemMessage(entry.sessionId, requestId, expiredToolName, entry.type, entry);
           this.sendToPhone({
             type: 'session_status',
             session_id: entry.sessionId,
@@ -970,7 +972,10 @@ export class AgentPocketDaemon extends EventEmitter {
       // still shows waitingPermission until terminal user acts.
       const blocking = this.pendingBlockingRequests.get(expired.toolUseId);
       if (blocking) {
-        (blocking as any).expiredToTerminal = true;
+        blocking.expiredToTerminal = true;
+        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, blocking.type, blocking);
+      } else {
+        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, 'permission_request');
       }
       logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
     });
@@ -3097,6 +3102,32 @@ export class AgentPocketDaemon extends EventEmitter {
       }
       this.relayClient.send(event, wake, wakePayload);
     }
+  }
+
+  private sendExpiredPendingSystemMessage(
+    sessionId: string,
+    requestId: string,
+    toolName: string,
+    actionType: 'permission_request' | 'user_question' | 'plan_review',
+    entry?: { expiredSystemMessageSent?: boolean },
+  ): void {
+    if (entry?.expiredSystemMessageSent) return;
+    const actionLabel = actionType === 'user_question'
+      ? 'question'
+      : actionType === 'plan_review'
+      ? 'plan review'
+      : 'permission request';
+    const content = "This " + actionLabel + " has expired. Handle it in the terminal, or interrupt this session from the app and continue it to trigger a new request.";
+    this.sendToPhone({
+      type: 'session_output',
+      session_id: sessionId,
+      output_type: 'system',
+      content,
+      timestamp: Date.now(),
+      request_id: requestId,
+      tool_name: toolName,
+    } as unknown as PcEvent);
+    if (entry) entry.expiredSystemMessageSent = true;
   }
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
