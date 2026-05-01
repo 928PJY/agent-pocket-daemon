@@ -43,6 +43,7 @@ import type {
   SessionOutputAckCommand,
   VerifyHistoryCommand,
   SyncRequestCommand,
+  NotificationDeliveryAckCommand,
   PcEvent,
   SessionStartedEvent,
   SessionOutputEvent,
@@ -70,6 +71,7 @@ import {
   HOOK_SERVER_PORT,
   WIRE_VERSION_CURRENT,
   CURRENT_PEER_CAPABILITIES,
+  PEER_CAPABILITIES,
   BLOCKING_RETRY_INTERVAL_MS,
   BLOCKING_RETRY_CHECK_INTERVAL_MS,
 } from 'agent-pocket-protocol';
@@ -103,6 +105,12 @@ type CodexTerminalTargetEntry = {
   turnId?: string;
   updatedAt: number;
 };
+
+type NotificationDeliveryEventType = 'permission_request' | 'user_question' | 'plan_review' | 'session_completed' | 'session_error';
+
+const NOTIFICATION_DELIVERY_MAX_ATTEMPTS = 3;
+const NOTIFICATION_DELIVERY_RETRY_INTERVAL_MS = 30_000;
+const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 10_000;
 
 // ============================================================================
 // AgentPocketDaemon
@@ -235,7 +243,17 @@ export class AgentPocketDaemon extends EventEmitter {
     expiredToTerminal?: boolean;
     expiredSystemMessageSent?: boolean;
   }> = new Map();
+  private pendingNotificationDeliveries: Map<string, {
+    requestId: string;
+    sessionId: string;
+    eventType: NotificationDeliveryEventType;
+    event: PcEvent;
+    wakePayload?: WakeBlobPayload;
+    sentAt: number;
+    attempts: number;
+  }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
+  private notificationDeliveryRetryInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: DaemonConfig) {
     super();
@@ -355,6 +373,9 @@ export class AgentPocketDaemon extends EventEmitter {
     this.blockingRetryInterval = setInterval(() => {
       this.retryPendingBlockingRequests();
     }, BLOCKING_RETRY_CHECK_INTERVAL_MS);
+    this.notificationDeliveryRetryInterval = setInterval(() => {
+      this.retryPendingNotificationDeliveries();
+    }, NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS);
 
     return hookPort;
   }
@@ -374,6 +395,10 @@ export class AgentPocketDaemon extends EventEmitter {
     if (this.blockingRetryInterval) {
       clearInterval(this.blockingRetryInterval);
       this.blockingRetryInterval = null;
+    }
+    if (this.notificationDeliveryRetryInterval) {
+      clearInterval(this.notificationDeliveryRetryInterval);
+      this.notificationDeliveryRetryInterval = null;
     }
     this.pendingBlockingRequests.clear();
     if (this.relayClient) {
@@ -465,16 +490,18 @@ export class AgentPocketDaemon extends EventEmitter {
 
     this.sessionManager.on('session_ended', (sessionId: string, exitCode: number) => {
       const externalId = this.resolveExternalSessionId(sessionId);
+      const errorRequestId = exitCode !== 0 ? `session_error_${externalId}_${Date.now()}` : undefined;
       const event: SessionEndedEvent = {
         type: 'session_ended',
         session_id: externalId,
         exit_code: exitCode,
         end_reason: exitCode === 0 ? 'completed' : 'error',
+        ...(errorRequestId ? { request_id: errorRequestId } : {}),
       };
 
       if (exitCode !== 0) {
         const sessionName = this.getSessionName(externalId);
-        this.sendToPhone(event, true, {
+        this.sendNotificationEventToPhone(event, 'session_error', externalId, errorRequestId!, {
           type: 'session_error',
           session_name: sessionName,
           body: `Session exited with code ${exitCode}`,
@@ -482,6 +509,7 @@ export class AgentPocketDaemon extends EventEmitter {
           sound: 'default',
           category: 'SESSION_ERROR',
           session_id: externalId,
+          request_id: errorRequestId,
         });
       } else {
         this.sendToPhone(event);
@@ -495,6 +523,9 @@ export class AgentPocketDaemon extends EventEmitter {
         if (entry.sessionId === externalId) {
           this.pendingBlockingRequests.delete(reqId);
         }
+      }
+      if (exitCode === 0) {
+        this.clearNotificationDeliveriesForSession(externalId);
       }
     });
 
@@ -516,7 +547,7 @@ export class AgentPocketDaemon extends EventEmitter {
             timestamp: new Date().toISOString(),
             ttl: HOOK_HOLD_TIMEOUT_SECONDS,
           };
-          this.sendToPhone(flat as unknown as PcEvent, true, {
+          this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, requestId, {
             type: 'user_question',
             session_name: this.getSessionName(externalId),
             body: truncateUtf8(questionPreview, 256),
@@ -780,7 +811,7 @@ export class AgentPocketDaemon extends EventEmitter {
         // (no in-memory cache) can rebuild the card. Then send a
         // permission_expired event so the card shows the timed-out banner.
         if ((entry as any).expiredToTerminal) {
-          this.sendToPhone(entry.event);
+          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
           const expiredToolName = (entry.event as any)?.tool_name ?? (entry as any).toolName ?? entry.type;
           this.sendToPhone({
             type: 'permission_expired',
@@ -795,6 +826,7 @@ export class AgentPocketDaemon extends EventEmitter {
             actionType: entry.type,
           });
           this.sendExpiredPendingSystemMessage(entry.sessionId, requestId, expiredToolName, entry.type, entry);
+          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
           this.sendToPhone({
             type: 'session_status',
             session_id: entry.sessionId,
@@ -810,11 +842,12 @@ export class AgentPocketDaemon extends EventEmitter {
           s => s.pendingPermissions?.has(requestId),
         );
         if (hookPending || sdkPending) {
-          this.sendToPhone(entry.event);
+          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
           entry.sentAt = Date.now();
           resent++;
         } else {
           this.pendingBlockingRequests.delete(requestId);
+          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
         }
       }
       logger.debug('daemon', `Resent ${resent} pending blocking requests`);
@@ -970,14 +1003,27 @@ export class AgentPocketDaemon extends EventEmitter {
 
       this.sendToPhone(event as unknown as PcEvent);
 
-      // Mark as expired but keep in pendingBlockingRequests so session list
-      // still shows waitingPermission until terminal user acts.
+      // Timeout transfers the request back to the terminal. Keep the expired
+      // banner in chat, but stop treating it as an app-blocking action so a
+      // later permission can surface normally.
       const blocking = this.pendingBlockingRequests.get(expired.toolUseId);
       if (blocking) {
-        blocking.expiredToTerminal = true;
         this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, blocking.type, blocking);
+        this.pendingBlockingRequests.delete(expired.toolUseId);
+        this.clearNotificationDelivery(blocking.type, externalId, expired.toolUseId);
       } else {
         this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, 'permission_request');
+        this.clearNotificationDelivery('permission_request', externalId, expired.toolUseId);
+      }
+      const hasOtherBlocking = Array.from(this.pendingBlockingRequests.values()).some(
+        entry => entry.sessionId === externalId,
+      );
+      if (!hasOtherBlocking) {
+        this.sendToPhone({
+          type: 'session_status',
+          session_id: externalId,
+          status: SessionStatus.READY,
+        } as unknown as PcEvent);
       }
       logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
     });
@@ -1069,7 +1115,7 @@ export class AgentPocketDaemon extends EventEmitter {
         has_always_allow: false,
       };
 
-      this.sendToPhone(event, true, {
+      this.sendNotificationEventToPhone(event, 'permission_request', sessionId, requestId, {
         type: 'permission_request',
         session_name: this.getSessionName(sessionId),
         body: truncateUtf8(`${toolName}: ${context}`, 256),
@@ -1126,6 +1172,7 @@ export class AgentPocketDaemon extends EventEmitter {
       for (const [reqId, entry] of this.pendingBlockingRequests) {
         if (entry.sessionId === externalId) {
           this.pendingBlockingRequests.delete(reqId);
+          this.clearNotificationDelivery(entry.type, entry.sessionId, reqId);
           cleared++;
         }
       }
@@ -1188,7 +1235,7 @@ export class AgentPocketDaemon extends EventEmitter {
       event.completion_body = completionBody;
       if (subtitle) event.completion_subtitle = subtitle;
 
-      this.sendToPhone(event as unknown as PcEvent, true, {
+      this.sendNotificationEventToPhone(event as unknown as PcEvent, 'session_completed', externalId, completionRequestId, {
         type: 'session_completed',
         session_name: projectName,
         body: truncateUtf8(completionBody.trim() || 'Session finished', 256),
@@ -1464,7 +1511,7 @@ export class AgentPocketDaemon extends EventEmitter {
           timestamp: new Date().toISOString(),
           ttl: HOOK_HOLD_TIMEOUT_SECONDS,
         };
-        this.sendToPhone(flat as unknown as PcEvent, true, {
+        this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, request.toolUseId, {
           type: 'user_question',
           session_name: this.getSessionName(externalId),
           body: truncateUtf8(hookQuestionPreview, 256),
@@ -1512,7 +1559,7 @@ export class AgentPocketDaemon extends EventEmitter {
         has_always_allow: Array.isArray(request.permissionSuggestions) && request.permissionSuggestions.length > 0,
       };
 
-      this.sendToPhone(event, true, {
+      this.sendNotificationEventToPhone(event, 'permission_request', externalId, request.toolUseId, {
         type: 'permission_request',
         session_name: this.getSessionName(externalId),
         body: truncateUtf8(`${request.toolName}: ${context}`, 256),
@@ -1623,14 +1670,14 @@ export class AgentPocketDaemon extends EventEmitter {
     if (!this.initialDiscoveryDone) return;
     const body = summary?.trim() || this.codexDiscovery.getLastAssistantMessage(sessionId) || 'Codex turn finished';
     const completionRequestId = this.nextCompletionRequestId(sessionId);
-    this.sendToPhone({
+    this.sendNotificationEventToPhone({
       type: 'session_status',
       session_id: sessionId,
       status: SessionStatus.READY,
       is_completion: true,
       completion_request_id: completionRequestId,
       completion_body: body,
-    } as unknown as PcEvent, true, {
+    } as unknown as PcEvent, 'session_completed', sessionId, completionRequestId, {
       type: 'session_completed',
       session_name: session?.title ?? (session?.cwd ? path.basename(session.cwd) : this.getSessionName(sessionId)),
       body: truncateUtf8(body, 256),
@@ -2214,6 +2261,10 @@ export class AgentPocketDaemon extends EventEmitter {
         this.handleSessionOutputAck(command);
         break;
 
+      case 'notification_delivery_ack':
+        this.handleNotificationDeliveryAck(command);
+        break;
+
       case 'verify_history':
         this.handleVerifyHistory(command);
         break;
@@ -2428,6 +2479,8 @@ export class AgentPocketDaemon extends EventEmitter {
   private handlePermissionResponse(command: PermissionResponseCommand): void {
     logger.debug('daemon', `handlePermissionResponse: request_id=${command.request_id}, decision=${command.decision}, hasPending=${this.hookServer.hasPendingPermission(command.request_id)}`);
     this.untrackBlockingRequest(command.request_id);
+    this.clearNotificationDelivery('permission_request', command.session_id, command.request_id);
+    this.clearNotificationDelivery('plan_review', command.session_id, command.request_id);
     try {
       // Verify the phone signature if we have peer identity key
       if (command.phone_signature && this.cryptoEngine.hasSessionKeys()) {
@@ -2539,6 +2592,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handleQuestionResponse(command: QuestionResponseCommand): void {
     this.untrackBlockingRequest(command.request_id);
+    this.clearNotificationDelivery('user_question', command.session_id, command.request_id);
     try {
       // AskUserQuestion answers come back through the PermissionRequest hook system
       if (this.hookServer.hasPendingPermission(command.request_id)) {
@@ -3010,6 +3064,26 @@ export class AgentPocketDaemon extends EventEmitter {
     logger.trace('daemon', 'session_output_ack', { sessionId: command.session_id, lastSeq: command.last_seq });
   }
 
+  private handleNotificationDeliveryAck(command: NotificationDeliveryAckCommand): void {
+    const key = this.notificationDeliveryKey(command.event_type, command.session_id, command.request_id);
+    const pending = this.pendingNotificationDeliveries.get(key);
+    if (pending) {
+      this.pendingNotificationDeliveries.delete(key);
+      logger.debug('daemon', 'notification_delivery_ack received', {
+        eventType: command.event_type,
+        sessionId: command.session_id,
+        requestId: command.request_id,
+        attempts: pending.attempts,
+      });
+    } else {
+      logger.trace('daemon', 'notification_delivery_ack for untracked event', {
+        eventType: command.event_type,
+        sessionId: command.session_id,
+        requestId: command.request_id,
+      });
+    }
+  }
+
   private handleVerifyHistory(command: VerifyHistoryCommand): void {
     // Read entire history (limit large enough to cover any session) to compare
     // against the phone's claimed count/tail. Silence = match.
@@ -3083,7 +3157,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // Helpers
   // --------------------------------------------------------------------------
 
-  private sendToPhone(event: PcEvent, wake = false, wakePayload?: WakeBlobPayload): void {
+  private sendToPhone(event: PcEvent, wake = false, wakePayload?: WakeBlobPayload, forceWake = false): void {
     // Stamp per-session monotonic seq on session_output events so the phone
     // can detect gaps and request fill via get_history{since_seq}.
     if ((event as { type?: string })?.type === 'session_output') {
@@ -3106,7 +3180,99 @@ export class AgentPocketDaemon extends EventEmitter {
       if (this.cryptoEngine.needsRekey()) {
         this.cryptoEngine.resetRekeyCounters();
       }
-      this.relayClient.send(event, wake, wakePayload);
+      this.relayClient.send(event, wake, wakePayload, forceWake);
+    }
+  }
+
+  private sendNotificationEventToPhone(
+    event: PcEvent,
+    eventType: NotificationDeliveryEventType,
+    sessionId: string,
+    requestId: string,
+    wakePayload: WakeBlobPayload,
+  ): void {
+    this.sendToPhone(event, true, wakePayload);
+    this.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
+  }
+
+  private trackNotificationDelivery(
+    eventType: NotificationDeliveryEventType,
+    sessionId: string,
+    requestId: string,
+    event: PcEvent,
+    wakePayload: WakeBlobPayload,
+  ): void {
+    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
+    const key = this.notificationDeliveryKey(eventType, sessionId, requestId);
+    this.pendingNotificationDeliveries.set(key, {
+      requestId,
+      sessionId,
+      eventType,
+      event,
+      wakePayload,
+      sentAt: Date.now(),
+      attempts: 1,
+    });
+    logger.debug('daemon', 'Tracking notification delivery', { eventType, sessionId, requestId });
+  }
+
+  private notificationDeliveryKey(eventType: string, sessionId: string, requestId: string): string {
+    return `${eventType}|${sessionId}|${requestId}`;
+  }
+
+  private resendTrackedBlockingEvent(
+    eventType: 'permission_request' | 'user_question' | 'plan_review',
+    sessionId: string,
+    requestId: string,
+    event: PcEvent,
+    forceWake = false,
+  ): void {
+    const pending = this.pendingNotificationDeliveries.get(this.notificationDeliveryKey(eventType, sessionId, requestId));
+    if (pending?.wakePayload) {
+      this.sendToPhone(event, true, pending.wakePayload, forceWake);
+    } else {
+      this.sendToPhone(event);
+    }
+  }
+
+  private clearNotificationDelivery(eventType: string, sessionId: string, requestId: string): void {
+    this.pendingNotificationDeliveries.delete(this.notificationDeliveryKey(eventType, sessionId, requestId));
+  }
+
+  private clearNotificationDeliveriesForSession(sessionId: string): void {
+    for (const [key, entry] of this.pendingNotificationDeliveries) {
+      if (entry.sessionId === sessionId) {
+        this.pendingNotificationDeliveries.delete(key);
+      }
+    }
+  }
+
+  private retryPendingNotificationDeliveries(): void {
+    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
+    const now = Date.now();
+    for (const [key, entry] of this.pendingNotificationDeliveries) {
+      if (now - entry.sentAt < NOTIFICATION_DELIVERY_RETRY_INTERVAL_MS) continue;
+
+      if (entry.attempts >= NOTIFICATION_DELIVERY_MAX_ATTEMPTS) {
+        this.pendingNotificationDeliveries.delete(key);
+        logger.warn('daemon', 'Notification delivery ack missing after bounded retries', {
+          eventType: entry.eventType,
+          sessionId: entry.sessionId,
+          requestId: entry.requestId,
+          attempts: entry.attempts,
+        });
+        continue;
+      }
+
+      entry.attempts += 1;
+      entry.sentAt = now;
+      logger.warn('daemon', 'Retrying unacknowledged notification delivery', {
+        eventType: entry.eventType,
+        sessionId: entry.sessionId,
+        requestId: entry.requestId,
+        attempts: entry.attempts,
+      });
+      this.sendToPhone(entry.event, true, entry.wakePayload, true);
     }
   }
 
@@ -3340,6 +3506,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
       if (!isStillPending) {
         this.pendingBlockingRequests.delete(requestId);
+        this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
         continue;
       }
 
@@ -3687,7 +3854,7 @@ export class AgentPocketDaemon extends EventEmitter {
       ttl: HOOK_HOLD_TIMEOUT_SECONDS,
     };
 
-    this.sendToPhone(flat as unknown as PcEvent, true, {
+    this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'plan_review', sessionId, requestId, {
       type: 'plan_review',
       session_name: this.getSessionName(sessionId),
       body: truncateUtf8(planContent || 'A plan is ready for your review', 256),

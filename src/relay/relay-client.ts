@@ -114,7 +114,7 @@ export class RelayClient extends EventEmitter {
    * peer is offline. `wakePayload` is encrypted into an opaque fixed-size blob
    * for iOS notification display; the relay only copies it through.
    */
-  send(payload: unknown, wake?: boolean, wakePayload?: WakeBlobPayload): void {
+  send(payload: unknown, wake?: boolean, wakePayload?: WakeBlobPayload, forceWake = false): void {
     const serialized = JSON.stringify(payload);
 
     let encryptedPayload: string;
@@ -139,6 +139,9 @@ export class RelayClient extends EventEmitter {
     };
     if (wake) {
       envelope.wake = true;
+      if (forceWake) {
+        envelope.force_wake = true;
+      }
       if (wakePayload && this.config.encryptWakeBlob) {
         envelope.wake_blob = this.config.encryptWakeBlob(JSON.stringify(wakePayload));
       }
@@ -147,6 +150,7 @@ export class RelayClient extends EventEmitter {
         wake_payload_type: wakePayload?.type,
         wake_body_bytes: wakePayload?.body ? Buffer.byteLength(wakePayload.body, 'utf-8') : 0,
         has_wake_blob: typeof envelope.wake_blob === 'string',
+        force_wake: envelope.force_wake === true,
       });
     }
 
