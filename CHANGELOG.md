@@ -14,15 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sync_complete` terminator carrying the per-session tail seqs. Phone
   uses the terminator to commit a side-staged batch in one transaction
   instead of rendering each backfilled message individually (issue #160).
-  The capability is implemented but **not yet announced**:
-  `SYNC_BOUNDARY` is appended to `CURRENT_PEER_CAPABILITIES` in a
-  follow-up release after `agent-pocket-protocol@0.2.1` ships.
 
 ### Changed
-- Bumped `agent-pocket-protocol` to `^0.2.0`. Brings in the `sync_request` /
-  `sync_complete` types and the `SYNC_BOUNDARY` capability constant. No
-  behavior change yet — daemon does not announce `SYNC_BOUNDARY` and has no
-  handler; both arrive in the next release (Phase 2 of agent-pocket #160).
+- Bumped `agent-pocket-protocol` to `^0.2.1`. 0.2.1 appends
+  `SYNC_BOUNDARY` to `CURRENT_PEER_CAPABILITIES`, so this build now
+  announces the capability in `peer_hello` — phones gating on
+  `peerCapabilities.has(SYNC_BOUNDARY)` will start using `sync_request`.
 - Switched wire-protocol source from the bundled `src/shared/` copy to the
   published [`agent-pocket-protocol`](https://www.npmjs.com/package/agent-pocket-protocol)
   npm package. `VERSION` moved to `src/version.ts`. No behavioral change — both
