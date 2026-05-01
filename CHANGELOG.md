@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Bumped `agent-pocket-protocol` to `^0.2.0`. Brings in the `sync_request` /
+  `sync_complete` types and the `SYNC_BOUNDARY` capability constant. No
+  behavior change yet — daemon does not announce `SYNC_BOUNDARY` and has no
+  handler; both arrive in the next release (Phase 2 of agent-pocket #160).
 - Switched wire-protocol source from the bundled `src/shared/` copy to the
   published [`agent-pocket-protocol`](https://www.npmjs.com/package/agent-pocket-protocol)
   npm package. `VERSION` moved to `src/version.ts`. No behavioral change — both

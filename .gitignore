@@ -6,3 +6,4 @@ dist/
 .env.*
 !.env.example
 *.tsbuildinfo
+.claude/worktrees/
