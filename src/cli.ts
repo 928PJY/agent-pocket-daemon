@@ -1279,6 +1279,19 @@ function getTtyForPid(pid: number): string | null {
   }
 }
 
+function formatLocalLastActivity(timestampMs?: number): string {
+  if (!timestampMs) return '-';
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short',
+  }).format(new Date(timestampMs));
+}
+
 async function cmdSessions(): Promise<void> {
   const { running } = isDaemonRunning();
   if (!running) {
@@ -1331,7 +1344,7 @@ async function cmdSessions(): Promise<void> {
     Title: s.customTitle ?? '-',
     CWD: s.cwd.replace(os.homedir(), '~'),
     Mode: s.isObserved ? 'observer' : 'controller',
-    'Last Activity': s.lastActivity ? new Date(s.lastActivity).toLocaleTimeString() : '-',
+    'Last Activity': formatLocalLastActivity(s.lastActivity),
   }));
 
   const codexRows = liveCodexSessions.map(({ live, session }) => ({
@@ -1344,7 +1357,7 @@ async function cmdSessions(): Promise<void> {
     Title: session.title ?? '-',
     CWD: session.cwd.replace(os.homedir(), '~'),
     Mode: 'observer',
-    'Last Activity': new Date(live.lastActivityMs).toLocaleTimeString(),
+    'Last Activity': formatLocalLastActivity(live.lastActivityMs),
   }));
 
   const rows = [...claudeRows, ...codexRows]
