@@ -1,7 +1,7 @@
 // Agent Pocket -- Bonjour Advertiser
 // Publishes _agentpocket._tcp service via mDNS for LAN discovery.
 
-import { BONJOUR_SERVICE_TYPE } from '../shared/index.js'
+import { BONJOUR_SERVICE_TYPE } from 'agent-pocket-protocol'
 import { logger } from '../logger.js'
 
 // ============================================================================

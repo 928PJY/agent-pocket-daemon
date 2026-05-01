@@ -9,7 +9,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { formatTimestamp, logger } from '../logger.js';
-import { HOOK_HOLD_TIMEOUT_MS } from '../shared/index.js';
+import { HOOK_HOLD_TIMEOUT_MS } from 'agent-pocket-protocol';
 
 const DEBUG_LOG = path.join(os.homedir(), '.agent-pocket', 'hook-debug.log');
 const MAX_PRE_TOOL_USE_QUEUE_SIZE = 32;

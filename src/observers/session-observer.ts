@@ -15,7 +15,7 @@ import type {
   ToolResultEvent,
   UserMessageEvent,
   SystemMessageEvent,
-} from '../shared/index.js';
+} from 'agent-pocket-protocol';
 import { SubagentObserver } from './subagent-observer.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText, type InterruptReason } from '../utils/interrupt-messages.js';

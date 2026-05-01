@@ -16,8 +16,8 @@ import type {
   LanAuthResult,
   LanPairRequest,
   LanPairResponse,
-} from '../shared/index.js'
-import { LAN_AUTH_TIMEOUT_MS, WIRE_VERSION_MIN, WIRE_VERSION_CURRENT } from '../shared/index.js'
+} from 'agent-pocket-protocol'
+import { LAN_AUTH_TIMEOUT_MS, WIRE_VERSION_MIN, WIRE_VERSION_CURRENT } from 'agent-pocket-protocol'
 
 // ============================================================================
 // Types

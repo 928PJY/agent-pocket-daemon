@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import type { ClaudeEvent } from '../shared/index.js';
+import type { ClaudeEvent } from 'agent-pocket-protocol';
 import type { HistoryMessage, HistoryPage } from './session-discovery.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';

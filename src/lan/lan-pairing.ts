@@ -5,8 +5,8 @@ import * as os from 'node:os'
 import { v4 as uuidv4 } from 'uuid'
 import type { CryptoEngine } from '../crypto/crypto-engine.js'
 import { spkiEd25519ToRaw, rawX25519ToSpki, rawEd25519ToSpki } from '../crypto/key-format.js'
-import type { LanPairRequest, LanPairResponse, QrCodePayload } from '../shared/index.js'
-import { DAEMON_DEFAULT_PORT, PAIRING_EXPIRY_SECONDS } from '../shared/index.js'
+import type { LanPairRequest, LanPairResponse, QrCodePayload } from 'agent-pocket-protocol'
+import { DAEMON_DEFAULT_PORT, PAIRING_EXPIRY_SECONDS } from 'agent-pocket-protocol'
 import { LanServer } from './lan-server.js'
 
 // ============================================================================

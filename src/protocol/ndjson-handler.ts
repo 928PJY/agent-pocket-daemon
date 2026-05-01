@@ -10,7 +10,7 @@ import type {
   AssistantMessageEvent,
   ToolUseEvent,
   ToolResultEvent,
-} from '../shared/index.js';
+} from 'agent-pocket-protocol';
 
 // ============================================================================
 // Raw Claude Code stream-json event shapes
