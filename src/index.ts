@@ -2644,8 +2644,9 @@ export class AgentPocketDaemon extends EventEmitter {
         // Real (non-synthetic) entries always win — they're live blocking requests.
         // Synthetic startup_pending_* entries are heuristic guesses from JSONL state
         // at startup; if the session has been silent for a long time, the user has
-        // likely moved past it. Downgrade to ready instead of advertising a phantom
-        // pending badge.
+        // likely moved past it — clean up the synthetic so it doesn't keep firing,
+        // but keep trusting SessionManager's own status (it's tracked from observer
+        // events, not from the hook server).
         let effectiveStatus = active.status as SessionStatus;
         let actionType: string | undefined;
         const realPending = Array.from(this.pendingBlockingRequests.entries()).find(
@@ -2663,7 +2664,11 @@ export class AgentPocketDaemon extends EventEmitter {
               this.pendingBlockingRequests.delete(syntheticId);
             }
           }
-          effectiveStatus = SessionStatus.READY;
+          // Do NOT downgrade to READY here — SessionManager set this status
+          // for a reason (real PreToolUse, observer detection, or startup
+          // JSONL analysis). The hook server can lose track of a permission
+          // that was timed out / transferred to terminal, but the session is
+          // still genuinely waiting.
         }
 
         allSessions.push({
@@ -2791,6 +2796,27 @@ export class AgentPocketDaemon extends EventEmitter {
           historyKey: codex.sessionId,
         });
         claimedSessionIds.add(codex.sessionId);
+      }
+
+      // Overlay pending_actions from the hook server onto whatever status
+      // each phase produced. Phase 2 (alive PID without an attached observer)
+      // hardcodes READY, so a real blocking permission request would otherwise
+      // be invisible to the phone. Only real pending entries qualify —
+      // synthetic startup_pending_* are heuristic guesses, not live blocks.
+      const realPendingBySessionId = new Map<string, string>();
+      for (const [reqId, entry] of this.pendingBlockingRequests.entries()) {
+        if (reqId.startsWith('startup_pending_')) continue;
+        if (!realPendingBySessionId.has(entry.sessionId)) {
+          realPendingBySessionId.set(entry.sessionId, entry.type);
+        }
+      }
+      for (const item of allSessions) {
+        const sid = item.entry.session_id as string;
+        const pendingType = realPendingBySessionId.get(sid);
+        if (pendingType && item.entry.status !== SessionStatus.PENDING_ACTIONS) {
+          item.entry.status = SessionStatus.PENDING_ACTIONS;
+          item.entry.action_type = pendingType;
+        }
       }
 
       // Sort: active sessions first, then by last_activity descending
