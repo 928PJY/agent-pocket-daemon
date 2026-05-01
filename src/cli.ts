@@ -1292,6 +1292,12 @@ function formatLocalLastActivity(timestampMs?: number): string {
   }).format(new Date(timestampMs));
 }
 
+function formatSessionTitle(title?: string): string {
+  if (!title) return '-';
+  const maxLength = /\p{Script=Han}/u.test(title) ? 5 : 20;
+  return Array.from(title).slice(0, maxLength).join('');
+}
+
 async function cmdSessions(): Promise<void> {
   const { running } = isDaemonRunning();
   if (!running) {
@@ -1341,7 +1347,7 @@ async function cmdSessions(): Promise<void> {
     'Session ID': s.sessionId.slice(0, 8) + '...',
     Status: s.status,
     Type: s.entrypoint ?? '-',
-    Title: s.customTitle ?? '-',
+    Title: formatSessionTitle(s.customTitle),
     CWD: s.cwd.replace(os.homedir(), '~'),
     Mode: s.isObserved ? 'observer' : 'controller',
     'Last Activity': formatLocalLastActivity(s.lastActivity),
@@ -1354,7 +1360,7 @@ async function cmdSessions(): Promise<void> {
     'Session ID': session.sessionId.slice(0, 14) + '...',
     Status: 'ready',
     Type: 'codex-cli',
-    Title: session.title ?? '-',
+    Title: formatSessionTitle(session.title),
     CWD: session.cwd.replace(os.homedir(), '~'),
     Mode: 'observer',
     'Last Activity': formatLocalLastActivity(live.lastActivityMs),
