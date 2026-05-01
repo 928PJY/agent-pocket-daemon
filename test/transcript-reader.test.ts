@@ -74,3 +74,47 @@ test('readLastTurnSummary ignores malformed lines and waits for an end_turn afte
 test('readLastTurnSummary returns null for missing transcript path', async () => {
   assert.equal(await readLastTurnSummary(''), null);
 });
+
+test('readLastTurnSummary treats tool_result-wrapped user lines as part of the assistant turn', async () => {
+  // A real-world turn: the user asks something, the assistant calls 3 tools,
+  // each tool_use is followed by a `type: "user"` line whose only content is a
+  // tool_result block. The summary should still attribute all 3 tool_use blocks
+  // to this turn — the tool_result wrappers are NOT new user turns.
+  const file = tempTranscript([
+    { type: 'user', timestamp: '2026-01-01T00:00:00.000Z', message: { content: [{ type: 'text', text: 'do the thing' }] } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      message: { content: [{ type: 'tool_use' }], usage: { output_tokens: 1, cache_creation_input_tokens: 0 } },
+    },
+    { type: 'user', timestamp: '2026-01-01T00:00:02.000Z', message: { content: [{ type: 'tool_result' }] } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:03.000Z',
+      message: { content: [{ type: 'tool_use' }], usage: { output_tokens: 1, cache_creation_input_tokens: 0 } },
+    },
+    { type: 'user', timestamp: '2026-01-01T00:00:04.000Z', message: { content: [{ type: 'tool_result' }] } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:05.000Z',
+      message: { content: [{ type: 'tool_use' }], usage: { output_tokens: 1, cache_creation_input_tokens: 0 } },
+    },
+    { type: 'user', timestamp: '2026-01-01T00:00:06.000Z', message: { content: [{ type: 'tool_result' }] } },
+    {
+      type: 'assistant',
+      timestamp: '2026-01-01T00:00:08.000Z',
+      message: {
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'all done' }],
+        usage: { output_tokens: 5, cache_creation_input_tokens: 0 },
+      },
+    },
+  ]);
+
+  assert.deepEqual(await readLastTurnSummary(file), {
+    text: 'all done',
+    toolUseCount: 3,
+    totalTokens: 8,
+    durationSec: 8,
+  });
+});

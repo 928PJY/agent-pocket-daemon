@@ -86,6 +86,20 @@ function toolUsesIn(line: TranscriptLine): number {
 }
 
 /**
+ * Distinguish a real user turn from a `type: "user"` line that just wraps a
+ * tool_result block. Tool-result lines share the same `type` discriminator,
+ * but their `content` is a list of `tool_result` blocks rather than text/image
+ * input. Treating them as the turn boundary causes us to undercount everything
+ * that happened in the actual turn.
+ */
+function isRealUserTurn(line: TranscriptLine): boolean {
+  if (line.type !== 'user') return false;
+  const content = line.message?.content;
+  if (!Array.isArray(content)) return true;
+  return !content.every((b) => b.type === 'tool_result');
+}
+
+/**
  * Read the most recent end-of-turn summary from a transcript file. Walks
  * backwards from the last `end_turn` assistant line up to the preceding
  * `user` message, summing tokens / tool_use blocks across the turn and
@@ -159,7 +173,8 @@ type SummaryResult =
 function summarizeFromLines(lines: Array<TranscriptLine | null>): SummaryResult {
   let userIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]?.type === 'user') { userIdx = i; break; }
+    const l = lines[i];
+    if (l && isRealUserTurn(l)) { userIdx = i; break; }
   }
   if (userIdx < 0) return { summary: null, reason: 'no-user' };
 
