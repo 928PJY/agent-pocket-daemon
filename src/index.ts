@@ -42,6 +42,7 @@ import type {
   SetPreferencesCommand,
   SessionOutputAckCommand,
   VerifyHistoryCommand,
+  SyncRequestCommand,
   PcEvent,
   SessionStartedEvent,
   SessionOutputEvent,
@@ -52,6 +53,7 @@ import type {
   ErrorEvent,
   MessageAckEvent,
   HistoryDivergenceEvent,
+  SyncCompleteEvent,
   ClaudeEvent,
   PeerHello,
   SessionInfo,
@@ -2216,6 +2218,10 @@ export class AgentPocketDaemon extends EventEmitter {
         this.handleVerifyHistory(command);
         break;
 
+      case 'sync_request':
+        this.handleSyncRequest(command);
+        break;
+
       default:
         this.sendError(
           (command as { request_id?: string }).request_id,
@@ -3696,11 +3702,13 @@ export class AgentPocketDaemon extends EventEmitter {
   /**
    * Read session history from disk and send it to the phone.
    * Supports pagination (offset/limit) and incremental fetch (since).
+   * Returns the tail seq actually sent (for callers that need to report
+   * it back, e.g. sync_complete.delivered).
    */
   private sendSessionHistory(
     claudeSessionId: string,
     options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
-  ): void {
+  ): number | undefined {
     // If no 'since' filter and no explicit offset, send all messages (up to 2000)
     // to ensure the phone gets complete history on first load.
     // When 'since'/'sinceSeq' is present, use smaller default limit for incremental updates.
@@ -3746,5 +3754,76 @@ export class AgentPocketDaemon extends EventEmitter {
     };
 
     this.sendToPhone(event as unknown as PcEvent);
+    return result.tailSeq;
   }
+
+  /**
+   * Handle sync_request from the phone (issue #160). For each session known
+   * to the daemon, replay missed history (everything past the phone's
+   * cursor, or the full history if the phone never saw it). Then emit a
+   * sync_complete terminator so the phone can commit its side-staged batch
+   * in one transaction.
+   *
+   * Ordering: sendSessionHistory is synchronous and sendToPhone serializes
+   * to the WS, so emitting sync_complete after the loop guarantees it
+   * arrives last on the wire.
+   *
+   * Gated by PEER_CAPABILITIES.SYNC_BOUNDARY (announced separately once
+   * the protocol package's CURRENT_PEER_CAPABILITIES is updated).
+   */
+  private handleSyncRequest(command: SyncRequestCommand): void {
+    const cursorMap = new Map<string, number>();
+    for (const cursor of command.cursors ?? []) {
+      cursorMap.set(cursor.session_id, cursor.last_seq);
+    }
+
+    const known = mergeSyncSessionIds(
+      cursorMap,
+      this.sessionManager
+        .getAllSessions()
+        .map((s) => s.claudeSessionId)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+
+    const delivered: SyncCompleteEvent['delivered'] = [];
+    for (const sessionId of known) {
+      const lastSeq = cursorMap.get(sessionId);
+      const tail = this.sendSessionHistory(sessionId, {
+        sinceSeq: lastSeq !== undefined && lastSeq >= 0 ? lastSeq : undefined,
+      });
+      if (tail !== undefined) {
+        delivered.push({ session_id: sessionId, last_seq: tail });
+      }
+    }
+
+    const event: SyncCompleteEvent = {
+      type: 'sync_complete',
+      request_id: command.request_id,
+      delivered,
+    };
+    logger.info('daemon', 'sync_complete', {
+      requestId: command.request_id,
+      sessions: delivered.length,
+    });
+    this.sendToPhone(event);
+  }
+}
+
+/**
+ * Build the set of session ids to replay during a sync_request: every
+ * session the phone declared a cursor for plus every session the daemon
+ * currently knows about. Exported for unit testing.
+ */
+export function mergeSyncSessionIds(
+  cursorMap: Map<string, number>,
+  daemonKnownSessionIds: Iterable<string>,
+): Set<string> {
+  const merged = new Set<string>();
+  for (const sessionId of cursorMap.keys()) {
+    merged.add(sessionId);
+  }
+  for (const sessionId of daemonKnownSessionIds) {
+    merged.add(sessionId);
+  }
+  return merged;
 }

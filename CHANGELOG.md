@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `sync_request` command handler. On receipt, the daemon replays missed
+  history (full or `since_seq`-filtered, per session) for every session
+  in the union of phone cursors + locally-known sessions, then emits a
+  `sync_complete` terminator carrying the per-session tail seqs. Phone
+  uses the terminator to commit a side-staged batch in one transaction
+  instead of rendering each backfilled message individually (issue #160).
+  The capability is implemented but **not yet announced**:
+  `SYNC_BOUNDARY` is appended to `CURRENT_PEER_CAPABILITIES` in a
+  follow-up release after `agent-pocket-protocol@0.2.1` ships.
+
 ### Changed
 - Bumped `agent-pocket-protocol` to `^0.2.0`. Brings in the `sync_request` /
   `sync_complete` types and the `SYNC_BOUNDARY` capability constant. No
