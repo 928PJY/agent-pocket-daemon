@@ -202,3 +202,63 @@ test('HookServer removes direct-correlated PreToolUse IDs from the fallback queu
   server.resolvePermissionPrompt(directPromptId, 'allow');
   await Promise.all([directPromptResponse, fallbackPromptResponse]);
 });
+
+test('HookServer keeps phone request visible when PermissionRequest connection closes before PostToolUse', async (t) => {
+  const server = new HookServer(0);
+  const port = await server.start();
+  t.after(() => server.stop());
+
+  const prompts: HookPermissionPrompt[] = [];
+  const expired: string[] = [];
+  const dismissed: string[] = [];
+
+  server.on('permission_request', (request) => {
+    server.resolvePermissionEmpty(request.toolUseId);
+  });
+  server.on('permission_prompt', (request) => {
+    prompts.push(request);
+  });
+  server.on('permission_expired', (event) => {
+    expired.push(event.toolUseId);
+  });
+  server.on('permission_dismissed', (toolUseId) => {
+    dismissed.push(toolUseId);
+  });
+
+  await postHook(port, '/hooks/permission-request', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-close-race',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo close-race' },
+  });
+
+  const controller = new AbortController();
+  const promptRequest = fetch(`http://127.0.0.1:${port}/hooks/permission-prompt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: 'session-1',
+      tool_name: 'Bash',
+      tool_input: { command: 'echo close-race' },
+    }),
+    signal: controller.signal,
+  }).catch((err: Error) => err);
+
+  await waitFor(() => prompts.length === 1);
+  const promptId = prompts[0].toolUseId;
+
+  controller.abort();
+  await waitFor(() => expired.includes(promptId));
+  assert.deepEqual(dismissed, []);
+
+  await postHook(port, '/hooks/post-tool-use', {
+    session_id: 'session-1',
+    tool_use_id: 'tool-use-close-race',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo close-race' },
+    tool_response: { output: 'close-race' },
+  });
+
+  await waitFor(() => dismissed.includes(promptId));
+  await promptRequest;
+});

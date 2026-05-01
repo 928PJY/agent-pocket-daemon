@@ -1279,6 +1279,25 @@ function getTtyForPid(pid: number): string | null {
   }
 }
 
+function formatLocalLastActivity(timestampMs?: number): string {
+  if (!timestampMs) return '-';
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short',
+  }).format(new Date(timestampMs));
+}
+
+function formatSessionTitle(title?: string): string {
+  if (!title) return '-';
+  const maxLength = /\p{Script=Han}/u.test(title) ? 5 : 20;
+  return Array.from(title).slice(0, maxLength).join('');
+}
+
 async function cmdSessions(): Promise<void> {
   const { running } = isDaemonRunning();
   if (!running) {
@@ -1328,10 +1347,10 @@ async function cmdSessions(): Promise<void> {
     'Session ID': s.sessionId.slice(0, 8) + '...',
     Status: s.status,
     Type: s.entrypoint ?? '-',
-    Title: s.customTitle ?? '-',
+    Title: formatSessionTitle(s.customTitle),
     CWD: s.cwd.replace(os.homedir(), '~'),
     Mode: s.isObserved ? 'observer' : 'controller',
-    'Last Activity': s.lastActivity ? new Date(s.lastActivity).toLocaleTimeString() : '-',
+    'Last Activity': formatLocalLastActivity(s.lastActivity),
   }));
 
   const codexRows = liveCodexSessions.map(({ live, session }) => ({
@@ -1341,10 +1360,10 @@ async function cmdSessions(): Promise<void> {
     'Session ID': session.sessionId.slice(0, 14) + '...',
     Status: 'ready',
     Type: 'codex-cli',
-    Title: session.title ?? '-',
+    Title: formatSessionTitle(session.title),
     CWD: session.cwd.replace(os.homedir(), '~'),
     Mode: 'observer',
-    'Last Activity': new Date(live.lastActivityMs).toLocaleTimeString(),
+    'Last Activity': formatLocalLastActivity(live.lastActivityMs),
   }));
 
   const rows = [...claudeRows, ...codexRows]

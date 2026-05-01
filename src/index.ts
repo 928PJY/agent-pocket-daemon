@@ -229,6 +229,9 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent;
     sentAt: number;
     type: 'permission_request' | 'user_question' | 'plan_review';
+    toolName?: string;
+    expiredToTerminal?: boolean;
+    expiredSystemMessageSent?: boolean;
   }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -660,6 +663,7 @@ export class AgentPocketDaemon extends EventEmitter {
         event: { type: 'session_status', session_id: externalId, status: SessionStatus.PENDING_ACTIONS } as unknown as PcEvent,
         sentAt: Date.now(),
         type: actionType,
+        toolName,
         expiredToTerminal: true,
       };
       this.pendingBlockingRequests.set(syntheticId, entry);
@@ -775,14 +779,20 @@ export class AgentPocketDaemon extends EventEmitter {
         // permission_expired event so the card shows the timed-out banner.
         if ((entry as any).expiredToTerminal) {
           this.sendToPhone(entry.event);
-          if ((entry.event as any)?.type === 'permission_request') {
-            this.sendToPhone({
-              type: 'permission_expired',
-              session_id: entry.sessionId,
-              request_id: requestId,
-              tool_name: (entry.event as any).tool_name,
-            } as unknown as PcEvent);
-          }
+          const expiredToolName = (entry.event as any)?.tool_name ?? (entry as any).toolName ?? entry.type;
+          this.sendToPhone({
+            type: 'permission_expired',
+            session_id: entry.sessionId,
+            request_id: requestId,
+            tool_name: expiredToolName,
+          } as unknown as PcEvent);
+          logger.info('daemon', 'Resent expired pending action to phone', {
+            sessionId: entry.sessionId,
+            requestId,
+            toolName: expiredToolName,
+            actionType: entry.type,
+          });
+          this.sendExpiredPendingSystemMessage(entry.sessionId, requestId, expiredToolName, entry.type, entry);
           this.sendToPhone({
             type: 'session_status',
             session_id: entry.sessionId,
@@ -962,7 +972,10 @@ export class AgentPocketDaemon extends EventEmitter {
       // still shows waitingPermission until terminal user acts.
       const blocking = this.pendingBlockingRequests.get(expired.toolUseId);
       if (blocking) {
-        (blocking as any).expiredToTerminal = true;
+        blocking.expiredToTerminal = true;
+        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, blocking.type, blocking);
+      } else {
+        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, 'permission_request');
       }
       logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
     });
@@ -2644,8 +2657,9 @@ export class AgentPocketDaemon extends EventEmitter {
         // Real (non-synthetic) entries always win — they're live blocking requests.
         // Synthetic startup_pending_* entries are heuristic guesses from JSONL state
         // at startup; if the session has been silent for a long time, the user has
-        // likely moved past it. Downgrade to ready instead of advertising a phantom
-        // pending badge.
+        // likely moved past it — clean up the synthetic so it doesn't keep firing,
+        // but keep trusting SessionManager's own status (it's tracked from observer
+        // events, not from the hook server).
         let effectiveStatus = active.status as SessionStatus;
         let actionType: string | undefined;
         const realPending = Array.from(this.pendingBlockingRequests.entries()).find(
@@ -2663,7 +2677,11 @@ export class AgentPocketDaemon extends EventEmitter {
               this.pendingBlockingRequests.delete(syntheticId);
             }
           }
-          effectiveStatus = SessionStatus.READY;
+          // Do NOT downgrade to READY here — SessionManager set this status
+          // for a reason (real PreToolUse, observer detection, or startup
+          // JSONL analysis). The hook server can lose track of a permission
+          // that was timed out / transferred to terminal, but the session is
+          // still genuinely waiting.
         }
 
         allSessions.push({
@@ -2791,6 +2809,27 @@ export class AgentPocketDaemon extends EventEmitter {
           historyKey: codex.sessionId,
         });
         claimedSessionIds.add(codex.sessionId);
+      }
+
+      // Overlay pending_actions from the hook server onto whatever status
+      // each phase produced. Phase 2 (alive PID without an attached observer)
+      // hardcodes READY, so a real blocking permission request would otherwise
+      // be invisible to the phone. Only real pending entries qualify —
+      // synthetic startup_pending_* are heuristic guesses, not live blocks.
+      const realPendingBySessionId = new Map<string, string>();
+      for (const [reqId, entry] of this.pendingBlockingRequests.entries()) {
+        if (reqId.startsWith('startup_pending_')) continue;
+        if (!realPendingBySessionId.has(entry.sessionId)) {
+          realPendingBySessionId.set(entry.sessionId, entry.type);
+        }
+      }
+      for (const item of allSessions) {
+        const sid = item.entry.session_id as string;
+        const pendingType = realPendingBySessionId.get(sid);
+        if (pendingType && item.entry.status !== SessionStatus.PENDING_ACTIONS) {
+          item.entry.status = SessionStatus.PENDING_ACTIONS;
+          item.entry.action_type = pendingType;
+        }
       }
 
       // Sort: active sessions first, then by last_activity descending
@@ -3063,6 +3102,32 @@ export class AgentPocketDaemon extends EventEmitter {
       }
       this.relayClient.send(event, wake, wakePayload);
     }
+  }
+
+  private sendExpiredPendingSystemMessage(
+    sessionId: string,
+    requestId: string,
+    toolName: string,
+    actionType: 'permission_request' | 'user_question' | 'plan_review',
+    entry?: { expiredSystemMessageSent?: boolean },
+  ): void {
+    if (entry?.expiredSystemMessageSent) return;
+    const actionLabel = actionType === 'user_question'
+      ? 'question'
+      : actionType === 'plan_review'
+      ? 'plan review'
+      : 'permission request';
+    const content = "This " + actionLabel + " has expired. Handle it in the terminal, or interrupt this session from the app and continue it to trigger a new request.";
+    this.sendToPhone({
+      type: 'session_output',
+      session_id: sessionId,
+      output_type: 'system',
+      content,
+      timestamp: Date.now(),
+      request_id: requestId,
+      tool_name: toolName,
+    } as unknown as PcEvent);
+    if (entry) entry.expiredSystemMessageSent = true;
   }
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
