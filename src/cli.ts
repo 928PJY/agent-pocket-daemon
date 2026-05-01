@@ -2,8 +2,9 @@
 // Agent Pocket — CLI Entry Point
 // Subcommands: start, stop, restart, status, logs, pair, sessions, panic
 
-import { VERSION, DAEMON_DEFAULT_PORT, HOOK_SERVER_PORT } from './shared/index.js';
-import type { ConnectionMode } from './shared/index.js';
+import { DAEMON_DEFAULT_PORT, HOOK_SERVER_PORT } from 'agent-pocket-protocol';
+import type { ConnectionMode } from 'agent-pocket-protocol';
+import { VERSION } from './version.js';
 import { AgentPocketDaemon } from './index.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
 import { CodexDiscovery } from './discovery/codex-discovery.js';

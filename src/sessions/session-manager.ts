@@ -18,8 +18,8 @@ import type {
   AssistantMessageEvent,
   ToolUseEvent,
   ToolResultEvent,
-} from '../shared/index.js';
-import { PermissionDecision, PERMISSION_TIMEOUT_MS, SessionStatus } from '../shared/index.js';
+} from 'agent-pocket-protocol';
+import { PermissionDecision, PERMISSION_TIMEOUT_MS, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
 import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';

@@ -12,7 +12,7 @@ import type {
   AssistantMessageEvent,
   ToolUseEvent,
   ToolResultEvent,
-} from '../shared/index.js';
+} from 'agent-pocket-protocol';
 
 // ============================================================================
 // Types

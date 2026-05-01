@@ -57,7 +57,7 @@ import type {
   SessionInfo,
   AgentType,
   WakeBlobPayload,
-} from './shared/index.js';
+} from 'agent-pocket-protocol';
 import {
   RISK_CLASSIFICATION,
   RiskLevel,
@@ -66,12 +66,12 @@ import {
   DAEMON_DEFAULT_PORT,
   SessionStatus,
   HOOK_SERVER_PORT,
-  VERSION,
   WIRE_VERSION_CURRENT,
   CURRENT_PEER_CAPABILITIES,
   BLOCKING_RETRY_INTERVAL_MS,
   BLOCKING_RETRY_CHECK_INTERVAL_MS,
-} from './shared/index.js';
+} from 'agent-pocket-protocol';
+import { VERSION } from './version.js';
 
 // ============================================================================
 // Types

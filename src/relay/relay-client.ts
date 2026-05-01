@@ -4,7 +4,7 @@
 
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
-import type { RelayEnvelope, WakeBlobPayload } from '../shared/index.js';
+import type { RelayEnvelope, WakeBlobPayload } from 'agent-pocket-protocol';
 import { logger } from '../logger.js';
 import {
   RECONNECT_BASE_DELAY_MS,
@@ -13,7 +13,7 @@ import {
   OFFLINE_MESSAGE_MAX_COUNT,
   WIRE_VERSION_MIN,
   WIRE_VERSION_CURRENT,
-} from '../shared/index.js';
+} from 'agent-pocket-protocol';
 
 // ============================================================================
 // Types

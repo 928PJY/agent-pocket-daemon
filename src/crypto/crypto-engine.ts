@@ -9,8 +9,8 @@ import * as os from 'node:os';
 import {
   REKEY_INTERVAL_MESSAGES,
   REKEY_INTERVAL_MS,
-} from '../shared/index.js';
-import type { QrCodePayload } from '../shared/index.js';
+} from 'agent-pocket-protocol';
+import type { QrCodePayload } from 'agent-pocket-protocol';
 import { logger } from '../logger.js';
 
 // ============================================================================

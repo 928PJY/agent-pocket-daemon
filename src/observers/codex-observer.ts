@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { EventEmitter } from 'node:events';
-import type { ClaudeEvent } from '../shared/index.js';
+import type { ClaudeEvent } from 'agent-pocket-protocol';
 import { codexHistoryMessageToEvent, parseCodexHistoryEntry, parseCodexLifecycleEntry } from '../discovery/codex-discovery.js';
 import { logger } from '../logger.js';
 
