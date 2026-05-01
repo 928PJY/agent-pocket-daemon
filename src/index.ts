@@ -229,6 +229,8 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent;
     sentAt: number;
     type: 'permission_request' | 'user_question' | 'plan_review';
+    toolName?: string;
+    expiredToTerminal?: boolean;
   }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -660,6 +662,7 @@ export class AgentPocketDaemon extends EventEmitter {
         event: { type: 'session_status', session_id: externalId, status: SessionStatus.PENDING_ACTIONS } as unknown as PcEvent,
         sentAt: Date.now(),
         type: actionType,
+        toolName,
         expiredToTerminal: true,
       };
       this.pendingBlockingRequests.set(syntheticId, entry);
@@ -775,14 +778,19 @@ export class AgentPocketDaemon extends EventEmitter {
         // permission_expired event so the card shows the timed-out banner.
         if ((entry as any).expiredToTerminal) {
           this.sendToPhone(entry.event);
-          if ((entry.event as any)?.type === 'permission_request') {
-            this.sendToPhone({
-              type: 'permission_expired',
-              session_id: entry.sessionId,
-              request_id: requestId,
-              tool_name: (entry.event as any).tool_name,
-            } as unknown as PcEvent);
-          }
+          const expiredToolName = (entry.event as any)?.tool_name ?? (entry as any).toolName ?? entry.type;
+          this.sendToPhone({
+            type: 'permission_expired',
+            session_id: entry.sessionId,
+            request_id: requestId,
+            tool_name: expiredToolName,
+          } as unknown as PcEvent);
+          logger.info('daemon', 'Resent expired pending action to phone', {
+            sessionId: entry.sessionId,
+            requestId,
+            toolName: expiredToolName,
+            actionType: entry.type,
+          });
           this.sendToPhone({
             type: 'session_status',
             session_id: entry.sessionId,
