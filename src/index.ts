@@ -3203,6 +3203,15 @@ export class AgentPocketDaemon extends EventEmitter {
     wakePayload: WakeBlobPayload,
   ): void {
     if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
+    // Informational events (completion / error) intentionally skip retry: a
+    // missed APNs is not worth waking the user with a duplicate, and Stop hooks
+    // can fire multiple times per turn (subagent stop, /clear) which compounds
+    // the noise. Actionable events (permission/question/plan) still retry —
+    // the turn is blocked until the user sees them.
+    if (eventType === 'session_completed' || eventType === 'session_error') {
+      logger.debug('daemon', 'Skipping informational delivery tracking', { eventType, sessionId, requestId });
+      return;
+    }
     const key = this.notificationDeliveryKey(eventType, sessionId, requestId);
     this.pendingNotificationDeliveries.set(key, {
       requestId,
