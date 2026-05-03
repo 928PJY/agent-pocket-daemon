@@ -53,6 +53,18 @@ jobs:
           header: daemon-coverage
           path: coverage.md
 
+      - name: Generate lcov for Codecov
+        if: matrix.node == '20'
+        run: npm run test:coverage:lcov
+
+      - name: Upload coverage to Codecov
+        if: matrix.node == '20'
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          flags: daemon
+          fail_ci_if_error: false
+
       - name: Verify package contents
         if: matrix.node == '20'
         run: npm pack --dry-run

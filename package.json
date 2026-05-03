@@ -19,6 +19,7 @@
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/*.test.ts",
     "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-exclude='test/**' --test-coverage-exclude='dist/**' --test-reporter=spec --test-reporter-destination=stdout test/*.test.ts",
+    "test:coverage:lcov": "c8 --reporter=lcov --reporter=text --include='src/**/*.ts' --exclude='test/**' --exclude='dist/**' --exclude='scripts/**' npm test",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build"
   },
@@ -59,6 +60,7 @@
     "@types/node": "^20.11.0",
     "@types/uuid": "^9.0.7",
     "@types/ws": "^8.5.10",
+    "c8": "^11.0.0",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   }
