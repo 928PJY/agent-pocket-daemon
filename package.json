@@ -18,6 +18,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-include='src/**/*.ts' --test-coverage-exclude='test/**' --test-coverage-exclude='dist/**' --test-reporter=spec --test-reporter-destination=stdout test/*.test.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build"
   },

@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   build:
@@ -34,6 +35,23 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Coverage report
+        if: matrix.node == '20'
+        id: coverage
+        run: |
+          set -o pipefail
+          npm run test:coverage 2>&1 | tee coverage.txt
+          node scripts/coverage-to-markdown.mjs < coverage.txt > coverage.md
+          cat coverage.md >> "$GITHUB_STEP_SUMMARY"
+        continue-on-error: true
+
+      - name: Comment coverage on PR
+        if: matrix.node == '20' && github.event_name == 'pull_request' && steps.coverage.outcome == 'success'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: daemon-coverage
+          path: coverage.md
 
       - name: Verify package contents
         if: matrix.node == '20'
