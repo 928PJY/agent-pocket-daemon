@@ -63,6 +63,7 @@ jobs:
         with:
           files: coverage/lcov.info
           flags: daemon
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
       - name: Verify package contents
