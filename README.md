@@ -9,6 +9,11 @@
   Approve permissions, send messages, and monitor sessions — anywhere.
 </p>
 
+<p align="center">
+  <a href="https://github.com/928PJY/agent-pocket-daemon/actions/workflows/ci.yml"><img src="https://github.com/928PJY/agent-pocket-daemon/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://codecov.io/gh/928PJY/agent-pocket-daemon"><img src="https://codecov.io/gh/928PJY/agent-pocket-daemon/branch/main/graph/badge.svg" alt="codecov"></a>
+</p>
+
 ---
 
 ## What is Agent Pocket?
