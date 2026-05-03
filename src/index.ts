@@ -108,9 +108,13 @@ type CodexTerminalTargetEntry = {
 
 type NotificationDeliveryEventType = 'permission_request' | 'user_question' | 'plan_review' | 'session_completed' | 'session_error';
 
-const NOTIFICATION_DELIVERY_MAX_ATTEMPTS = 3;
-const NOTIFICATION_DELIVERY_RETRY_INTERVAL_MS = 30_000;
-const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 10_000;
+// Notification delivery: when phone is online at emit time, the WS push went
+// out but the phone may go to background before processing it. We give the
+// phone a short window to ack; if the ack doesn't arrive, we send exactly one
+// forceWake APNs as the fallback and stop. When phone is offline at emit time,
+// the relay already routes to APNs — no tracking, no retry.
+const NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS = 3_000;
+const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 1_000;
 
 // ============================================================================
 // AgentPocketDaemon
@@ -3191,8 +3195,14 @@ export class AgentPocketDaemon extends EventEmitter {
     requestId: string,
     wakePayload: WakeBlobPayload,
   ): void {
+    const phoneOnline = this.relayClient?.getPhonePeerOnline() === true;
+    logger.debug('daemon', 'notification emit', { eventType, sessionId, requestId, phoneOnline });
     this.sendToPhone(event, true, wakePayload);
-    this.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
+    // Only track for ack-fallback when phone was online at emit time. If phone
+    // was offline, the relay already routed to APNs — no second push needed.
+    if (phoneOnline) {
+      this.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
+    }
   }
 
   private trackNotificationDelivery(
@@ -3251,26 +3261,15 @@ export class AgentPocketDaemon extends EventEmitter {
     if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
     const now = Date.now();
     for (const [key, entry] of this.pendingNotificationDeliveries) {
-      if (now - entry.sentAt < NOTIFICATION_DELIVERY_RETRY_INTERVAL_MS) continue;
-
-      if (entry.attempts >= NOTIFICATION_DELIVERY_MAX_ATTEMPTS) {
-        this.pendingNotificationDeliveries.delete(key);
-        logger.warn('daemon', 'Notification delivery ack missing after bounded retries', {
-          eventType: entry.eventType,
-          sessionId: entry.sessionId,
-          requestId: entry.requestId,
-          attempts: entry.attempts,
-        });
-        continue;
-      }
-
-      entry.attempts += 1;
-      entry.sentAt = now;
-      logger.warn('daemon', 'Retrying unacknowledged notification delivery', {
+      if (now - entry.sentAt < NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS) continue;
+      // Phone was online at emit but didn't ack within the window — fall back
+      // to one forceWake APNs and stop. No further retries; APNs is trusted.
+      this.pendingNotificationDeliveries.delete(key);
+      logger.warn('daemon', 'notification ack timeout — sending forceWake APNs fallback', {
         eventType: entry.eventType,
         sessionId: entry.sessionId,
         requestId: entry.requestId,
-        attempts: entry.attempts,
+        elapsedMs: now - entry.sentAt,
       });
       this.sendToPhone(entry.event, true, entry.wakePayload, true);
     }
