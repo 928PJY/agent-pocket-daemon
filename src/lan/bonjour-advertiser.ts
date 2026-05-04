@@ -4,23 +4,54 @@
 import { BONJOUR_SERVICE_TYPE } from 'agent-pocket-protocol'
 import { logger } from '../logger.js'
 
+type BonjourPublishOptions = {
+  name: string
+  type: string
+  port: number
+  txt: Record<string, string>
+}
+
+type BonjourService = {
+  stop?: CallableFunction
+}
+
+type BonjourInstance = {
+  publish(options: BonjourPublishOptions): BonjourService
+  destroy(): void
+}
+
+export type BonjourFactory = () => Promise<BonjourInstance> | BonjourInstance
+
+async function createDefaultBonjour(): Promise<BonjourInstance> {
+  const { Bonjour } = await import('bonjour-service')
+  return new Bonjour()
+}
+
 // ============================================================================
 // BonjourAdvertiser
 // ============================================================================
 
 export class BonjourAdvertiser {
-  private bonjour: any = null
-  private service: any = null
+  private bonjour: BonjourInstance | null = null
+  private service: BonjourService | null = null
   private port: number
   private pairId: string
   private deviceName: string
   private version: string
+  private createBonjour: BonjourFactory
 
-  constructor(port: number, pairId: string, deviceName: string, version: string = '0.1.0') {
+  constructor(
+    port: number,
+    pairId: string,
+    deviceName: string,
+    version: string = '0.1.0',
+    createBonjour: BonjourFactory = createDefaultBonjour,
+  ) {
     this.port = port
     this.pairId = pairId
     this.deviceName = deviceName
     this.version = version
+    this.createBonjour = createBonjour
   }
 
   /**
@@ -28,8 +59,7 @@ export class BonjourAdvertiser {
    */
   async start(): Promise<void> {
     try {
-      const { Bonjour } = await import('bonjour-service')
-      this.bonjour = new Bonjour()
+      this.bonjour = await this.createBonjour()
 
       this.service = this.bonjour.publish({
         name: `AgentPocket-${this.deviceName}`,
@@ -54,7 +84,7 @@ export class BonjourAdvertiser {
    */
   stop(): void {
     if (this.service) {
-      this.service.stop()
+      this.service.stop?.()
       this.service = null
     }
     if (this.bonjour) {

@@ -7,6 +7,28 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+interface TmuxInjectorDeps {
+  spawnSync: typeof spawnSync;
+  execFileSync: typeof execFileSync;
+  readdirSync: typeof fs.readdirSync;
+  getuid: () => number | undefined;
+}
+
+let deps: TmuxInjectorDeps = {
+  spawnSync,
+  execFileSync,
+  readdirSync: fs.readdirSync,
+  getuid: () => process.getuid?.(),
+};
+
+export function __setTmuxInjectorDepsForTest(overrides: Partial<TmuxInjectorDeps>): () => void {
+  const previous = deps;
+  deps = { ...deps, ...overrides };
+  return () => {
+    deps = previous;
+  };
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -101,7 +123,7 @@ tell application "iTerm2"
   end repeat
   return ""
 end tell`;
-    const result = execFileSync('osascript', ['-e', script], { timeout: 3000 });
+    const result = deps.execFileSync('osascript', ['-e', script], { timeout: 3000 });
     return result.toString().trim() === 'found';
   } catch {
     return false;
@@ -143,7 +165,7 @@ tell application "iTerm2"
 end tell`;
 
   try {
-    const result = execFileSync('osascript', ['-e', script], { timeout: 5000 });
+    const result = deps.execFileSync('osascript', ['-e', script], { timeout: 5000 });
     const output = result.toString().trim();
     if (output === 'not found') {
       throw new Error(`iTerm2 session with TTY ${ttyPath} not found`);
@@ -175,7 +197,7 @@ tell application "iTerm2"
 end tell`;
 
   try {
-    const result = execFileSync('osascript', ['-e', script], { timeout: 5000 });
+    const result = deps.execFileSync('osascript', ['-e', script], { timeout: 5000 });
     const output = result.toString().trim();
     if (output === 'not found') {
       throw new Error(`iTerm2 session with TTY ${ttyPath} not found`);
@@ -195,7 +217,7 @@ function findTmuxPaneForPid(pid: number): { socket: string; target: string } | n
   if (sockets.length === 0) return null;
 
   for (const socketPath of sockets) {
-    const result = spawnSync('tmux', [
+    const result = deps.spawnSync('tmux', [
       '-S', socketPath, 'list-panes', '-a', '-F',
       '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}',
     ]);
@@ -215,7 +237,7 @@ function findTmuxPaneForPid(pid: number): { socket: string; target: string } | n
       if (target) {
         return { socket: socketPath, target };
       }
-      const ppidResult = spawnSync('ps', ['-p', currentPid, '-o', 'ppid=']);
+      const ppidResult = deps.spawnSync('ps', ['-p', currentPid, '-o', 'ppid=']);
       if (ppidResult.status !== 0) break;
       currentPid = ppidResult.stdout.toString().trim();
     }
@@ -230,21 +252,21 @@ function tmuxClearAndSendKeys(socket: string, target: string, text: string): voi
   const bsCount = 200;
   const bsArgs: string[] = [];
   for (let i = 0; i < bsCount; i++) bsArgs.push('BSpace');
-  const clearResult = spawnSync('tmux', [
+  const clearResult = deps.spawnSync('tmux', [
     '-S', socket, 'send-keys', '-t', target, ...bsArgs,
   ]);
   if (clearResult.status !== 0) {
     throw new Error(`tmux send BSpace failed: ${clearResult.stderr?.toString() ?? 'unknown error'}`);
   }
 
-  const textResult = spawnSync('tmux', [
+  const textResult = deps.spawnSync('tmux', [
     '-S', socket, 'send-keys', '-t', target, '-l', text,
   ]);
   if (textResult.status !== 0) {
     throw new Error(`tmux send-keys failed: ${textResult.stderr?.toString() ?? 'unknown error'}`);
   }
 
-  const enterResult = spawnSync('tmux', [
+  const enterResult = deps.spawnSync('tmux', [
     '-S', socket, 'send-keys', '-t', target, 'Enter',
   ]);
   if (enterResult.status !== 0) {
@@ -253,7 +275,7 @@ function tmuxClearAndSendKeys(socket: string, target: string, text: string): voi
 }
 
 function tmuxSendEscape(socket: string, target: string): void {
-  const result = spawnSync('tmux', [
+  const result = deps.spawnSync('tmux', [
     '-S', socket, 'send-keys', '-t', target, 'Escape',
   ]);
   if (result.status !== 0) {
@@ -267,7 +289,7 @@ function tmuxSendEscape(socket: string, target: string): void {
 
 function getTtyForPid(pid: number): string | null {
   try {
-    const result = spawnSync('ps', ['-p', String(pid), '-o', 'tty=']);
+    const result = deps.spawnSync('ps', ['-p', String(pid), '-o', 'tty=']);
     if (result.status !== 0) return null;
     const tty = result.stdout.toString().trim();
     return tty && tty !== '??' ? tty : null;
@@ -277,12 +299,12 @@ function getTtyForPid(pid: number): string | null {
 }
 
 function getAllTmuxSockets(): string[] {
-  const uid = process.getuid?.();
+  const uid = deps.getuid();
   if (uid === undefined) return [];
 
   const tmuxDir = `/private/tmp/tmux-${uid}`;
   try {
-    return fs.readdirSync(tmuxDir).map((f) => path.join(tmuxDir, f));
+    return deps.readdirSync(tmuxDir).map((f) => path.join(tmuxDir, f));
   } catch {
     return [];
   }

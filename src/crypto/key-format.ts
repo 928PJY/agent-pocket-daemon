@@ -17,7 +17,10 @@ export function spkiX25519ToRaw(spkiBase64: string): string {
   if (spki.length !== 44) {
     throw new Error(`Expected 44-byte SPKI X25519 key, got ${spki.length}`);
   }
-  return spki.subarray(12).toString('base64');
+  if (!spki.subarray(0, X25519_SPKI_PREFIX.length).equals(X25519_SPKI_PREFIX)) {
+    throw new Error('Expected SPKI X25519 key prefix');
+  }
+  return spki.subarray(X25519_SPKI_PREFIX.length).toString('base64');
 }
 
 export function rawEd25519ToSpki(rawBase64: string): string {
@@ -33,5 +36,8 @@ export function spkiEd25519ToRaw(spkiBase64: string): string {
   if (spki.length !== 44) {
     throw new Error(`Expected 44-byte SPKI Ed25519 key, got ${spki.length}`);
   }
-  return spki.subarray(12).toString('base64');
+  if (!spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)) {
+    throw new Error('Expected SPKI Ed25519 key prefix');
+  }
+  return spki.subarray(ED25519_SPKI_PREFIX.length).toString('base64');
 }
