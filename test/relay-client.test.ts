@@ -352,3 +352,159 @@ test('RelayClient emits decrypt_error after three consecutive decrypt failures',
 
   assert.deepEqual(errors, [3]);
 });
+
+
+test('RelayClient reports connection states from socket and connected flags', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const internals = client as unknown as { isConnected: boolean; ws: { readyState: number } | null };
+
+  assert.equal(client.getConnectionState(), 'disconnected');
+
+  internals.ws = { readyState: 0 };
+  assert.equal(client.getConnectionState(), 'connecting');
+
+  internals.isConnected = true;
+  assert.equal(client.getConnectionState(), 'connected');
+});
+
+test('RelayClient setter hooks update encryption, decryption, and wake blob behavior', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const internals = client as unknown as {
+    handleMessage(data: string): void;
+    offlineQueue: Array<{ encrypted_payload: string; nonce: number; wake_blob?: string }>;
+  };
+  const messages: unknown[] = [];
+  client.on('message', (message) => messages.push(message));
+
+  client.setEncryptFn((plaintext) => ({ ciphertext: `cipher:${plaintext}`, nonce: 42 }));
+  client.setWakeBlobEncryptFn((text) => `wake:${text}`);
+  client.send({ type: 'permission_request', request_id: 'req-1' }, true, {
+    type: 'permission_request',
+    session_name: 'Session',
+    body: 'Approve?',
+    category: 'PERMISSION',
+    session_id: 'session-1',
+    request_id: 'req-1',
+  });
+
+  assert.equal(internals.offlineQueue[0].encrypted_payload, 'cipher:{"type":"permission_request","request_id":"req-1"}');
+  assert.equal(internals.offlineQueue[0].nonce, 42);
+  assert.match(internals.offlineQueue[0].wake_blob!, /^wake:/);
+
+  client.setDecryptFn((ciphertext, nonce) => JSON.stringify({ type: 'decoded', ciphertext, nonce }));
+  internals.handleMessage(JSON.stringify({
+    pair_id: 'pair-1',
+    sender: 'phone',
+    encrypted_payload: 'ciphertext',
+    nonce: 7,
+    timestamp: Date.now(),
+  }));
+
+  assert.deepEqual(messages, [{ type: 'decoded', ciphertext: 'ciphertext', nonce: 7 }]);
+});
+
+test('RelayClient sends peer control frames only when the socket is open', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const sent: string[] = [];
+  const internals = client as unknown as { ws: { readyState: number; send(data: string): void } | null };
+
+  client.sendControlFrame({ action: 'key_verify', key_fingerprint: 'abc123' });
+
+  internals.ws = { readyState: 0, send: (data) => sent.push(data) };
+  client.sendControlFrame({ action: 'key_verify', key_fingerprint: 'abc123' });
+
+  internals.ws = { readyState: 1, send: (data) => sent.push(data) };
+  client.sendControlFrame({ action: 'key_verify', key_fingerprint: 'abc123' });
+
+  assert.deepEqual(sent.map((frame) => JSON.parse(frame)), [
+    { type: '__peer_control', action: 'key_verify', key_fingerprint: 'abc123' },
+  ]);
+});
+
+test('RelayClient flushes queued envelopes when connection becomes available', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  client.send({ type: 'message', index: 1 });
+  client.send({ type: 'message', index: 2 });
+
+  const sent: string[] = [];
+  const internals = client as unknown as {
+    isConnected: boolean;
+    ws: { readyState: number; send(data: string): void };
+    offlineQueue: unknown[];
+    flushOfflineQueue(): void;
+  };
+  internals.isConnected = true;
+  internals.ws = { readyState: 1, send: (data) => sent.push(data) };
+
+  internals.flushOfflineQueue();
+
+  assert.equal(internals.offlineQueue.length, 0);
+  assert.deepEqual(sent.map((frame) => JSON.parse(Buffer.from(JSON.parse(frame).encrypted_payload, 'base64').toString('utf-8'))), [
+    { type: 'message', index: 1 },
+    { type: 'message', index: 2 },
+  ]);
+});
+
+test('RelayClient ping timer terminates stale open sockets', (t) => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  let intervalCallback: (() => void) | null = null;
+  let pings = 0;
+  let terminates = 0;
+  let cleared = false;
+  const timer = Symbol('timer') as unknown as ReturnType<typeof setInterval>;
+  t.after(() => {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  });
+  globalThis.setInterval = ((callback: () => void) => {
+    intervalCallback = callback;
+    return timer;
+  }) as typeof setInterval;
+  globalThis.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
+    if (handle === timer) cleared = true;
+  }) as typeof clearInterval;
+
+  const internals = client as unknown as {
+    ws: { readyState: number; ping(): void; terminate(): void };
+    startPingTimer(): void;
+    stopPingTimer(): void;
+  };
+  internals.ws = {
+    readyState: 1,
+    ping: () => { pings++; },
+    terminate: () => { terminates++; },
+  };
+
+  internals.startPingTimer();
+  assert.equal(typeof intervalCallback, 'function');
+
+  intervalCallback!();
+  intervalCallback!();
+  internals.stopPingTimer();
+
+  assert.equal(pings, 1);
+  assert.equal(terminates, 1);
+  assert.equal(cleared, true);
+});

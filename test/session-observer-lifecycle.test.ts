@@ -515,3 +515,171 @@ function writeEntries(filePath: string, entries: unknown[]): void {
 function appendEntries(filePath: string, entries: unknown[]): void {
   appendFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
 }
+
+
+test('SessionManager reports missing sessions and no-op boundary helpers', async () => {
+  const manager = new SessionManager();
+
+  await assert.rejects(() => manager.sendMessage('missing', 'hello'), /Session not found: missing/);
+  assert.throws(() => manager.respondPermission('missing', 'request-1', PermissionDecision.APPROVE), /Session not found: missing/);
+  await assert.rejects(() => manager.killSession('missing'), /Session not found: missing/);
+  assert.throws(() => manager.interruptSession('missing'), /Session not found: missing/);
+
+  manager.clearPendingActions('missing');
+  manager.removeSession('missing');
+  manager.markObservedSessionHistory('missing');
+
+  assert.equal(manager.findByClaudeSessionId('missing'), undefined);
+  assert.equal(manager.findByTerminalPid(999), undefined);
+  assert.equal(manager.isObservedSession('missing'), false);
+});
+
+test('SessionManager active session count excludes history and error sessions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const firstPath = join(dir, 'first.jsonl');
+  const secondPath = join(dir, 'second.jsonl');
+  const thirdPath = join(dir, 'third.jsonl');
+  writeFileSync(firstPath, '');
+  writeFileSync(secondPath, '');
+  writeFileSync(thirdPath, '');
+
+  const manager = new SessionManager();
+
+  try {
+    const readyId = manager.observeSession('claude-session-1', firstPath, dir, 111);
+    const historyId = manager.observeSession('claude-session-2', secondPath, dir, 222);
+    const errorId = manager.observeSession('claude-session-3', thirdPath, dir, 333);
+
+    manager.getSession(historyId)!.status = SessionStatus.HISTORY;
+    manager.getSession(errorId)!.status = SessionStatus.ERROR;
+
+    assert.equal(manager.getAllSessions().length, 3);
+    assert.equal(manager.getActiveSessionCount(), 1);
+    assert.equal(manager.getSession(readyId)?.status, SessionStatus.READY);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager.respondPermission rejects unknown pending request', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+
+  try {
+    const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+
+    assert.throws(
+      () => manager.respondPermission(sessionId, 'missing-request', PermissionDecision.APPROVE),
+      /No pending permission with request ID: missing-request/,
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager SDK message mapper emits deltas, tools, results, and ready status', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const outputs: unknown[] = [];
+  const statuses: SessionStatus[] = [];
+  manager.on('session_output', (_sessionId, event) => outputs.push(event));
+  manager.on('session_status', (_sessionId, status) => statuses.push(status));
+  const privateManager = manager as unknown as { handleSDKMessage(state: ReturnType<SessionManager['getSession']>, message: unknown): void };
+
+  try {
+    const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+    const session = manager.getSession(sessionId)!;
+    outputs.length = 0;
+    statuses.length = 0;
+
+    privateManager.handleSDKMessage(session, { type: 'system', session_id: 'sdk-session-1' });
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'thinking', thinking: 'think' },
+          { type: 'text', text: 'hello' },
+          { type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'a.ts' } },
+        ],
+      },
+    });
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'thinking', thinking: 'thinking' },
+          { type: 'text', text: 'hello world' },
+          { type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'a.ts' } },
+        ],
+      },
+    });
+    privateManager.handleSDKMessage(session, {
+      type: 'user',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'tool-1', content: { ok: true } },
+          { type: 'tool_result', tool_use_id: 'tool-2', is_error: true, content: 'failed' },
+        ],
+      },
+    });
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Write', input: { file_path: 'b.ts' } }] },
+    });
+    privateManager.handleSDKMessage(session, { type: 'result', session_id: 'sdk-session-2' });
+    privateManager.handleSDKMessage(session, { type: 'stream_event' });
+
+    assert.equal(session.claudeSessionId, 'sdk-session-2');
+    assert.equal(session.status, SessionStatus.READY);
+    assert.deepEqual(statuses, [SessionStatus.READY]);
+    assert.deepEqual(outputs, [
+      { type: 'thinking', thinking: 'think' },
+      { type: 'assistant_message', message: 'hello' },
+      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Read', tool_input: { file_path: 'a.ts' } },
+      { type: 'thinking', thinking: 'ing' },
+      { type: 'assistant_message', message: ' world' },
+      { type: 'tool_result', tool_id: 'tool-1', status: 'success', output: '{"ok":true}' },
+      { type: 'tool_result', tool_id: 'tool-2', status: 'error', output: 'failed' },
+      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Write', tool_input: { file_path: 'b.ts' } },
+    ]);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager cleanup denies pending permission resolvers', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const privateManager = manager as unknown as {
+    registerPermissionRequest(sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>): void;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+    const session = manager.getSession(sessionId)!;
+    const resolved: unknown[] = [];
+
+    privateManager.registerPermissionRequest(sessionId, 'request-1', 'Bash', { command: 'pwd' });
+    session.pendingPermissionResolvers.set('request-1', (result) => resolved.push(result));
+
+    manager.removeSession(sessionId);
+
+    assert.equal(manager.getSession(sessionId), undefined);
+    assert.deepEqual(resolved, [{ behavior: 'deny', message: 'Session killed' }]);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
