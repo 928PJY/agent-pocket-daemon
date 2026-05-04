@@ -165,6 +165,24 @@ class StreamInputController {
 // SessionManager
 // ============================================================================
 
+/**
+ * Verify a session's working directory exists and is a directory before we
+ * hand it to the SDK as `cwd`. Without this check the SDK's `query()` spawn
+ * fails with `ENOENT`, which the SDK reports as "Claude Code native binary
+ * not found" — completely misleading. See agent-pocket#224.
+ */
+function assertWorkingDirectoryExists(dir: string): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(dir);
+  } catch {
+    throw new Error(`Working directory does not exist: ${dir}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Working directory is not a directory: ${dir}`);
+  }
+}
+
 export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionState> = new Map();
   private config: SessionManagerConfig;
@@ -213,6 +231,7 @@ export class SessionManager extends EventEmitter {
 
     const sessionId = this.generateSessionId();
     const workingDir = config.working_directory ?? this.config.default_working_directory ?? process.cwd();
+    assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
 
@@ -275,6 +294,7 @@ export class SessionManager extends EventEmitter {
 
     const sessionId = this.generateSessionId();
     const workingDir = config.working_directory ?? this.config.default_working_directory ?? process.cwd();
+    assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
 
