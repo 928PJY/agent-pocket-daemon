@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../src/observers/session-observer.js';
 import { SessionManager } from '../src/sessions/session-manager.js';
+
+type SessionObserverInternals = SessionObserver & { readNewEntries(): void };
 
 test('SessionObserver stops quietly when the watched JSONL file disappears', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-observer-'));
@@ -23,6 +25,168 @@ test('SessionObserver stops quietly when the watched JSONL file disappears', asy
 
     assert.equal(observer.isActive(), false);
     assert.deepEqual(errors, []);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionObserver reports pending user action from the last unresolved tool use', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-observer-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+
+  try {
+    writeEntries(jsonlPath, [
+      {
+        type: 'assistant',
+        message: {
+          stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: {} }],
+        },
+      },
+    ]);
+    assert.deepEqual(SessionObserver.isPendingUserAction(jsonlPath), { pending: true, toolName: 'Bash' });
+
+    appendEntries(jsonlPath, [
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] } },
+    ]);
+    assert.deepEqual(SessionObserver.isPendingUserAction(jsonlPath), { pending: false });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionObserver emits existing custom title when starting at end of transcript', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-observer-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeEntries(jsonlPath, [
+    { type: 'custom-title', customTitle: 'Older title' },
+    { type: 'custom-title', customTitle: 'Latest title' },
+  ]);
+  const observer = new SessionObserver('session-1', jsonlPath);
+  const titles: Array<[string, boolean]> = [];
+  observer.on('title', (title, isCustom) => titles.push([title, isCustom]));
+
+  try {
+    observer.start();
+
+    assert.deepEqual(titles, [['Latest title', true]]);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionObserver maps queue, user, assistant, and tool result entries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-observer-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const observer = new SessionObserver('session-1', jsonlPath);
+  const outputs: unknown[] = [];
+  const titles: Array<[string, boolean]> = [];
+  const statuses: string[] = [];
+  observer.on('output', (event) => outputs.push(event));
+  observer.on('title', (title, isCustom) => titles.push([title, isCustom]));
+  observer.on('status_change', (status) => statuses.push(status));
+
+  try {
+    observer.start(false);
+    appendEntries(jsonlPath, [
+      { type: 'ai-title', aiTitle: 'Generated' },
+      { type: 'queue-operation', operation: 'enqueue', content: '<system-reminder>skip</system-reminder>' },
+      { type: 'queue-operation', operation: 'enqueue', content: 'queued user text' },
+      { type: 'user', message: { content: 'plain user' } },
+      { type: 'user', message: { content: '<command-name>skip</command-name>' } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'thinking', thinking: 'think' },
+            { type: 'text', text: 'hello' },
+            { type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'a.ts' } },
+          ],
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          stop_reason: 'end_turn',
+          content: [
+            { type: 'thinking', thinking: 'thinking more' },
+            { type: 'text', text: 'hello world' },
+            { type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'a.ts' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'text', text: 'block user' },
+            { type: 'tool_result', tool_use_id: 'tool-1', content: { ok: true } },
+          ],
+        },
+      },
+    ]);
+
+    (observer as SessionObserverInternals).readNewEntries();
+
+    assert.deepEqual(titles, [['Generated', false]]);
+    assert.deepEqual(statuses, ['running', 'running', 'running', 'running', 'ready', 'running']);
+    assert.deepEqual(outputs, [
+      { type: 'user_message', message: 'queued user text' },
+      { type: 'user_message', message: 'plain user' },
+      { type: 'thinking', thinking: 'think' },
+      { type: 'assistant_message', message: 'hello' },
+      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Read', tool_input: { file_path: 'a.ts' } },
+      { type: 'thinking', thinking: 'ing more' },
+      { type: 'assistant_message', message: ' world' },
+      { type: 'user_message', message: 'block user' },
+      { type: 'tool_result', tool_id: 'tool-1', status: 'success', output: '{"ok":true}' },
+    ]);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionObserver emits interrupted system message and closes pending tools', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-observer-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const observer = new SessionObserver('session-1', jsonlPath);
+  const outputs: unknown[] = [];
+  const interrupted: string[] = [];
+  const statuses: string[] = [];
+  observer.on('output', (event) => outputs.push(event));
+  observer.on('interrupted', (reason) => interrupted.push(reason));
+  observer.on('status_change', (status) => statuses.push(status));
+
+  try {
+    observer.start(false);
+    appendEntries(jsonlPath, [
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: {} }] },
+      },
+      { type: 'user', message: { content: '[Request interrupted by user]' } },
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: '[Tool use interrupted]' }] },
+      },
+    ]);
+
+    (observer as SessionObserverInternals).readNewEntries();
+
+    assert.deepEqual(statuses, ['running']);
+    assert.deepEqual(interrupted, ['streaming']);
+    assert.deepEqual(outputs, [
+      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Bash', tool_input: {} },
+      { type: 'tool_result', tool_id: 'tool-1', status: 'error', output: '[Tool use interrupted]' },
+      { type: 'system_message', message: 'Interrupted by user.' },
+    ]);
   } finally {
     observer.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -223,4 +387,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+}
+
+function writeEntries(filePath: string, entries: unknown[]): void {
+  writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+}
+
+function appendEntries(filePath: string, entries: unknown[]): void {
+  appendFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
 }
