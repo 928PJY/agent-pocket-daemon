@@ -112,6 +112,68 @@ test('RelayClient resets decrypt failure streak across connection boundaries', (
   assert.deepEqual(decryptErrors, [3]);
 });
 
+test('RelayClient resets decrypt failure streak after a good encrypted envelope', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+    decrypt: (_ciphertext, nonce) => {
+      if (nonce === 2) return JSON.stringify({ type: 'send_message', text: 'ok' });
+      throw new Error('auth failed');
+    },
+  });
+  const internals = client as unknown as { handleMessage(data: string): void };
+  const decryptErrors: number[] = [];
+  const messages: unknown[] = [];
+  client.on('decrypt_error', (count) => decryptErrors.push(count));
+  client.on('message', (message) => messages.push(message));
+
+  const frame = (nonce: number) => JSON.stringify({
+    pair_id: 'pair-1',
+    sender: 'phone',
+    encrypted_payload: 'ciphertext',
+    nonce,
+    timestamp: Date.now(),
+  });
+  internals.handleMessage(frame(0));
+  internals.handleMessage(frame(1));
+  internals.handleMessage(frame(2));
+  internals.handleMessage(frame(3));
+  internals.handleMessage(frame(4));
+
+  assert.deepEqual(messages, [{ type: 'send_message', text: 'ok' }]);
+  assert.deepEqual(decryptErrors, []);
+});
+
+test('RelayClient requeues envelope and emits error when connected socket send fails', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const internals = client as unknown as {
+    isConnected: boolean;
+    ws: { readyState: number; send(data: string): void };
+    offlineQueue: Array<{ encrypted_payload: string }>;
+  };
+  const errors: Error[] = [];
+  internals.isConnected = true;
+  internals.ws = {
+    readyState: 1,
+    send: () => { throw new Error('socket closed mid-send'); },
+  };
+  client.on('error', (error) => errors.push(error));
+
+  client.send({ type: 'permission_request', request_id: 'req-1' });
+
+  assert.equal(internals.offlineQueue.length, 1);
+  assert.match(errors[0].message, /socket closed mid-send/);
+  assert.deepEqual(
+    JSON.parse(Buffer.from(internals.offlineQueue[0].encrypted_payload, 'base64').toString('utf-8')),
+    { type: 'permission_request', request_id: 'req-1' },
+  );
+});
+
 test('RelayClient bounds offline queue by dropping oldest messages', () => {
   const client = new RelayClient({
     relayUrl: 'wss://relay.example',
@@ -165,6 +227,85 @@ test('RelayClient processes relay hello and peer status control frames', () => {
   assert.deepEqual(client.getRelayFeatures(), ['peer_status']);
   assert.equal(client.getPhonePeerOnline(), true);
   assert.equal(phoneOnlineEvents, 1);
+});
+
+test('RelayClient processes peer status query responses and offline transitions', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  let phoneOnlineEvents = 0;
+  client.on('phone_online', () => { phoneOnlineEvents++; });
+  const privateClient = client as unknown as { handleMessage(data: string): void };
+
+  privateClient.handleMessage(JSON.stringify({
+    type: '__relay_control',
+    action: 'peer_status',
+    online: true,
+  }));
+  privateClient.handleMessage(JSON.stringify({
+    type: '__relay_control',
+    action: 'peer_status',
+    online: false,
+  }));
+  privateClient.handleMessage(JSON.stringify({
+    type: '__relay_control',
+    action: 'peer_status',
+    role: 'pc',
+    online: true,
+  }));
+
+  assert.equal(client.getPhonePeerOnline(), false);
+  assert.equal(phoneOnlineEvents, 1);
+});
+
+test('RelayClient emits peer control frames without requiring envelope payloads', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+    decrypt: () => {
+      throw new Error('peer controls must bypass decrypt');
+    },
+  });
+  const privateClient = client as unknown as { handleMessage(data: string): void };
+  const fingerprints: string[] = [];
+  const e2eErrors: string[] = [];
+  client.on('key_verify', (fingerprint) => fingerprints.push(fingerprint));
+  client.on('e2e_error_control', (message) => e2eErrors.push(message));
+
+  privateClient.handleMessage(JSON.stringify({
+    type: '__peer_control',
+    action: 'key_verify',
+    key_fingerprint: 'abc123',
+  }));
+  privateClient.handleMessage(JSON.stringify({
+    type: '__peer_control',
+    action: 'e2e_error',
+    message: 'rekey required',
+  }));
+
+  assert.deepEqual(fingerprints, ['abc123']);
+  assert.deepEqual(e2eErrors, ['rekey required']);
+});
+
+test('RelayClient emits parse errors for malformed relay frames without decrypt_error', () => {
+  const client = new RelayClient({
+    relayUrl: 'wss://relay.example',
+    pairId: 'pair-1',
+    authToken: 'token',
+  });
+  const privateClient = client as unknown as { handleMessage(data: string): void };
+  const errors: Error[] = [];
+  const decryptErrors: number[] = [];
+  client.on('error', (error) => errors.push(error));
+  client.on('decrypt_error', (count) => decryptErrors.push(count));
+
+  privateClient.handleMessage('{bad');
+
+  assert.match(errors[0].message, /Failed to parse relay message/);
+  assert.deepEqual(decryptErrors, []);
 });
 
 test('RelayClient decodes plaintext envelopes and emits payload messages', () => {
