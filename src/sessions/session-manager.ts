@@ -174,7 +174,7 @@ class StreamInputController {
  *
  * PATH search walks $PATH directly (no shell exec) for safety + speed.
  */
-function resolveClaudeExecutable(): string | undefined {
+export function resolveClaudeExecutable(): string | undefined {
   const override = process.env.AGENT_POCKET_CLAUDE_PATH;
   if (override && fs.existsSync(override)) return override;
 
