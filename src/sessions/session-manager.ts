@@ -5,6 +5,7 @@
 
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Query,
@@ -159,6 +160,36 @@ class StreamInputController {
       }
     }
   }
+}
+
+// ============================================================================
+// Claude CLI resolution
+// ============================================================================
+
+/**
+ * Decide which `claude` binary the SDK should spawn. Order:
+ *   1. AGENT_POCKET_CLAUDE_PATH env override
+ *   2. `claude` on PATH (typically the user's native installer at ~/.local/bin/claude)
+ *   3. undefined — let the SDK fall back to its bundled platform binary
+ *
+ * PATH search walks $PATH directly (no shell exec) for safety + speed.
+ */
+function resolveClaudeExecutable(): string | undefined {
+  const override = process.env.AGENT_POCKET_CLAUDE_PATH;
+  if (override && fs.existsSync(override)) return override;
+
+  const pathEnv = process.env.PATH ?? '';
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, 'claude');
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // ENOENT — keep searching.
+    }
+  }
+
+  return undefined;
 }
 
 // ============================================================================
@@ -807,8 +838,10 @@ export class SessionManager extends EventEmitter {
 
   private buildQueryOptions(state: SessionState, config: SessionConfig) {
     const model = config.model ?? this.config.default_model;
+    const claudePath = resolveClaudeExecutable();
     return {
       cwd: state.workingDirectory,
+      ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
       ...(model ? { model } : {}),
       ...(config.system_prompt ? { systemPrompt: config.system_prompt } : {}),
       permissionMode: 'default' as const,
