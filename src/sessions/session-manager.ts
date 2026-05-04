@@ -11,7 +11,13 @@ import type {
   SDKMessage,
   SDKUserMessage,
   PermissionResult,
+  Options as SDKQueryOptions,
 } from '@anthropic-ai/claude-agent-sdk';
+
+export type QueryFactory = (args: {
+  prompt: AsyncIterable<SDKUserMessage>;
+  options: SDKQueryOptions;
+}) => Query;
 import type {
   ClaudeEvent,
   ThinkingEvent,
@@ -95,6 +101,9 @@ export interface SessionManagerConfig {
   default_working_directory?: string;
   default_model?: string;
   max_concurrent_sessions?: number;
+  /** Override the SDK query() factory. Used by tests to inject a fake Query
+   *  without spawning the Claude binary. */
+  queryFactory?: QueryFactory;
 }
 
 export interface SessionManagerEvents {
@@ -169,10 +178,12 @@ export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionState> = new Map();
   private config: SessionManagerConfig;
   private sessionCounter: number = 0;
+  private queryFactory: QueryFactory;
 
   constructor(config: SessionManagerConfig = {}) {
     super();
     this.config = config;
+    this.queryFactory = config.queryFactory ?? ((args) => query(args));
   }
 
   /**
@@ -252,7 +263,7 @@ export class SessionManager extends EventEmitter {
     }
 
     // Start the SDK query
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: this.buildQueryOptions(state, config),
     });
@@ -313,7 +324,7 @@ export class SessionManager extends EventEmitter {
       } as SDKUserMessage);
     }
 
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: {
         ...this.buildQueryOptions(state, config),
@@ -918,7 +929,7 @@ export class SessionManager extends EventEmitter {
     session.lastEmittedThinkingLength = Number.MAX_SAFE_INTEGER;
     // Don't clear emittedToolUseIds — old tool IDs should remain suppressed
 
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: {
         ...this.buildQueryOptions(session, session.config ?? {}),
