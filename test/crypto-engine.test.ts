@@ -97,3 +97,52 @@ test('wake blob decrypts the shared cross-language fixture', () => {
 
   assert.equal(receiver.decryptWakeBlob(fixture.blob), fixture.payload);
 });
+
+test('message encryption and decryption reject missing keys and invalid ciphertext', () => {
+  const engine = new CryptoEngine();
+
+  assert.throws(() => engine.encrypt('hello'), /Session keys not established/);
+  assert.throws(() => engine.decrypt('', 0), /Session keys not established/);
+
+  engine.restoreSessionKeys(crypto.randomBytes(32), crypto.randomBytes(32), crypto.randomBytes(32));
+
+  assert.throws(() => engine.decrypt(Buffer.alloc(27).toString('base64'), 0), /Ciphertext too short/);
+
+  const encrypted = engine.encrypt('signed text');
+  const tampered = Buffer.from(encrypted.ciphertext, 'base64');
+  tampered[tampered.length - 1] ^= 0xff;
+
+  assert.throws(() => engine.decrypt(tampered.toString('base64'), encrypted.nonce));
+});
+
+test('wake blob decryption rejects unauthenticated or malformed plaintext', () => {
+  const sendKey = crypto.randomBytes(32);
+  const sasKey = crypto.randomBytes(32);
+  const engine = new CryptoEngine();
+  const receiver = new CryptoEngine();
+
+  assert.throws(() => engine.encryptWakeBlob('hello'), /Session keys not established/);
+  assert.throws(() => engine.decryptWakeBlob(''), /Session keys not established/);
+
+  engine.restoreSessionKeys(sendKey, crypto.randomBytes(32), sasKey);
+  receiver.restoreSessionKeys(crypto.randomBytes(32), sendKey, sasKey);
+
+  const blob = engine.encryptWakeBlob('hello');
+  const tampered = Buffer.from(blob, 'base64');
+  tampered[tampered.length - 1] ^= 0xff;
+
+  assert.throws(() => receiver.decryptWakeBlob(Buffer.alloc(27).toString('base64')), /Ciphertext too short/);
+  assert.throws(() => receiver.decryptWakeBlob(tampered.toString('base64')));
+
+  const privateEngine = engine as unknown as { encryptWithKey(plaintext: Buffer, key: Buffer): string };
+  const wakeKey = engine.getSessionKeys()!.wakeSendKey;
+
+  assert.throws(
+    () => receiver.decryptWakeBlob(privateEngine.encryptWithKey(Buffer.alloc(10), wakeKey)),
+    /Invalid wake blob plaintext length/,
+  );
+  assert.throws(
+    () => receiver.decryptWakeBlob(privateEngine.encryptWithKey(Buffer.alloc(1024), wakeKey)),
+    /Invalid wake blob text length/,
+  );
+});

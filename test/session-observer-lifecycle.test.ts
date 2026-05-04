@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { SessionStatus } from 'agent-pocket-protocol';
+import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../src/observers/session-observer.js';
 import { SessionManager } from '../src/sessions/session-manager.js';
 
@@ -373,6 +373,125 @@ test('SessionManager marks observed sessions as history and discards queued mess
     assert.equal(session.terminalPid, undefined);
     assert.equal(session.terminalTarget, undefined);
     assert.deepEqual(session.messageQueue, []);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager.respondPermission resolves approve, deny, and always-allow branches', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const privateManager = manager as unknown as {
+    registerPermissionRequest(sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>): void;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+    const session = manager.getSession(sessionId)!;
+    const resolved: unknown[] = [];
+    const statuses: SessionStatus[] = [];
+    manager.on('session_status', (_sessionId, status) => statuses.push(status));
+
+    privateManager.registerPermissionRequest(sessionId, 'approve-1', 'Bash', { command: 'pwd' });
+    session.pendingPermissionResolvers.set('approve-1', (result) => resolved.push(result));
+    manager.respondPermission(sessionId, 'approve-1', PermissionDecision.APPROVE, { command: 'ls' });
+
+    privateManager.registerPermissionRequest(sessionId, 'deny-1', 'Write', { file_path: 'a.txt' });
+    session.pendingPermissionResolvers.set('deny-1', (result) => resolved.push(result));
+    manager.respondPermission(sessionId, 'deny-1', PermissionDecision.DENY);
+
+    privateManager.registerPermissionRequest(sessionId, 'always-1', 'Read', { file_path: 'b.txt' });
+    session.pendingPermissionResolvers.set('always-1', (result) => resolved.push(result));
+    manager.respondPermission(sessionId, 'always-1', PermissionDecision.ALWAYS_ALLOW);
+
+    assert.deepEqual(resolved, [
+      { behavior: 'allow', updatedInput: { command: 'ls' } },
+      { behavior: 'deny', message: 'User denied permission' },
+      { behavior: 'allow', updatedInput: { file_path: 'b.txt' } },
+    ]);
+    assert.equal(session.pendingPermissions.size, 0);
+    assert.equal(session.pendingPermissionResolvers.size, 0);
+    assert.equal(session.status, SessionStatus.RUNNING);
+    assert.equal(session.alwaysAllowedTools.has('Read'), true);
+    assert.equal(statuses.includes(SessionStatus.PENDING_ACTIONS), true);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager permission callback auto-allows remembered tools and aborts pending requests', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const privateManager = manager as unknown as {
+    buildCanUseTool(session: ReturnType<SessionManager['getSession']>): (
+      toolName: string,
+      toolInput: Record<string, unknown>,
+      options: { signal: AbortSignal },
+    ) => Promise<unknown>;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+    const session = manager.getSession(sessionId)!;
+    session.alwaysAllowedTools.add('Read');
+    const canUseTool = privateManager.buildCanUseTool(session);
+
+    assert.deepEqual(
+      await canUseTool('Read', { file_path: 'a.txt' }, { signal: new AbortController().signal }),
+      { behavior: 'allow', updatedInput: { file_path: 'a.txt' } },
+    );
+
+    const abortController = new AbortController();
+    const pending = canUseTool('Bash', { command: 'sleep 1' }, { signal: abortController.signal });
+    assert.equal(session.pendingPermissions.size, 1);
+
+    abortController.abort();
+
+    assert.deepEqual(await pending, { behavior: 'deny', message: 'Aborted' });
+    assert.equal(session.pendingPermissionResolvers.size, 0);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager kill, interrupt, and emergency paths clean up session state', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+
+  try {
+    const observedId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
+    const observed = manager.getSession(observedId)!;
+    const ended: Array<[string, number]> = [];
+    manager.on('session_ended', (sessionId, code) => ended.push([sessionId, code]));
+
+    await manager.killSession(observedId);
+
+    assert.equal(observed.status, SessionStatus.HISTORY);
+    assert.equal(observed.observer?.isActive(), false);
+    assert.deepEqual(ended, [[observedId, 0]]);
+
+    const interruptId = manager.observeSession('claude-session-2', jsonlPath, dir, 12346);
+    assert.throws(() => manager.interruptSession(interruptId), /no terminal target available/);
+
+    const emergencyId = manager.observeSession('claude-session-3', jsonlPath, dir, 12347);
+    const emergency = manager.getSession(emergencyId)!;
+    manager.emergencyAbort();
+
+    assert.equal(emergency.status, SessionStatus.HISTORY);
+    assert.equal(emergency.abortController.signal.aborted, true);
+    assert.equal(emergency.observer?.isActive(), false);
   } finally {
     manager.shutdown();
     rmSync(dir, { recursive: true, force: true });
