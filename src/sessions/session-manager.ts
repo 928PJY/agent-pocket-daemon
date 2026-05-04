@@ -13,7 +13,13 @@ import type {
   SDKMessage,
   SDKUserMessage,
   PermissionResult,
+  Options as SDKQueryOptions,
 } from '@anthropic-ai/claude-agent-sdk';
+
+export type QueryFactory = (args: {
+  prompt: AsyncIterable<SDKUserMessage>;
+  options: SDKQueryOptions;
+}) => Query;
 import type {
   ClaudeEvent,
   ThinkingEvent,
@@ -97,6 +103,9 @@ export interface SessionManagerConfig {
   default_working_directory?: string;
   default_model?: string;
   max_concurrent_sessions?: number;
+  /** Override the SDK query() factory. Used by tests to inject a fake Query
+   *  without spawning the Claude binary. */
+  queryFactory?: QueryFactory;
 }
 
 export interface SessionManagerEvents {
@@ -164,6 +173,36 @@ class StreamInputController {
 }
 
 // ============================================================================
+// Claude CLI resolution
+// ============================================================================
+
+/**
+ * Decide which `claude` binary the SDK should spawn. Order:
+ *   1. AGENT_POCKET_CLAUDE_PATH env override
+ *   2. `claude` on PATH (typically the user's native installer at ~/.local/bin/claude)
+ *   3. undefined — let the SDK fall back to its bundled platform binary
+ *
+ * PATH search walks $PATH directly (no shell exec) for safety + speed.
+ */
+export function resolveClaudeExecutable(): string | undefined {
+  const override = process.env.AGENT_POCKET_CLAUDE_PATH;
+  if (override && fs.existsSync(override)) return override;
+
+  const pathEnv = process.env.PATH ?? '';
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, 'claude');
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // ENOENT — keep searching.
+    }
+  }
+
+  return undefined;
+}
+
+// ============================================================================
 // SessionManager
 // ============================================================================
 
@@ -211,10 +250,12 @@ export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionState> = new Map();
   private config: SessionManagerConfig;
   private sessionCounter: number = 0;
+  private queryFactory: QueryFactory;
 
   constructor(config: SessionManagerConfig = {}) {
     super();
     this.config = config;
+    this.queryFactory = config.queryFactory ?? ((args) => query(args));
   }
 
   /**
@@ -295,7 +336,7 @@ export class SessionManager extends EventEmitter {
     }
 
     // Start the SDK query
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: this.buildQueryOptions(state, config),
     });
@@ -357,7 +398,7 @@ export class SessionManager extends EventEmitter {
       } as SDKUserMessage);
     }
 
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: {
         ...this.buildQueryOptions(state, config),
@@ -833,8 +874,10 @@ export class SessionManager extends EventEmitter {
 
   private buildQueryOptions(state: SessionState, config: SessionConfig) {
     const model = config.model ?? this.config.default_model;
+    const claudePath = resolveClaudeExecutable();
     return {
       cwd: state.workingDirectory,
+      ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
       ...(model ? { model } : {}),
       ...(config.system_prompt ? { systemPrompt: config.system_prompt } : {}),
       permissionMode: 'default' as const,
@@ -962,7 +1005,7 @@ export class SessionManager extends EventEmitter {
     session.lastEmittedThinkingLength = Number.MAX_SAFE_INTEGER;
     // Don't clear emittedToolUseIds — old tool IDs should remain suppressed
 
-    const handle = query({
+    const handle = this.queryFactory({
       prompt: inputController.stream(),
       options: {
         ...this.buildQueryOptions(session, session.config ?? {}),
