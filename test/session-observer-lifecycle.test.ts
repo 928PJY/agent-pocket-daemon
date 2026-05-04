@@ -483,7 +483,7 @@ test('SessionManager kill, interrupt, and emergency paths clean up session state
     assert.deepEqual(ended, [[observedId, 0]]);
 
     const interruptId = manager.observeSession('claude-session-2', jsonlPath, dir, 12346);
-    assert.throws(() => manager.interruptSession(interruptId), /no terminal target available/);
+    await assert.rejects(() => manager.interruptSession(interruptId), /no terminal target available/);
 
     const emergencyId = manager.observeSession('claude-session-3', jsonlPath, dir, 12347);
     const emergency = manager.getSession(emergencyId)!;
@@ -523,7 +523,7 @@ test('SessionManager reports missing sessions and no-op boundary helpers', async
   await assert.rejects(() => manager.sendMessage('missing', 'hello'), /Session not found: missing/);
   assert.throws(() => manager.respondPermission('missing', 'request-1', PermissionDecision.APPROVE), /Session not found: missing/);
   await assert.rejects(() => manager.killSession('missing'), /Session not found: missing/);
-  assert.throws(() => manager.interruptSession('missing'), /Session not found: missing/);
+  await assert.rejects(() => manager.interruptSession('missing'), /Session not found: missing/);
 
   manager.clearPendingActions('missing');
   manager.removeSession('missing');
