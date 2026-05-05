@@ -38,6 +38,7 @@ import type {
   SetPermissionModeCommand,
   SetModelCommand,
   GetSupportedModelsCommand,
+  GetContextUsageCommand,
   ListSessionsCommand,
   ReadFileCommand,
   EmergencyAbortCommand,
@@ -2282,6 +2283,10 @@ export class AgentPocketDaemon extends EventEmitter {
         await this.handleGetSupportedModels(command as GetSupportedModelsCommand);
         break;
 
+      case 'get_context_usage':
+        await this.handleGetContextUsage(command as GetContextUsageCommand);
+        break;
+
       case 'get_history':
         this.handleGetHistory(command);
         break;
@@ -2802,6 +2807,38 @@ export class AgentPocketDaemon extends EventEmitter {
     } catch (err) {
       const message = (err as Error).message;
       const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_MODELS_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
+  private async handleGetContextUsage(command: GetContextUsageCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'get_context_usage is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      const sdk = await this.sessionManager.getContextUsage(internalId);
+      const usage = {
+        categories: sdk.categories.map(c => ({ name: c.name, tokens: c.tokens, color: c.color, is_deferred: c.isDeferred })),
+        total_tokens: sdk.totalTokens,
+        max_tokens: sdk.maxTokens,
+        raw_max_tokens: sdk.rawMaxTokens,
+        percentage: sdk.percentage,
+        model: sdk.model,
+        memory_files: sdk.memoryFiles?.map(f => ({ path: f.path, type: f.type, tokens: f.tokens })),
+        mcp_tools: sdk.mcpTools?.map(t => ({ name: t.name, server_name: t.serverName, tokens: t.tokens, is_loaded: t.isLoaded })),
+        deferred_builtin_tools: sdk.deferredBuiltinTools?.map(t => ({ name: t.name, tokens: t.tokens, is_loaded: t.isLoaded })),
+      };
+      this.sendToPhone({
+        type: 'context_usage',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        usage,
+      } as unknown as PcEvent);
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_CONTEXT_USAGE_ERROR';
       this.sendError(command.request_id, message, code);
     }
   }
