@@ -721,11 +721,11 @@ export class AgentPocketDaemon extends EventEmitter {
     // message in JSONL. Clean up any pending blocking requests for this session
     // (the held hook HTTP connection may already be gone, but we also clear
     // the daemon-side retry tracking) and tell the phone the session is ready.
-    this.sessionManager.on('session_interrupted', (sessionId: string, reason: 'streaming' | 'tool_use') => {
+    this.sessionManager.on('session_interrupted', (sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer') => {
       const externalId = this.resolveExternalSessionId(sessionId);
       const session = this.sessionManager.getAllSessions().find(s => s.sessionId === sessionId);
 
-      logger.info('daemon', `session_interrupted (${reason}) for ${externalId.slice(0, 8)}`);
+      logger.info('daemon', `session_interrupted (${reason}, ${source}) for ${externalId.slice(0, 8)}`);
 
       // Drop every pending blocking request targeting this session, and tell
       // the phone to remove the corresponding card so it doesn't keep ticking.
@@ -745,6 +745,16 @@ export class AgentPocketDaemon extends EventEmitter {
       }
       if (session) {
         this.sessionManager.clearPendingActions(session.sessionId);
+      }
+
+      // SDK-driven interrupt has no JSONL trail, so emit a synthetic system
+      // message so the phone shows visible feedback. Observer-mode interrupts
+      // already surface via the JSONL synthetic interrupt entry.
+      if (source === 'sdk') {
+        this.sendFlattenedSessionOutput(externalId, {
+          type: 'system_message',
+          message: 'Session interrupted by user',
+        }, 'claude_code');
       }
 
       this.sendToPhone({
@@ -2292,12 +2302,16 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handleNewSession(command: NewSessionCommand): void {
     try {
+      if (command.config.agent_type !== 'claude_code') {
+        throw new Error(`agent_type '${command.config.agent_type}' is not yet supported by the controller`);
+      }
       const sessionConfig: SessionConfig = {
+        name: command.config.name,
+        agent_type: command.config.agent_type,
         working_directory: command.config.working_directory,
         model: command.config.model,
         system_prompt: command.config.system_prompt,
         allowed_tools: command.config.allowed_tools,
-        initial_message: command.config.initial_message,
       };
 
       const sessionId = this.sessionManager.createSession(sessionConfig);
