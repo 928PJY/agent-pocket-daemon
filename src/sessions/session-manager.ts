@@ -39,11 +39,12 @@ import { logger } from '../logger.js';
 // ============================================================================
 
 export interface SessionConfig {
+  name?: string;
+  agent_type?: 'claude_code' | 'codex';
   working_directory?: string;
   model?: string;
   system_prompt?: string;
   allowed_tools?: string[];
-  initial_message?: string;
 }
 
 export interface PendingPermission {
@@ -68,6 +69,8 @@ export interface SessionState {
   lastActivity: number;
   /** Claude Code's own session ID (from init/result), used for --resume */
   claudeSessionId?: string;
+  /** User-supplied session name shown in the phone session list. */
+  name?: string;
   /** Config used to create this session, needed for respawning */
   config?: SessionConfig;
   messageQueue: string[];
@@ -114,7 +117,7 @@ export interface SessionManagerEvents {
   session_output: [sessionId: string, event: ClaudeEvent];
   session_ended: [sessionId: string, exitCode: number];
   session_status: [sessionId: string, status: SessionStatus];
-  session_interrupted: [sessionId: string, reason: 'streaming' | 'tool_use'];
+  session_interrupted: [sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer'];
   permission_request: [sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>];
   error: [sessionId: string, error: Error];
 }
@@ -309,6 +312,7 @@ export class SessionManager extends EventEmitter {
     const state: SessionState = {
       sessionId,
       claudeSessionId,
+      name: config.name,
       abortController,
       inputController,
       queryHandle: null,
@@ -323,7 +327,8 @@ export class SessionManager extends EventEmitter {
       messageQueue: [],
       injectedMessages: new Set(),
       hasEmittedStarted: false,
-      titleIsCustom: false,
+      customTitle: config.name,
+      titleIsCustom: config.name ? true : false,
       lastEmittedTextLength: 0,
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
@@ -332,15 +337,6 @@ export class SessionManager extends EventEmitter {
     };
 
     this.sessions.set(sessionId, state);
-
-    // Push the initial message into the stream
-    if (config.initial_message) {
-      inputController.push({
-        type: 'user',
-        message: { role: 'user', content: config.initial_message },
-        parent_tool_use_id: null,
-      } as SDKUserMessage);
-    }
 
     // Start the SDK query
     const handle = this.queryFactory({
@@ -387,7 +383,8 @@ export class SessionManager extends EventEmitter {
       messageQueue: [],
       injectedMessages: new Set(),
       hasEmittedStarted: false,
-      titleIsCustom: false,
+      customTitle: config.name,
+      titleIsCustom: config.name ? true : false,
       lastEmittedTextLength: 0,
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
@@ -396,14 +393,6 @@ export class SessionManager extends EventEmitter {
     };
 
     this.sessions.set(sessionId, state);
-
-    if (config.initial_message) {
-      inputController.push({
-        type: 'user',
-        message: { role: 'user', content: config.initial_message },
-        parent_tool_use_id: null,
-      } as SDKUserMessage);
-    }
 
     const handle = this.queryFactory({
       prompt: inputController.stream(),
@@ -698,7 +687,7 @@ export class SessionManager extends EventEmitter {
       state.status = SessionStatus.READY;
       state.lastActivity = Date.now();
       state.hasReceivedEvents = true;
-      this.emit('session_interrupted', sessionId, reason);
+      this.emit('session_interrupted', sessionId, reason, 'observer');
     });
 
     // Start tailing
@@ -858,7 +847,7 @@ export class SessionManager extends EventEmitter {
     try {
       await session.queryHandle.interrupt();
       session.lastActivity = Date.now();
-      this.emit('session_interrupted', sessionId, 'streaming');
+      this.emit('session_interrupted', sessionId, 'streaming', 'sdk');
     } catch (err) {
       // Fall back to abort if the SDK rejects the interrupt (e.g. query already
       // settling). abort() ends the session entirely, matching the old behaviour.
@@ -906,6 +895,7 @@ export class SessionManager extends EventEmitter {
       ...(model ? { model } : {}),
       ...(config.system_prompt ? { systemPrompt: config.system_prompt } : {}),
       ...(includeSessionId && state.claudeSessionId ? { sessionId: state.claudeSessionId } : {}),
+      ...(includeSessionId && state.customTitle ? { title: state.customTitle } : {}),
       permissionMode: 'default' as const,
       ...(config.allowed_tools?.length ? { allowedTools: config.allowed_tools } : {}),
       canUseTool: this.buildCanUseTool(state),
@@ -1052,11 +1042,16 @@ export class SessionManager extends EventEmitter {
     if (!queryHandle) return;
 
     try {
-      state.status = SessionStatus.RUNNING;
+      // First-time spawn: surface the session immediately as READY (waiting
+      // for user input). Re-entry (e.g. after sendMessage queues a turn)
+      // transitions to RUNNING.
       if (!state.hasEmittedStarted) {
         state.hasEmittedStarted = true;
-        this.emit('session_started', sessionId, state.workingDirectory);
+        state.status = SessionStatus.READY;
+        this.emit('session_started', sessionId, state.workingDirectory, state.customTitle);
+        this.emit('session_status', sessionId, SessionStatus.READY);
       } else {
+        state.status = SessionStatus.RUNNING;
         this.emit('session_status', sessionId, SessionStatus.RUNNING);
       }
 

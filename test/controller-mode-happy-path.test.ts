@@ -103,8 +103,9 @@ test('controller mode happy path: createSession streams events and reaches READY
   const cwd = mkdtempSync(join(tmpdir(), 'cm-happy-path-'));
   try {
     const sessionId = manager.createSession({
+      name: 'happy-path',
+      agent_type: 'claude_code',
       working_directory: cwd,
-      initial_message: 'hello claude',
     });
 
     await waitFor(() => startedWith !== undefined);
@@ -112,9 +113,11 @@ test('controller mode happy path: createSession streams events and reaches READY
     assert.equal(startedWith?.cwd, cwd);
 
     const session = manager.getSession(sessionId)!;
-    assert.equal(session.status, SessionStatus.RUNNING);
+    assert.equal(session.status, SessionStatus.READY);
     assert.ok(session.queryHandle, 'queryHandle must be set after createSession');
 
+    await manager.sendMessage(sessionId, 'hello claude');
+    assert.equal(session.status, SessionStatus.RUNNING);
     const promptIter = fake.prompt[Symbol.asyncIterator]();
     const first = await promptIter.next();
     assert.equal(first.done, false);
