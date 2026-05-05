@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Query, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { SessionStatus } from 'agent-pocket-protocol';
@@ -97,15 +100,16 @@ test('controller mode happy path: createSession streams events and reaches READY
   manager.on('session_status', (_id, status) => statuses.push(status));
   manager.on('session_started', (sessionId, cwd) => { startedWith = { sessionId, cwd }; });
 
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-happy-path-'));
   try {
     const sessionId = manager.createSession({
-      working_directory: '/tmp/cm-happy-path',
+      working_directory: cwd,
       initial_message: 'hello claude',
     });
 
     await waitFor(() => startedWith !== undefined);
     assert.equal(startedWith?.sessionId, sessionId);
-    assert.equal(startedWith?.cwd, '/tmp/cm-happy-path');
+    assert.equal(startedWith?.cwd, cwd);
 
     const session = manager.getSession(sessionId)!;
     assert.equal(session.status, SessionStatus.RUNNING);
@@ -151,5 +155,6 @@ test('controller mode happy path: createSession streams events and reaches READY
     assert.equal(session.status, SessionStatus.READY);
   } finally {
     manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

@@ -5,6 +5,7 @@
 
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
@@ -205,6 +206,46 @@ export function resolveClaudeExecutable(): string | undefined {
 // SessionManager
 // ============================================================================
 
+/**
+ * Expand shell-style path tokens that the daemon (Node.js) does not handle
+ * natively but users typing on the phone reasonably expect to work:
+ *   - leading `~` or `~/...`  -> $HOME/...
+ *   - `$VAR` and `${VAR}`     -> process.env.VAR (left as-is if unset)
+ * Also normalizes the result so `..` segments collapse.
+ */
+export function expandPath(input: string): string {
+  let out = input;
+  if (out === '~') {
+    out = os.homedir();
+  } else if (out.startsWith('~/')) {
+    out = path.join(os.homedir(), out.slice(2));
+  }
+  out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced: string | undefined, bare: string | undefined) => {
+    const name = braced ?? bare ?? '';
+    const value = process.env[name];
+    return value ?? match;
+  });
+  return path.normalize(out);
+}
+
+/**
+ * Verify a session's working directory exists and is a directory before we
+ * hand it to the SDK as `cwd`. Without this check the SDK's `query()` spawn
+ * fails with `ENOENT`, which the SDK reports as "Claude Code native binary
+ * not found" — completely misleading. See agent-pocket#224.
+ */
+function assertWorkingDirectoryExists(dir: string): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(dir);
+  } catch {
+    throw new Error(`Working directory does not exist: ${dir}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Working directory is not a directory: ${dir}`);
+  }
+}
+
 export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionState> = new Map();
   private config: SessionManagerConfig;
@@ -254,7 +295,8 @@ export class SessionManager extends EventEmitter {
     }
 
     const sessionId = this.generateSessionId();
-    const workingDir = config.working_directory ?? this.config.default_working_directory ?? process.cwd();
+    const workingDir = expandPath(config.working_directory ?? this.config.default_working_directory ?? process.cwd());
+    assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
 
@@ -316,7 +358,8 @@ export class SessionManager extends EventEmitter {
     }
 
     const sessionId = this.generateSessionId();
-    const workingDir = config.working_directory ?? this.config.default_working_directory ?? process.cwd();
+    const workingDir = expandPath(config.working_directory ?? this.config.default_working_directory ?? process.cwd());
+    assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
 
