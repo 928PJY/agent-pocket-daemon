@@ -909,6 +909,17 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Snapshot the SDK Query's current context-window usage. Controller-mode only.
+   */
+  async getContextUsage(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['getContextUsage']>>> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query context usage');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    return await session.queryHandle.getContextUsage();
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {

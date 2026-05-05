@@ -20,6 +20,9 @@ interface FakeQueryHandle {
   supportedModelsCalls: number;
   setSupportedModelsResult(models: unknown[]): void;
   setSupportedModelsError(err: Error): void;
+  getContextUsageCalls: number;
+  setContextUsageResult(usage: unknown): void;
+  setContextUsageError(err: Error): void;
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -52,6 +55,9 @@ function createFakeQuery(): FakeQueryHandle {
     supportedModelsCalls: 0,
     supportedModelsResult: [] as unknown[],
     supportedModelsError: undefined as Error | undefined,
+    getContextUsageCalls: 0,
+    contextUsageResult: undefined as unknown,
+    contextUsageError: undefined as Error | undefined,
     async interrupt() { fakeQuery.interruptCalls += 1; },
     async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
     async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
@@ -67,7 +73,11 @@ function createFakeQuery(): FakeQueryHandle {
     async supportedAgents() { return []; },
     async mcpServerStatus() { return []; },
     async setMcpServers() {},
-    async getContextUsage() { return undefined as never; },
+    async getContextUsage() {
+      fakeQuery.getContextUsageCalls += 1;
+      if (fakeQuery.contextUsageError) throw fakeQuery.contextUsageError;
+      return fakeQuery.contextUsageResult as never;
+    },
     async rewindFiles() { return undefined as never; },
   };
 
@@ -80,6 +90,9 @@ function createFakeQuery(): FakeQueryHandle {
     supportedModelsCalls: 0,
     setSupportedModelsResult(models) { fakeQuery.supportedModelsResult = models; },
     setSupportedModelsError(err) { fakeQuery.supportedModelsError = err; },
+    getContextUsageCalls: 0,
+    setContextUsageResult(usage) { fakeQuery.contextUsageResult = usage; },
+    setContextUsageError(err) { fakeQuery.contextUsageError = err; },
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -91,6 +104,7 @@ function createFakeQuery(): FakeQueryHandle {
   Object.defineProperty(handle, 'setPermissionModeCalls', { get: () => fakeQuery.setPermissionModeCalls });
   Object.defineProperty(handle, 'setModelCalls', { get: () => fakeQuery.setModelCalls });
   Object.defineProperty(handle, 'supportedModelsCalls', { get: () => fakeQuery.supportedModelsCalls });
+  Object.defineProperty(handle, 'getContextUsageCalls', { get: () => fakeQuery.getContextUsageCalls });
 
   return handle;
 }
@@ -344,6 +358,63 @@ test('getSupportedModels propagates SDK errors', async () => {
     await assert.rejects(
       () => manager.getSupportedModels(sessionId),
       (err: Error) => err.message.includes('boom from sdk'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getContextUsage forwards to query.getContextUsage and returns the snapshot', async () => {
+  const fake = createFakeQuery();
+  const fakeUsage = {
+    categories: [{ name: 'messages', tokens: 5000, color: '#abc' }],
+    totalTokens: 5000,
+    maxTokens: 200000,
+    rawMaxTokens: 200000,
+    percentage: 2.5,
+    gridRows: [],
+    model: 'claude-sonnet-4-6',
+    memoryFiles: [],
+    mcpTools: [],
+  };
+  fake.setContextUsageResult(fakeUsage);
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-ctx-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const usage = await manager.getContextUsage(sessionId);
+    assert.equal(fake.getContextUsageCalls, 1);
+    assert.equal((usage as { totalTokens: number }).totalTokens, 5000);
+    assert.equal((usage as { model: string }).model, 'claude-sonnet-4-6');
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getContextUsage rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.getContextUsage('does-not-exist'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('getContextUsage propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setContextUsageError(new Error('boom usage'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-ctx-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.getContextUsage(sessionId),
+      (err: Error) => err.message.includes('boom usage'),
     );
   } finally {
     manager.shutdown();
