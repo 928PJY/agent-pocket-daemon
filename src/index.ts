@@ -2986,8 +2986,9 @@ export class AgentPocketDaemon extends EventEmitter {
         if (claimedSessionIds.has(codex.sessionId)) continue;
         const observed = this.codexObservers.get(codex.sessionId);
         const liveCodex = liveCodexSessions.get(codex.sessionId);
+        const observedStatus = observed?.status;
         const codexStatus = liveCodex
-          ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
+          ? (observedStatus === SessionStatus.RUNNING || observedStatus === SessionStatus.PENDING_ACTIONS ? observedStatus : SessionStatus.READY)
           : SessionStatus.HISTORY;
         const terminal = liveCodex ? this.resolveCodexTerminalTarget(codex.sessionId, liveCodex) : undefined;
         const capabilities = liveCodex ? this.getCodexCapabilities(codex.sessionId) : ['observe'];
