@@ -35,6 +35,8 @@ import type {
   QuestionResponseCommand,
   KillSessionCommand,
   InterruptSessionCommand,
+  SetPermissionModeCommand,
+  SetModelCommand,
   ListSessionsCommand,
   ReadFileCommand,
   EmergencyAbortCommand,
@@ -453,6 +455,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
       const requestId = this.findRequestIdForSession(sessionId);
       const externalId = this.resolveExternalSessionId(sessionId);
+      const state = this.sessionManager.getSession(sessionId);
 
       const event: SessionStartedEvent = {
         type: 'session_started',
@@ -464,9 +467,25 @@ export class AgentPocketDaemon extends EventEmitter {
         agent_display_name: 'Claude Code',
         agent_version: this.claudeAgentVersion,
         capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
+        is_observed: state?.isObserved ?? true,
+        ...(state && !state.isObserved
+          ? {
+              permission_mode: state.permissionMode ?? 'default',
+              dangerously_skip_permissions: state.config?.dangerously_skip_permissions === true,
+            }
+          : {}),
       };
 
       this.sendToPhone(event);
+    });
+
+    this.sessionManager.on('permission_mode_changed', (sessionId: string, mode) => {
+      const externalId = this.resolveExternalSessionId(sessionId);
+      this.sendToPhone({
+        type: 'session_permission_mode_changed',
+        session_id: externalId,
+        mode,
+      });
     });
 
     this.sessionManager.on('session_output', (sessionId: string, claudeEvent: ClaudeEvent) => {
@@ -2250,6 +2269,14 @@ export class AgentPocketDaemon extends EventEmitter {
         await this.handleInterruptSession(command as InterruptSessionCommand);
         break;
 
+      case 'set_permission_mode':
+        await this.handleSetPermissionMode(command as SetPermissionModeCommand);
+        break;
+
+      case 'set_model':
+        await this.handleSetModel(command as SetModelCommand);
+        break;
+
       case 'get_history':
         this.handleGetHistory(command);
         break;
@@ -2312,6 +2339,7 @@ export class AgentPocketDaemon extends EventEmitter {
         model: command.config.model,
         system_prompt: command.config.system_prompt,
         allowed_tools: command.config.allowed_tools,
+        dangerously_skip_permissions: command.config.dangerously_skip_permissions,
       };
 
       const sessionId = this.sessionManager.createSession(sessionConfig);
@@ -2700,6 +2728,48 @@ export class AgentPocketDaemon extends EventEmitter {
     }
   }
 
+  private async handleSetPermissionMode(command: SetPermissionModeCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'set_permission_mode is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      await this.sessionManager.setPermissionMode(internalId, command.mode);
+      this.sendToPhone({
+        type: 'command_ack',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        command: 'set_permission_mode',
+      });
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_PERMISSION_MODE_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
+  private async handleSetModel(command: SetModelCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'set_model is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      await this.sessionManager.setModel(internalId, command.model);
+      this.sendToPhone({
+        type: 'command_ack',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        command: 'set_model',
+      });
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_MODEL_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
   private async handleListSessions(command: ListSessionsCommand): Promise<void> {
     fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions CALLED\n`);
     try {
@@ -2778,6 +2848,13 @@ export class AgentPocketDaemon extends EventEmitter {
             last_activity: active.lastActivity,
             entrypoint: active.entrypoint,
             pid: active.terminalPid,
+            is_observed: active.isObserved,
+            ...(active.isObserved
+              ? {}
+              : {
+                  permission_mode: active.permissionMode ?? 'default',
+                  dangerously_skip_permissions: active.config?.dangerously_skip_permissions === true,
+                }),
           },
           historyKey: claudeId,
         });
@@ -2829,6 +2906,7 @@ export class AgentPocketDaemon extends EventEmitter {
             last_activity: lastActivity,
             entrypoint: pidInfo.entrypoint,
             pid: pidInfo.pid,
+            is_observed: true,
           },
           historyKey,
         });
@@ -2852,6 +2930,7 @@ export class AgentPocketDaemon extends EventEmitter {
             working_directory: discovered.projectDir,
             project_name: discovered.customTitle ?? path.basename(discovered.projectDir),
             last_activity: discovered.lastModified,
+            is_observed: true,
           },
           historyKey: discovered.sessionId,
         });
@@ -2883,6 +2962,7 @@ export class AgentPocketDaemon extends EventEmitter {
             last_activity: observed?.lastActivity ?? codex.updatedAtMs,
             entrypoint: 'codex-cli',
             pid: liveCodex?.pid ?? terminal?.pid,
+            is_observed: true,
           },
           historyKey: codex.sessionId,
         });
@@ -3188,6 +3268,10 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     logger.trace('daemon', 'OUT event', { type: (event as { type?: string })?.type, requestId: (event as { request_id?: string })?.request_id, preview: JSON.stringify(event).slice(0, 100) });
+    if ((event as { type?: string })?.type === 'session_list') {
+      const sl = event as unknown as { sessions: Array<{ session_id: string; project_name?: string; status?: string }> };
+      logger.info('daemon', `[debug] session_list -> phone: ${sl.sessions.length} sessions: ${sl.sessions.map(s => `${s.session_id.slice(0,12)}(${s.project_name ?? '?'},${s.status ?? '?'})`).join(' | ')}`);
+    }
 
     const mode = this.config.connectionMode ?? 'relay';
 

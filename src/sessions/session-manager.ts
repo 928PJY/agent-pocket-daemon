@@ -27,6 +27,7 @@ import type {
   AssistantMessageEvent,
   ToolUseEvent,
   ToolResultEvent,
+  PermissionMode,
 } from 'agent-pocket-protocol';
 import { PermissionDecision, PERMISSION_TIMEOUT_MS, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
@@ -45,6 +46,11 @@ export interface SessionConfig {
   model?: string;
   system_prompt?: string;
   allowed_tools?: string[];
+  /**
+   * Launch the SDK Query with `allowDangerouslySkipPermissions: true`. Required
+   * for the session to switch into `bypassPermissions` mode later.
+   */
+  dangerously_skip_permissions?: boolean;
 }
 
 export interface PendingPermission {
@@ -88,6 +94,8 @@ export interface SessionState {
   emittedToolUseIds: Set<string>;
   /** Whether this session is observed (tailing JSONL) rather than controlled (SDK) */
   isObserved: boolean;
+  /** Current SDK permission mode for controller-mode sessions. Undefined for observed. */
+  permissionMode?: PermissionMode;
   /** The SessionObserver instance for observed sessions */
   observer?: SessionObserver;
   /** PID of the terminal Claude process (for observed sessions) */
@@ -119,6 +127,7 @@ export interface SessionManagerEvents {
   session_status: [sessionId: string, status: SessionStatus];
   session_interrupted: [sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer'];
   permission_request: [sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>];
+  permission_mode_changed: [sessionId: string, mode: PermissionMode];
   error: [sessionId: string, error: Error];
 }
 
@@ -333,6 +342,7 @@ export class SessionManager extends EventEmitter {
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
       isObserved: false,
+      permissionMode: 'default',
       hasReceivedEvents: false,
     };
 
@@ -389,6 +399,7 @@ export class SessionManager extends EventEmitter {
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
       isObserved: false,
+      permissionMode: 'default',
       hasReceivedEvents: false,
     };
 
@@ -857,6 +868,36 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Switch the active permission mode on a controller-mode session's SDK Query.
+   * Throws for observer-mode sessions or sessions with no live query handle.
+   */
+  async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot change permission mode');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    await session.queryHandle.setPermissionMode(mode);
+    session.permissionMode = mode;
+    session.lastActivity = Date.now();
+    this.emit('permission_mode_changed', sessionId, mode);
+    logger.debug('session-manager', 'Set permission mode', { sessionId, mode });
+  }
+
+  /**
+   * Switch the active model on a controller-mode session's SDK Query.
+   * Pass `undefined` to reset to the SDK's default model.
+   */
+  async setModel(sessionId: string, model: string | undefined): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot change model');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    await session.queryHandle.setModel(model);
+    session.lastActivity = Date.now();
+    logger.debug('session-manager', 'Set model', { sessionId, model });
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {
@@ -897,6 +938,7 @@ export class SessionManager extends EventEmitter {
       ...(includeSessionId && state.claudeSessionId ? { sessionId: state.claudeSessionId } : {}),
       ...(includeSessionId && state.customTitle ? { title: state.customTitle } : {}),
       permissionMode: 'default' as const,
+      ...(config.dangerously_skip_permissions ? { allowDangerouslySkipPermissions: true } : {}),
       ...(config.allowed_tools?.length ? { allowedTools: config.allowed_tools } : {}),
       canUseTool: this.buildCanUseTool(state),
       abortController: state.abortController,
