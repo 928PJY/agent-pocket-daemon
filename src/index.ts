@@ -2879,6 +2879,12 @@ export class AgentPocketDaemon extends EventEmitter {
           pidInfo.cwd = mapEntry.cwd;
         }
 
+        // Phase 1 records the SDK session's externalId/claudeSessionId in
+        // claimedSessionIds even when terminalPid is undefined (controller
+        // mode). Skip here so we don't emit a second copy of the same
+        // session when its sessionId also shows up in ~/.claude/sessions/.
+        if (claimedSessionIds.has(pidInfo.sessionId)) continue;
+
         // Best-effort JSONL match: try PID file's sessionId first.
         // If JSONL is missing or stale, still emit the PID with its tracked
         // sessionId — long-idle sessions are still real sessions with valid
