@@ -820,11 +820,13 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Interrupt a session by sending Escape to the terminal.
-   * For observed sessions, sends ESC via terminal injection.
-   * For SDK sessions, aborts the controller (same as kill — no graceful interrupt available).
+   * Interrupt a session.
+   * Observed sessions: send ESC via terminal injection.
+   * SDK sessions: call Query.interrupt(), which stops the current turn but
+   * keeps the query alive so the next user message lands on the same query
+   * (no resume + STARTING gap).
    */
-  interruptSession(sessionId: string): void {
+  async interruptSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -833,12 +835,28 @@ export class SessionManager extends EventEmitter {
     if (session.isObserved && session.terminalTarget) {
       logger.debug('session-manager', 'Sending ESC interrupt to terminal', { sessionId });
       terminalSendInterrupt(session.terminalTarget);
-    } else if (!session.isObserved) {
-      // SDK sessions: abort is the only way to interrupt
-      logger.debug('session-manager', 'Aborting SDK session', { sessionId });
-      session.abortController.abort();
-    } else {
+      return;
+    }
+
+    if (session.isObserved) {
       throw new Error('Cannot interrupt — no terminal target available');
+    }
+
+    if (!session.queryHandle) {
+      logger.debug('session-manager', 'Interrupt requested but no live query', { sessionId });
+      return;
+    }
+
+    logger.debug('session-manager', 'Interrupting SDK query', { sessionId });
+    try {
+      await session.queryHandle.interrupt();
+      session.lastActivity = Date.now();
+      this.emit('session_interrupted', sessionId, 'streaming');
+    } catch (err) {
+      // Fall back to abort if the SDK rejects the interrupt (e.g. query already
+      // settling). abort() ends the session entirely, matching the old behaviour.
+      logger.warn('session-manager', `Query.interrupt() failed, falling back to abort: ${(err as Error).message}`, { sessionId });
+      session.abortController.abort();
     }
   }
 

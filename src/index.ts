@@ -2237,7 +2237,7 @@ export class AgentPocketDaemon extends EventEmitter {
         break;
 
       case 'interrupt_session':
-        this.handleInterruptSession(command as InterruptSessionCommand);
+        await this.handleInterruptSession(command as InterruptSessionCommand);
         break;
 
       case 'get_history':
@@ -2658,7 +2658,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
   }
 
-  private handleInterruptSession(command: InterruptSessionCommand): void {
+  private async handleInterruptSession(command: InterruptSessionCommand): Promise<void> {
     if (isCodexSessionId(command.session_id)) {
       const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
       if (!target) {
@@ -2675,7 +2675,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
     try {
       const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      this.sessionManager.interruptSession(internalId);
+      await this.sessionManager.interruptSession(internalId);
       logger.debug('daemon', `Interrupted session ${command.session_id}`);
     } catch (err) {
       this.sendError(
