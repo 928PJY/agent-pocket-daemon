@@ -4,6 +4,7 @@
 // callback for interactive permission approval from the phone.
 
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -297,11 +298,17 @@ export class SessionManager extends EventEmitter {
     const sessionId = this.generateSessionId();
     const workingDir = expandPath(config.working_directory ?? this.config.default_working_directory ?? process.cwd());
     assertWorkingDirectoryExists(workingDir);
+    // Pre-generate the Claude session UUID and pass it to the SDK via
+    // `options.sessionId` so the external id is stable from the very first
+    // emitted event — avoids a window where the phone sees an internal id and
+    // then output frames arrive under the real claudeSessionId.
+    const claudeSessionId = randomUUID();
     const abortController = new AbortController();
     const inputController = new StreamInputController();
 
     const state: SessionState = {
       sessionId,
+      claudeSessionId,
       abortController,
       inputController,
       queryHandle: null,
@@ -338,7 +345,7 @@ export class SessionManager extends EventEmitter {
     // Start the SDK query
     const handle = this.queryFactory({
       prompt: inputController.stream(),
-      options: this.buildQueryOptions(state, config),
+      options: this.buildQueryOptions(state, config, true),
     });
     state.queryHandle = handle;
 
@@ -890,7 +897,7 @@ export class SessionManager extends EventEmitter {
     return `session_${Date.now()}_${this.sessionCounter}`;
   }
 
-  private buildQueryOptions(state: SessionState, config: SessionConfig) {
+  private buildQueryOptions(state: SessionState, config: SessionConfig, includeSessionId = false) {
     const model = config.model ?? this.config.default_model;
     const claudePath = resolveClaudeExecutable();
     return {
@@ -898,6 +905,7 @@ export class SessionManager extends EventEmitter {
       ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
       ...(model ? { model } : {}),
       ...(config.system_prompt ? { systemPrompt: config.system_prompt } : {}),
+      ...(includeSessionId && state.claudeSessionId ? { sessionId: state.claudeSessionId } : {}),
       permissionMode: 'default' as const,
       ...(config.allowed_tools?.length ? { allowedTools: config.allowed_tools } : {}),
       canUseTool: this.buildCanUseTool(state),
