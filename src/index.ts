@@ -39,6 +39,8 @@ import type {
   SetModelCommand,
   GetSupportedModelsCommand,
   GetContextUsageCommand,
+  GetSupportedCommandsCommand,
+  GetSupportedAgentsCommand,
   ListSessionsCommand,
   ReadFileCommand,
   EmergencyAbortCommand,
@@ -2286,6 +2288,12 @@ export class AgentPocketDaemon extends EventEmitter {
       case 'get_context_usage':
         await this.handleGetContextUsage(command as GetContextUsageCommand);
         break;
+      case 'get_supported_commands':
+        await this.handleGetSupportedCommands(command as GetSupportedCommandsCommand);
+        break;
+      case 'get_supported_agents':
+        await this.handleGetSupportedAgents(command as GetSupportedAgentsCommand);
+        break;
 
       case 'get_history':
         this.handleGetHistory(command);
@@ -2839,6 +2847,59 @@ export class AgentPocketDaemon extends EventEmitter {
     } catch (err) {
       const message = (err as Error).message;
       const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_CONTEXT_USAGE_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
+  private async handleGetSupportedCommands(command: GetSupportedCommandsCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'get_supported_commands is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      const sdk = await this.sessionManager.getSupportedCommands(internalId);
+      const commands = sdk.map(c => ({
+        name: c.name,
+        description: c.description,
+        argument_hint: c.argumentHint,
+        aliases: c.aliases,
+      }));
+      this.sendToPhone({
+        type: 'supported_commands',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        commands,
+      } as unknown as PcEvent);
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_COMMANDS_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
+  private async handleGetSupportedAgents(command: GetSupportedAgentsCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'get_supported_agents is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      const sdk = await this.sessionManager.getSupportedAgents(internalId);
+      const agents = sdk.map(a => ({
+        name: a.name,
+        description: a.description,
+        model: a.model,
+      }));
+      this.sendToPhone({
+        type: 'supported_agents',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        agents,
+      } as unknown as PcEvent);
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_AGENTS_ERROR';
       this.sendError(command.request_id, message, code);
     }
   }

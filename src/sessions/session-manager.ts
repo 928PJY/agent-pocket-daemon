@@ -920,6 +920,28 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Enumerate the slash commands the SDK Query knows about. Controller-mode only.
+   */
+  async getSupportedCommands(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['supportedCommands']>>> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query supported commands');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    return await session.queryHandle.supportedCommands();
+  }
+
+  /**
+   * Enumerate the subagents the SDK Query can spawn. Controller-mode only.
+   */
+  async getSupportedAgents(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['supportedAgents']>>> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query supported agents');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    return await session.queryHandle.supportedAgents();
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {

@@ -23,6 +23,12 @@ interface FakeQueryHandle {
   getContextUsageCalls: number;
   setContextUsageResult(usage: unknown): void;
   setContextUsageError(err: Error): void;
+  supportedCommandsCalls: number;
+  setSupportedCommandsResult(commands: unknown[]): void;
+  setSupportedCommandsError(err: Error): void;
+  supportedAgentsCalls: number;
+  setSupportedAgentsResult(agents: unknown[]): void;
+  setSupportedAgentsError(err: Error): void;
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -58,19 +64,33 @@ function createFakeQuery(): FakeQueryHandle {
     getContextUsageCalls: 0,
     contextUsageResult: undefined as unknown,
     contextUsageError: undefined as Error | undefined,
+    supportedCommandsCalls: 0,
+    supportedCommandsResult: [] as unknown[],
+    supportedCommandsError: undefined as Error | undefined,
+    supportedAgentsCalls: 0,
+    supportedAgentsResult: [] as unknown[],
+    supportedAgentsError: undefined as Error | undefined,
     async interrupt() { fakeQuery.interruptCalls += 1; },
     async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
     async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
     async setMaxThinkingTokens() {},
     async applyFlagSettings() {},
     async initializationResult() { return {} as never; },
-    async supportedCommands() { return []; },
+    async supportedCommands() {
+      fakeQuery.supportedCommandsCalls += 1;
+      if (fakeQuery.supportedCommandsError) throw fakeQuery.supportedCommandsError;
+      return fakeQuery.supportedCommandsResult as never;
+    },
     async supportedModels() {
       fakeQuery.supportedModelsCalls += 1;
       if (fakeQuery.supportedModelsError) throw fakeQuery.supportedModelsError;
       return fakeQuery.supportedModelsResult as never;
     },
-    async supportedAgents() { return []; },
+    async supportedAgents() {
+      fakeQuery.supportedAgentsCalls += 1;
+      if (fakeQuery.supportedAgentsError) throw fakeQuery.supportedAgentsError;
+      return fakeQuery.supportedAgentsResult as never;
+    },
     async mcpServerStatus() { return []; },
     async setMcpServers() {},
     async getContextUsage() {
@@ -93,6 +113,12 @@ function createFakeQuery(): FakeQueryHandle {
     getContextUsageCalls: 0,
     setContextUsageResult(usage) { fakeQuery.contextUsageResult = usage; },
     setContextUsageError(err) { fakeQuery.contextUsageError = err; },
+    supportedCommandsCalls: 0,
+    setSupportedCommandsResult(commands) { fakeQuery.supportedCommandsResult = commands; },
+    setSupportedCommandsError(err) { fakeQuery.supportedCommandsError = err; },
+    supportedAgentsCalls: 0,
+    setSupportedAgentsResult(agents) { fakeQuery.supportedAgentsResult = agents; },
+    setSupportedAgentsError(err) { fakeQuery.supportedAgentsError = err; },
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -105,6 +131,8 @@ function createFakeQuery(): FakeQueryHandle {
   Object.defineProperty(handle, 'setModelCalls', { get: () => fakeQuery.setModelCalls });
   Object.defineProperty(handle, 'supportedModelsCalls', { get: () => fakeQuery.supportedModelsCalls });
   Object.defineProperty(handle, 'getContextUsageCalls', { get: () => fakeQuery.getContextUsageCalls });
+  Object.defineProperty(handle, 'supportedCommandsCalls', { get: () => fakeQuery.supportedCommandsCalls });
+  Object.defineProperty(handle, 'supportedAgentsCalls', { get: () => fakeQuery.supportedAgentsCalls });
 
   return handle;
 }
@@ -415,6 +443,98 @@ test('getContextUsage propagates SDK errors', async () => {
     await assert.rejects(
       () => manager.getContextUsage(sessionId),
       (err: Error) => err.message.includes('boom usage'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getSupportedCommands forwards to query.supportedCommands and returns the list', async () => {
+  const fake = createFakeQuery();
+  const fakeCommands = [{ name: 'usage', description: 'Show usage', argumentHint: '', aliases: ['cost'] }];
+  fake.setSupportedCommandsResult(fakeCommands);
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-cmds-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const commands = await manager.getSupportedCommands(sessionId);
+    assert.equal(fake.supportedCommandsCalls, 1);
+    assert.equal((commands as Array<{ name: string }>)[0]?.name, 'usage');
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getSupportedCommands rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.getSupportedCommands('does-not-exist'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('getSupportedCommands propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setSupportedCommandsError(new Error('boom cmds'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-cmds-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.getSupportedCommands(sessionId),
+      (err: Error) => err.message.includes('boom cmds'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getSupportedAgents forwards to query.supportedAgents and returns the list', async () => {
+  const fake = createFakeQuery();
+  const fakeAgents = [{ name: 'Explore', description: 'Codebase explorer', model: 'haiku' }];
+  fake.setSupportedAgentsResult(fakeAgents);
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-agents-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const agents = await manager.getSupportedAgents(sessionId);
+    assert.equal(fake.supportedAgentsCalls, 1);
+    assert.equal((agents as Array<{ name: string }>)[0]?.name, 'Explore');
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getSupportedAgents rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.getSupportedAgents('does-not-exist'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('getSupportedAgents propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setSupportedAgentsError(new Error('boom agents'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-agents-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.getSupportedAgents(sessionId),
+      (err: Error) => err.message.includes('boom agents'),
     );
   } finally {
     manager.shutdown();
