@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22']
+        node: ['22']
 
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,6 @@ jobs:
         run: npm test
 
       - name: Coverage report
-        if: matrix.node == '20'
         id: coverage
         run: |
           set -o pipefail
@@ -47,18 +46,16 @@ jobs:
         continue-on-error: true
 
       - name: Comment coverage on PR
-        if: matrix.node == '20' && github.event_name == 'pull_request' && steps.coverage.outcome == 'success'
+        if: github.event_name == 'pull_request' && steps.coverage.outcome == 'success'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: daemon-coverage
           path: coverage.md
 
       - name: Generate lcov for Codecov
-        if: matrix.node == '20'
         run: npm run test:coverage:lcov
 
       - name: Upload coverage to Codecov
-        if: matrix.node == '20'
         uses: codecov/codecov-action@v5
         with:
           files: coverage/lcov.info
@@ -67,5 +64,4 @@ jobs:
           fail_ci_if_error: false
 
       - name: Verify package contents
-        if: matrix.node == '20'
         run: npm pack --dry-run
