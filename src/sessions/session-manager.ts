@@ -213,7 +213,7 @@ export function resolveClaudeExecutable(): string | undefined {
  *   - `$VAR` and `${VAR}`     -> process.env.VAR (left as-is if unset)
  * Also normalizes the result so `..` segments collapse.
  */
-function expandPath(input: string): string {
+export function expandPath(input: string): string {
   let out = input;
   if (out === '~') {
     out = os.homedir();
