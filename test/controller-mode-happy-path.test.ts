@@ -15,6 +15,8 @@ interface FakeQueryHandle {
   finish(): void;
   fail(err: Error): void;
   interruptCalls: number;
+  setPermissionModeCalls: unknown[][];
+  setModelCalls: unknown[][];
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -42,9 +44,11 @@ function createFakeQuery(): FakeQueryHandle {
     async return() { done = true; deliver({ done: true, value: undefined }); return { done: true, value: undefined } as IteratorResult<SDKMessage, void>; },
     async throw(err: unknown) { error = err instanceof Error ? err : new Error(String(err)); deliver({ done: true, value: undefined }); return { done: true, value: undefined } as IteratorResult<SDKMessage, void>; },
     interruptCalls: 0,
+    setPermissionModeCalls: [] as unknown[][],
+    setModelCalls: [] as unknown[][],
     async interrupt() { fakeQuery.interruptCalls += 1; },
-    async setPermissionMode() {},
-    async setModel() {},
+    async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
+    async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
     async setMaxThinkingTokens() {},
     async applyFlagSettings() {},
     async initializationResult() { return {} as never; },
@@ -61,6 +65,8 @@ function createFakeQuery(): FakeQueryHandle {
     query: fakeQuery as unknown as Query,
     prompt: (async function* () {})(),
     interruptCalls: 0,
+    setPermissionModeCalls: [],
+    setModelCalls: [],
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -69,6 +75,8 @@ function createFakeQuery(): FakeQueryHandle {
     fail(err) { error = err; deliver({ done: true, value: undefined }); },
   };
   Object.defineProperty(handle, 'interruptCalls', { get: () => fakeQuery.interruptCalls });
+  Object.defineProperty(handle, 'setPermissionModeCalls', { get: () => fakeQuery.setPermissionModeCalls });
+  Object.defineProperty(handle, 'setModelCalls', { get: () => fakeQuery.setModelCalls });
 
   return handle;
 }
@@ -236,4 +244,46 @@ test('SDK-driven interrupt emits session_interrupted with source=sdk', async () 
     manager.shutdown();
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test('setPermissionMode forwards to query.setPermissionMode', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-mode-'));
+  try {
+    const sessionId = manager.createSession({ name: 'm', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await manager.setPermissionMode(sessionId, 'plan');
+    assert.deepEqual(fake.setPermissionModeCalls.at(-1), ['plan']);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('setModel forwards to query.setModel including undefined for reset', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-model-'));
+  try {
+    const sessionId = manager.createSession({ name: 'm', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await manager.setModel(sessionId, 'claude-sonnet-4-6');
+    await manager.setModel(sessionId, undefined);
+    assert.deepEqual(fake.setModelCalls.at(-2), ['claude-sonnet-4-6']);
+    assert.deepEqual(fake.setModelCalls.at(-1), [undefined]);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('setPermissionMode rejects observed sessions with not_supported', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.setPermissionMode('does-not-exist', 'plan'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
 });
