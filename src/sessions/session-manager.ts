@@ -898,6 +898,17 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Enumerate the SDK Query's supportedModels(). Controller-mode only.
+   */
+  async getSupportedModels(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['supportedModels']>>> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query supported models');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    return await session.queryHandle.supportedModels();
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {

@@ -17,6 +17,9 @@ interface FakeQueryHandle {
   interruptCalls: number;
   setPermissionModeCalls: unknown[][];
   setModelCalls: unknown[][];
+  supportedModelsCalls: number;
+  setSupportedModelsResult(models: unknown[]): void;
+  setSupportedModelsError(err: Error): void;
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -46,6 +49,9 @@ function createFakeQuery(): FakeQueryHandle {
     interruptCalls: 0,
     setPermissionModeCalls: [] as unknown[][],
     setModelCalls: [] as unknown[][],
+    supportedModelsCalls: 0,
+    supportedModelsResult: [] as unknown[],
+    supportedModelsError: undefined as Error | undefined,
     async interrupt() { fakeQuery.interruptCalls += 1; },
     async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
     async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
@@ -53,7 +59,11 @@ function createFakeQuery(): FakeQueryHandle {
     async applyFlagSettings() {},
     async initializationResult() { return {} as never; },
     async supportedCommands() { return []; },
-    async supportedModels() { return []; },
+    async supportedModels() {
+      fakeQuery.supportedModelsCalls += 1;
+      if (fakeQuery.supportedModelsError) throw fakeQuery.supportedModelsError;
+      return fakeQuery.supportedModelsResult as never;
+    },
     async supportedAgents() { return []; },
     async mcpServerStatus() { return []; },
     async setMcpServers() {},
@@ -67,6 +77,9 @@ function createFakeQuery(): FakeQueryHandle {
     interruptCalls: 0,
     setPermissionModeCalls: [],
     setModelCalls: [],
+    supportedModelsCalls: 0,
+    setSupportedModelsResult(models) { fakeQuery.supportedModelsResult = models; },
+    setSupportedModelsError(err) { fakeQuery.supportedModelsError = err; },
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -77,6 +90,7 @@ function createFakeQuery(): FakeQueryHandle {
   Object.defineProperty(handle, 'interruptCalls', { get: () => fakeQuery.interruptCalls });
   Object.defineProperty(handle, 'setPermissionModeCalls', { get: () => fakeQuery.setPermissionModeCalls });
   Object.defineProperty(handle, 'setModelCalls', { get: () => fakeQuery.setModelCalls });
+  Object.defineProperty(handle, 'supportedModelsCalls', { get: () => fakeQuery.supportedModelsCalls });
 
   return handle;
 }
@@ -286,4 +300,53 @@ test('setPermissionMode rejects observed sessions with not_supported', async () 
     (err: Error) => err.message.includes('Session not found'),
   );
   manager.shutdown();
+});
+
+test('getSupportedModels forwards to query.supportedModels and returns the list', async () => {
+  const fake = createFakeQuery();
+  const fakeModels = [
+    { value: 'claude-sonnet-4-6', displayName: 'Sonnet 4.6', description: 'fast', supportsEffort: false },
+    { value: 'claude-opus-4-7', displayName: 'Opus 4.7', description: 'smart', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  ];
+  fake.setSupportedModelsResult(fakeModels);
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-models-'));
+  try {
+    const sessionId = manager.createSession({ name: 'm', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const models = await manager.getSupportedModels(sessionId);
+    assert.equal(fake.supportedModelsCalls, 1);
+    assert.deepEqual(models, fakeModels);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getSupportedModels rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.getSupportedModels('does-not-exist'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('getSupportedModels propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setSupportedModelsError(new Error('boom from sdk'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-models-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'm', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.getSupportedModels(sessionId),
+      (err: Error) => err.message.includes('boom from sdk'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });

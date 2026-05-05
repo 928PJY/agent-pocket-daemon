@@ -37,6 +37,7 @@ import type {
   InterruptSessionCommand,
   SetPermissionModeCommand,
   SetModelCommand,
+  GetSupportedModelsCommand,
   ListSessionsCommand,
   ReadFileCommand,
   EmergencyAbortCommand,
@@ -2277,6 +2278,10 @@ export class AgentPocketDaemon extends EventEmitter {
         await this.handleSetModel(command as SetModelCommand);
         break;
 
+      case 'get_supported_models':
+        await this.handleGetSupportedModels(command as GetSupportedModelsCommand);
+        break;
+
       case 'get_history':
         this.handleGetHistory(command);
         break;
@@ -2770,6 +2775,37 @@ export class AgentPocketDaemon extends EventEmitter {
     }
   }
 
+  private async handleGetSupportedModels(command: GetSupportedModelsCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'get_supported_models is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      const sdkModels = await this.sessionManager.getSupportedModels(internalId);
+      const models = sdkModels.map(m => ({
+        value: m.value,
+        display_name: m.displayName,
+        description: m.description,
+        supports_effort: m.supportsEffort,
+        supported_effort_levels: m.supportedEffortLevels,
+        supports_adaptive_thinking: m.supportsAdaptiveThinking,
+        supports_fast_mode: m.supportsFastMode,
+        supports_auto_mode: m.supportsAutoMode,
+      }));
+      this.sendToPhone({
+        type: 'supported_models',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        models,
+      } as unknown as PcEvent);
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_MODELS_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
   private async handleListSessions(command: ListSessionsCommand): Promise<void> {
     fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions CALLED\n`);
     try {
@@ -2950,8 +2986,9 @@ export class AgentPocketDaemon extends EventEmitter {
         if (claimedSessionIds.has(codex.sessionId)) continue;
         const observed = this.codexObservers.get(codex.sessionId);
         const liveCodex = liveCodexSessions.get(codex.sessionId);
+        const observedStatus = observed?.status;
         const codexStatus = liveCodex
-          ? (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS ? observed.status : SessionStatus.READY)
+          ? (observedStatus === SessionStatus.RUNNING || observedStatus === SessionStatus.PENDING_ACTIONS ? observedStatus : SessionStatus.READY)
           : SessionStatus.HISTORY;
         const terminal = liveCodex ? this.resolveCodexTerminalTarget(codex.sessionId, liveCodex) : undefined;
         const capabilities = liveCodex ? this.getCodexCapabilities(codex.sessionId) : ['observe'];
@@ -4042,6 +4079,7 @@ export class AgentPocketDaemon extends EventEmitter {
    * the protocol package's CURRENT_PEER_CAPABILITIES is updated).
    */
   private handleSyncRequest(command: SyncRequestCommand): void {
+    const t0 = Date.now();
     const cursorMap = new Map<string, number>();
     for (const cursor of command.cursors ?? []) {
       cursorMap.set(cursor.session_id, cursor.last_seq);
@@ -4055,12 +4093,21 @@ export class AgentPocketDaemon extends EventEmitter {
         .filter((id): id is string => typeof id === 'string'),
     );
 
+    logger.info('daemon', 'sync_request received', {
+      requestId: command.request_id,
+      cursors: cursorMap.size,
+      knownSessions: known.size,
+    });
+
     const delivered: SyncCompleteEvent['delivered'] = [];
+    const perSessionMs: Record<string, number> = {};
     for (const sessionId of known) {
+      const sessionStart = Date.now();
       const lastSeq = cursorMap.get(sessionId);
       const tail = this.sendSessionHistory(sessionId, {
         sinceSeq: lastSeq !== undefined && lastSeq >= 0 ? lastSeq : undefined,
       });
+      perSessionMs[sessionId.slice(0, 8)] = Date.now() - sessionStart;
       if (tail !== undefined) {
         delivered.push({ session_id: sessionId, last_seq: tail });
       }
@@ -4074,6 +4121,8 @@ export class AgentPocketDaemon extends EventEmitter {
     logger.info('daemon', 'sync_complete', {
       requestId: command.request_id,
       sessions: delivered.length,
+      totalMs: Date.now() - t0,
+      perSessionMs,
     });
     this.sendToPhone(event);
   }
