@@ -942,6 +942,17 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Snapshot of MCP server connections for this session. Controller-mode only.
+   */
+  async getMcpServerStatus(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['mcpServerStatus']>>> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query MCP status');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    return await session.queryHandle.mcpServerStatus();
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {

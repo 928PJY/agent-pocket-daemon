@@ -1,0 +1,21 @@
+# Coverage gates are informational — we surface patch/project deltas in the
+# PR comment but never block a merge on them. Hard-blocking on coverage
+# thresholds tends to push contributors toward low-value smoke tests on
+# message-routing handlers (where the real bugs are integration-shaped, not
+# line-shaped) just to clear the gate.
+
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+        target: auto
+
+comment:
+  layout: "header, diff, files"
+  require_changes: false

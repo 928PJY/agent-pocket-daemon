@@ -29,6 +29,9 @@ interface FakeQueryHandle {
   supportedAgentsCalls: number;
   setSupportedAgentsResult(agents: unknown[]): void;
   setSupportedAgentsError(err: Error): void;
+  mcpServerStatusCalls: number;
+  setMcpServerStatusResult(servers: unknown[]): void;
+  setMcpServerStatusError(err: Error): void;
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -70,6 +73,9 @@ function createFakeQuery(): FakeQueryHandle {
     supportedAgentsCalls: 0,
     supportedAgentsResult: [] as unknown[],
     supportedAgentsError: undefined as Error | undefined,
+    mcpServerStatusCalls: 0,
+    mcpServerStatusResult: [] as unknown[],
+    mcpServerStatusError: undefined as Error | undefined,
     async interrupt() { fakeQuery.interruptCalls += 1; },
     async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
     async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
@@ -91,7 +97,11 @@ function createFakeQuery(): FakeQueryHandle {
       if (fakeQuery.supportedAgentsError) throw fakeQuery.supportedAgentsError;
       return fakeQuery.supportedAgentsResult as never;
     },
-    async mcpServerStatus() { return []; },
+    async mcpServerStatus() {
+      fakeQuery.mcpServerStatusCalls += 1;
+      if (fakeQuery.mcpServerStatusError) throw fakeQuery.mcpServerStatusError;
+      return fakeQuery.mcpServerStatusResult as never;
+    },
     async setMcpServers() {},
     async getContextUsage() {
       fakeQuery.getContextUsageCalls += 1;
@@ -119,6 +129,9 @@ function createFakeQuery(): FakeQueryHandle {
     supportedAgentsCalls: 0,
     setSupportedAgentsResult(agents) { fakeQuery.supportedAgentsResult = agents; },
     setSupportedAgentsError(err) { fakeQuery.supportedAgentsError = err; },
+    mcpServerStatusCalls: 0,
+    setMcpServerStatusResult(servers) { fakeQuery.mcpServerStatusResult = servers; },
+    setMcpServerStatusError(err) { fakeQuery.mcpServerStatusError = err; },
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -133,6 +146,7 @@ function createFakeQuery(): FakeQueryHandle {
   Object.defineProperty(handle, 'getContextUsageCalls', { get: () => fakeQuery.getContextUsageCalls });
   Object.defineProperty(handle, 'supportedCommandsCalls', { get: () => fakeQuery.supportedCommandsCalls });
   Object.defineProperty(handle, 'supportedAgentsCalls', { get: () => fakeQuery.supportedAgentsCalls });
+  Object.defineProperty(handle, 'mcpServerStatusCalls', { get: () => fakeQuery.mcpServerStatusCalls });
 
   return handle;
 }
@@ -535,6 +549,52 @@ test('getSupportedAgents propagates SDK errors', async () => {
     await assert.rejects(
       () => manager.getSupportedAgents(sessionId),
       (err: Error) => err.message.includes('boom agents'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getMcpServerStatus forwards to query.mcpServerStatus and returns the list', async () => {
+  const fake = createFakeQuery();
+  const fakeServers = [{ name: 'github', status: 'connected', tools: [{ name: 'list_prs' }] }];
+  fake.setMcpServerStatusResult(fakeServers);
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-mcp-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const servers = await manager.getMcpServerStatus(sessionId);
+    assert.equal(fake.mcpServerStatusCalls, 1);
+    assert.equal((servers as Array<{ name: string }>)[0]?.name, 'github');
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('getMcpServerStatus rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.getMcpServerStatus('does-not-exist'),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('getMcpServerStatus propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setMcpServerStatusError(new Error('boom mcp'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-mcp-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.getMcpServerStatus(sessionId),
+      (err: Error) => err.message.includes('boom mcp'),
     );
   } finally {
     manager.shutdown();

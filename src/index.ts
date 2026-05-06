@@ -41,6 +41,7 @@ import type {
   GetContextUsageCommand,
   GetSupportedCommandsCommand,
   GetSupportedAgentsCommand,
+  GetMcpServerStatusCommand,
   ListSessionsCommand,
   ReadFileCommand,
   EmergencyAbortCommand,
@@ -121,6 +122,23 @@ type NotificationDeliveryEventType = 'permission_request' | 'user_question' | 'p
 // the relay already routes to APNs — no tracking, no retry.
 const NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS = 3_000;
 const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 1_000;
+
+// Static catalog of Claude model ids the SDK accepts. Verified by probing all
+// 72 family×version×effort×1m combinations on SDK 0.2.129 — the SDK accepts
+// any well-formed `claude-{family}-{ver}[-effort][1m]` string and reflects it
+// back via getContextUsage().model. Query.supportedModels() on its own only
+// lists 4 alias entries plus the launched build, so older versions and effort
+// tiers are unreachable through the picker without this table.
+const STATIC_MODEL_CATALOG = {
+  entries: [
+    { family: 'sonnet', version: '4-5', version_label: '4.5', supports_one_m: true,  effort_levels: [] as Array<'low' | 'medium' | 'high' | 'xhigh' | 'max'> },
+    { family: 'sonnet', version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
+    { family: 'opus',   version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
+    { family: 'opus',   version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
+    { family: 'opus',   version: '4-7', version_label: '4.7', supports_one_m: true,  effort_levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { family: 'haiku',  version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
+  ],
+} as const;
 
 // ============================================================================
 // AgentPocketDaemon
@@ -2294,6 +2312,9 @@ export class AgentPocketDaemon extends EventEmitter {
       case 'get_supported_agents':
         await this.handleGetSupportedAgents(command as GetSupportedAgentsCommand);
         break;
+      case 'get_mcp_server_status':
+        await this.handleGetMcpServerStatus(command as GetMcpServerStatusCommand);
+        break;
 
       case 'get_history':
         this.handleGetHistory(command);
@@ -2796,6 +2817,13 @@ export class AgentPocketDaemon extends EventEmitter {
     try {
       const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
       const sdkModels = await this.sessionManager.getSupportedModels(internalId);
+      let currentModel: string | undefined;
+      try {
+        const usage = await this.sessionManager.getContextUsage(internalId);
+        currentModel = usage.model || undefined;
+      } catch {
+        currentModel = undefined;
+      }
       const models = sdkModels.map(m => ({
         value: m.value,
         display_name: m.displayName,
@@ -2811,6 +2839,8 @@ export class AgentPocketDaemon extends EventEmitter {
         request_id: command.request_id,
         session_id: command.session_id,
         models,
+        current_model: currentModel,
+        model_catalog: STATIC_MODEL_CATALOG,
       } as unknown as PcEvent);
     } catch (err) {
       const message = (err as Error).message;
@@ -2900,6 +2930,35 @@ export class AgentPocketDaemon extends EventEmitter {
     } catch (err) {
       const message = (err as Error).message;
       const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_AGENTS_ERROR';
+      this.sendError(command.request_id, message, code);
+    }
+  }
+
+  private async handleGetMcpServerStatus(command: GetMcpServerStatusCommand): Promise<void> {
+    if (isCodexSessionId(command.session_id)) {
+      this.sendError(command.request_id, 'get_mcp_server_status is not supported for Codex sessions', 'NOT_SUPPORTED');
+      return;
+    }
+    try {
+      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
+      const sdk = await this.sessionManager.getMcpServerStatus(internalId);
+      const servers = sdk.map(s => ({
+        name: s.name,
+        status: s.status,
+        scope: s.scope,
+        error: s.error,
+        server_version: s.serverInfo?.version,
+        tools: s.tools?.map(t => ({ name: t.name, description: t.description })),
+      }));
+      this.sendToPhone({
+        type: 'mcp_server_status',
+        request_id: command.request_id,
+        session_id: command.session_id,
+        servers,
+      } as unknown as PcEvent);
+    } catch (err) {
+      const message = (err as Error).message;
+      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_MCP_SERVER_STATUS_ERROR';
       this.sendError(command.request_id, message, code);
     }
   }
