@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, forkSession } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Query,
   SDKMessage,
@@ -953,6 +953,98 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Rewind a session to a given user message.
+   *
+   * Two-phase. `dryRun: true` only previews file changes (`filesChanged` /
+   * `insertions` / `deletions`) — disk untouched, no fork happens, the
+   * session keeps running. The phone uses dry-run to populate the
+   * confirmation sheet.
+   *
+   * `dryRun: false` performs the real rewind:
+   *   1. `Query.rewindFiles(uuid)` restores tracked files. **Must run on
+   *      the live (pre-fork) query** — fork drops the checkpoint history
+   *      ("Forked sessions start without undo history").
+   *   2. `forkSession(claudeSessionId, { upToMessageId: uuid })` slices
+   *      the SDK transcript inclusive of the target message.
+   *   3. The original session's query is aborted (emits `session_ended`).
+   *   4. A new internal session is created via `resumeSession(...)` against
+   *      the fork's claude session id, inheriting the original's working
+   *      directory + config.
+   *
+   * The returned `newSessionId` is the new internal id the phone should
+   * navigate to. Controller-mode only — observer sessions throw
+   * `not_supported`. If `rewindFiles` reports `canRewind: false` the
+   * fork is skipped and `newSessionId` is omitted.
+   */
+  async rewindSession(
+    sessionId: string,
+    userMessageId: string,
+    dryRun: boolean,
+  ): Promise<{
+    canRewind: boolean;
+    error?: string;
+    filesChanged?: string[];
+    insertions?: number;
+    deletions?: number;
+    newSessionId?: string;
+  }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot be rewound');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    if (!session.claudeSessionId) throw new Error('Session has no claudeSessionId — cannot fork');
+
+    const fileResult = await session.queryHandle.rewindFiles(userMessageId, { dryRun });
+
+    if (dryRun || !fileResult.canRewind) {
+      logger.debug('session-manager', 'rewindSession (preview/denied)', {
+        sessionId,
+        userMessageId,
+        dryRun,
+        canRewind: fileResult.canRewind,
+        filesChanged: fileResult.filesChanged?.length ?? 0,
+      });
+      return {
+        canRewind: fileResult.canRewind,
+        error: fileResult.error,
+        filesChanged: fileResult.filesChanged,
+        insertions: fileResult.insertions,
+        deletions: fileResult.deletions,
+      };
+    }
+
+    const sourceClaudeSessionId = session.claudeSessionId;
+    const forkResult = await forkSession(sourceClaudeSessionId, { upToMessageId: userMessageId });
+
+    // End the source session before resuming the fork so listeners don't
+    // see two live queries on the same Claude session id.
+    session.abortController.abort();
+
+    const newSessionId = this.resumeSession(forkResult.sessionId, {
+      ...(session.config ?? {}),
+      working_directory: session.workingDirectory,
+      name: session.customTitle,
+    });
+
+    logger.info('session-manager', 'rewindSession applied', {
+      sessionId,
+      userMessageId,
+      sourceClaudeSessionId,
+      forkClaudeSessionId: forkResult.sessionId,
+      newSessionId,
+      filesChanged: fileResult.filesChanged?.length ?? 0,
+    });
+
+    return {
+      canRewind: true,
+      filesChanged: fileResult.filesChanged,
+      insertions: fileResult.insertions,
+      deletions: fileResult.deletions,
+      newSessionId,
+    };
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {
@@ -997,6 +1089,10 @@ export class SessionManager extends EventEmitter {
       ...(config.allowed_tools?.length ? { allowedTools: config.allowed_tools } : {}),
       canUseTool: this.buildCanUseTool(state),
       abortController: state.abortController,
+      // Enables Query.rewindFiles() — backs the phone's "Rewind to here"
+      // affordance. SDK keeps per-file backups before each modifying tool
+      // call; restoring is bounded by user-message id.
+      enableFileCheckpointing: true,
     };
   }
 

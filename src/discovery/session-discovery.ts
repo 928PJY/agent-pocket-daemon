@@ -50,6 +50,15 @@ export interface DiscoveredSession {
 export interface HistoryMessage {
   role: 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'subagent' | 'system';
   content: string;
+  /**
+   * For role='user' entries: the SDK transcript UUID from the JSONL row's
+   * top-level `uuid` field. The phone needs this verbatim to call
+   * `rewind_files { user_message_id }` — `Query.rewindFiles()` only accepts
+   * the SDK uuid, not our app-side ChatMessage.id (which is locally generated).
+   * Older daemons won't set this; phone treats absence as "rewind unavailable
+   * for this turn".
+   */
+  sdkUuid?: string;
   toolName?: string;
   toolId?: string;
   toolStatus?: 'success' | 'error';
@@ -490,7 +499,8 @@ export class SessionDiscovery {
       if (!content) return [];
       // Filter out internal Claude Code protocol messages (commands, system reminders, etc.)
       if (this.isInternalMessage(content)) return [];
-      return [{ role: 'user', content, timestamp }];
+      const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+      return [{ role: 'user', content, timestamp, sdkUuid }];
     }
 
     if (type === 'assistant') {
