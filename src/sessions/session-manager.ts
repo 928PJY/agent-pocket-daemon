@@ -143,13 +143,18 @@ class StreamInputController {
   private queue: SDKUserMessage[] = [];
   private waiting: ((msg: SDKUserMessage) => void) | null = null;
   private _closed = false;
+  /** Tag for log correlation — set by SessionManager.create*() right after construction. */
+  ownerSessionId?: string;
 
   get closed(): boolean {
     return this._closed;
   }
 
   push(msg: SDKUserMessage): void {
-    if (this._closed) return;
+    if (this._closed) {
+      logger.warn('stream-input', 'push() on closed controller — dropped', { sessionId: this.ownerSessionId?.substring(0, 8) });
+      return;
+    }
     if (this.waiting) {
       const resolve = this.waiting;
       this.waiting = null;
@@ -317,6 +322,7 @@ export class SessionManager extends EventEmitter {
     const claudeSessionId = randomUUID();
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const state: SessionState = {
       sessionId,
@@ -375,6 +381,7 @@ export class SessionManager extends EventEmitter {
     assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const state: SessionState = {
       sessionId,
@@ -422,7 +429,7 @@ export class SessionManager extends EventEmitter {
   /**
    * Send a user message to an active session.
    */
-  async sendMessage(sessionId: string, message: string): Promise<void> {
+  async sendMessage(sessionId: string, message: string): Promise<{ sdkUuid?: string }> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -491,25 +498,35 @@ export class SessionManager extends EventEmitter {
           });
         }
       }, probeTimeoutMs).unref();
-      return;
+      // Observed-mode echo carries sdkUuid via session_output user_message;
+      // no need to wait for it here.
+      return {};
     }
+
+    // Controller mode: pre-generate the SDK transcript uuid and stamp it on
+    // the pushed SDKUserMessage. The SDK accepts a caller-provided uuid on
+    // streaming-input pushes (per the Agent SDK docs), so we can return it
+    // synchronously instead of awaiting an echo frame.
+    const sdkUuid = randomUUID();
 
     // If the query is still alive, push directly
     if (session.queryHandle && !session.inputController.closed) {
       session.inputController.push({
         type: 'user',
+        uuid: sdkUuid,
         message: { role: 'user', content: message },
         parent_tool_use_id: null,
       } as SDKUserMessage);
       session.status = SessionStatus.RUNNING;
       session.lastActivity = Date.now();
       this.emit('session_status', sessionId, SessionStatus.RUNNING);
-      logger.trace('session-manager', 'Pushed user message', { sessionId });
-      return;
+      logger.trace('session-manager', 'Pushed user message', { sessionId, sdkUuid });
+      return { sdkUuid };
     }
 
     // Query ended — resume with a new query
-    this.resumeWithMessage(session, message);
+    this.resumeWithMessage(session, message, sdkUuid);
+    return { sdkUuid };
   }
 
   /**
@@ -601,6 +618,7 @@ export class SessionManager extends EventEmitter {
     const sessionId = this.generateSessionId();
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const observer = new SessionObserver(claudeSessionId, jsonlPath);
 
@@ -965,9 +983,10 @@ export class SessionManager extends EventEmitter {
    *      the live (pre-fork) query** — fork drops the checkpoint history
    *      ("Forked sessions start without undo history").
    *   2. `forkSession(claudeSessionId, { upToMessageId: uuid })` slices
-   *      the SDK transcript inclusive of the target message.
-   *   3. The original session's query is aborted (emits `session_ended`).
-   *   4. A new internal session is created via `resumeSession(...)` against
+   *      the SDK transcript inclusive of the target message and returns a
+   *      new claudeSessionId. The source session's query keeps running so
+   *      the user can continue the original timeline in parallel.
+   *   3. A new internal session is created via `resumeSession(...)` against
    *      the fork's claude session id, inheriting the original's working
    *      directory + config.
    *
@@ -1016,9 +1035,9 @@ export class SessionManager extends EventEmitter {
     const sourceClaudeSessionId = session.claudeSessionId;
     const forkResult = await forkSession(sourceClaudeSessionId, { upToMessageId: userMessageId });
 
-    // End the source session before resuming the fork so listeners don't
-    // see two live queries on the same Claude session id.
-    session.abortController.abort();
+    // Keep the source query alive so the user can continue the original
+    // timeline. fork returns a distinct claudeSessionId, so the two SDK
+    // processes don't collide on hook routing.
 
     const newSessionId = this.resumeSession(forkResult.sessionId, {
       ...(session.config ?? {}),
@@ -1186,7 +1205,7 @@ export class SessionManager extends EventEmitter {
   /**
    * Resume a session that has ended, creating a new query with --resume.
    */
-  private resumeWithMessage(session: SessionState, message: string): void {
+  private resumeWithMessage(session: SessionState, message: string, sdkUuid?: string): void {
     if (!session.claudeSessionId) {
       throw new Error(`Session ${session.sessionId} has ended and no Claude session ID available for resume`);
     }
@@ -1195,9 +1214,11 @@ export class SessionManager extends EventEmitter {
 
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = session.sessionId;
 
     inputController.push({
       type: 'user',
+      ...(sdkUuid ? { uuid: sdkUuid } : {}),
       message: { role: 'user', content: message },
       parent_tool_use_id: null,
     } as SDKUserMessage);
@@ -1207,11 +1228,13 @@ export class SessionManager extends EventEmitter {
     session.status = SessionStatus.STARTING;
     session.lastActivity = Date.now();
 
-    // Suppress replayed assistant content from resume — set counters high so
-    // the delta logic produces zero output. They reset to 0 on the next 'user'
-    // message in handleSDKMessage, which arrives before the new response.
-    session.lastEmittedTextLength = Number.MAX_SAFE_INTEGER;
-    session.lastEmittedThinkingLength = Number.MAX_SAFE_INTEGER;
+    // Fresh SDK process: it won't replay prior assistant content over the
+    // streaming-input channel, so start delta tracking at 0. (Initializing
+    // these to MAX_SAFE_INTEGER would silently drop the first response
+    // because slice(MAX) is "" and the resume path never sees a 'user'
+    // frame to reset the counter back to 0.)
+    session.lastEmittedTextLength = 0;
+    session.lastEmittedThinkingLength = 0;
     // Don't clear emittedToolUseIds — old tool IDs should remain suppressed
 
     const handle = this.queryFactory({
@@ -1261,16 +1284,17 @@ export class SessionManager extends EventEmitter {
       logger.debug('session-manager', 'Query stream ended', { sessionId });
 
     } catch (err) {
+      const e = err as Error;
       // Mark query as done
       state.queryHandle = null;
       state.inputController.close();
 
-      if ((err as Error).name === 'AbortError') {
+      if (e.name === 'AbortError') {
         state.status = SessionStatus.HISTORY;
         this.emit('session_ended', sessionId, 0);
         logger.debug('session-manager', 'Session aborted', { sessionId });
       } else {
-        logger.error('session-manager', `Query stream error: ${(err as Error).message}`, { sessionId });
+        logger.error('session-manager', `Query stream error: ${e.message}`, { sessionId });
         this.emit('error', sessionId, err instanceof Error ? err : new Error(String(err)));
         if (state.claudeSessionId) {
           state.status = SessionStatus.READY;

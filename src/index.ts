@@ -1218,7 +1218,13 @@ export class AgentPocketDaemon extends EventEmitter {
 
       const projectName = session?.customTitle ?? (session ? path.basename(session.workingDirectory) : 'Session');
 
-      logger.debug('daemon', 'Stop hook fired', { sessionId: externalId });
+      logger.info('daemon', 'Stop hook fired', {
+        sessionId: externalId,
+        claudeSessionId: claudeSessionId?.substring(0, 8),
+        internalSessionId: session?.sessionId,
+        hasTranscriptPath: !!transcriptPath,
+        firedAt,
+      });
 
       // Claude finished this turn — any pending blocking requests we were still
       // tracking for this session are stale (resolved, expired, or interrupted).
@@ -2477,11 +2483,11 @@ export class AgentPocketDaemon extends EventEmitter {
       // Resolve the external session ID to our internal ID
       const internalId = this.resolveInternalSessionId(command.session_id);
       if (internalId) {
-        await this.sessionManager.sendMessage(internalId, command.message);
+        const result = await this.sessionManager.sendMessage(internalId, command.message);
         if (clientMessageId) {
-          this.sendMessageAck(clientMessageId, command.session_id, 'committed');
+          this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
         }
-        logger.debug('daemon', 'send_message committed (tracked)', { cid: cidShort, sessionId: sidShort });
+        logger.debug('daemon', 'send_message committed (tracked)', { cid: cidShort, sessionId: sidShort, sdkUuid: result.sdkUuid });
         return;
       }
 
@@ -2526,9 +2532,9 @@ export class AgentPocketDaemon extends EventEmitter {
       this.sendSessionHistory(command.session_id);
 
       // Now send the message (will inject via tmux if available)
-      await this.sessionManager.sendMessage(sessionId, command.message);
+      const result = await this.sessionManager.sendMessage(sessionId, command.message);
       if (clientMessageId) {
-        this.sendMessageAck(clientMessageId, command.session_id, 'committed');
+        this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
       }
       logger.debug('daemon', 'send_message committed (observed)', { cid: cidShort, sessionId: sidShort });
     } catch (err) {
@@ -2548,6 +2554,7 @@ export class AgentPocketDaemon extends EventEmitter {
     sessionId: string,
     status: 'received' | 'committed' | 'failed',
     error?: string,
+    sdkUuid?: string,
   ): void {
     const ack: MessageAckEvent = {
       type: 'message_ack',
@@ -2556,11 +2563,13 @@ export class AgentPocketDaemon extends EventEmitter {
       status,
       ts: Date.now(),
       ...(error ? { error } : {}),
+      ...(sdkUuid ? { sdk_uuid: sdkUuid } : {}),
     };
     logger.debug('daemon', 'message_ack send', {
       cid: clientMessageId.substring(0, 8),
       sessionId: sessionId.substring(0, 8),
       status,
+      sdkUuid,
     });
     this.sendToPhone(ack);
   }
@@ -2976,6 +2985,9 @@ export class AgentPocketDaemon extends EventEmitter {
     try {
       const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
       const result = await this.sessionManager.rewindSession(internalId, command.user_message_id, dryRun);
+      const externalNewId = result.newSessionId
+        ? this.resolveExternalSessionId(result.newSessionId)
+        : undefined;
       this.sendToPhone({
         type: 'rewind_session_response',
         request_id: command.request_id,
@@ -2986,10 +2998,16 @@ export class AgentPocketDaemon extends EventEmitter {
         files_changed: result.filesChanged,
         insertions: result.insertions,
         deletions: result.deletions,
-        new_session_id: result.newSessionId,
+        new_session_id: externalNewId,
       } as unknown as PcEvent);
     } catch (err) {
       const message = (err as Error).message;
+      logger.warn('daemon', 'rewind_session failed', {
+        sessionId: command.session_id,
+        userMessageId: command.user_message_id,
+        dryRun,
+        error: message,
+      });
       // Reply on the rewind_session_response channel rather than the generic
       // error channel so the phone's pending resolver fires instead of timing
       // out. The phone surfaces `error` directly to the user.
