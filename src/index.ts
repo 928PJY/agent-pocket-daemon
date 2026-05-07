@@ -18,7 +18,7 @@ import { CodexDiscovery, codexExternalSessionId, findOpenCodexRollouts, isCodexS
 import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
-import type { CodexHookRequest, HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import type { CodexHookRequest, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
 import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
@@ -101,6 +101,15 @@ import {
   type PhonePreferences,
 } from './commands/handlers/preferences-and-peer.js';
 import { DiscoveryLoop } from './discovery/discovery-orchestrator.js';
+import {
+  registerPermissionRequestPassthrough,
+  registerToolResultHandler,
+  registerErrorHandler,
+  registerSubagentStartHandler,
+  registerSubagentStopHandler,
+  registerApiSessionsHandler,
+  registerApiStatusHandler,
+} from './wiring/hook-handlers.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -1039,40 +1048,15 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireHookServerEvents(): void {
-    // PreToolUse hook: pass through everything. The hook exists only to establish
-    // tool_use_id correlation for PermissionRequest matching and PostToolUse cleanup.
-    // All actual permission handling happens in the PermissionRequest hook.
-    this.hookServer.on('permission_request', (request: HookPermissionRequest) => {
-      this.hookServer.resolvePermissionEmpty(request.toolUseId);
+    registerPermissionRequestPassthrough(this.hookServer);
+    registerToolResultHandler(this.hookServer, {
+      prefs: this.phonePreferences,
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      sendToPhone: (event) => this.sendToPhone(event),
     });
-
-    this.hookServer.on('tool_result', (result: HookToolResult) => {
-      // Skip tool_result events when phone has disabled tool use messages
-      if (!this.phonePreferences.showToolUse) return;
-
-      const session = this.sessionManager.findByClaudeSessionId(result.sessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : result.sessionId;
-
-      const flat: Record<string, unknown> = {
-        type: 'session_output',
-        session_id: externalId,
-        timestamp: Date.now(),
-        output_type: 'tool_result',
-        tool_use_id: result.toolUseId,
-        output: typeof result.toolResponse === 'string'
-          ? result.toolResponse
-          : JSON.stringify(result.toolResponse ?? ''),
-        is_error: false,
-      };
-
-      this.sendToPhone(flat as unknown as PcEvent);
-    });
-
-    this.hookServer.on('error', (err: Error) => {
-      logger.error('daemon', `Hook server error: ${err.message}`);
-      this.restartHookServer();
+    registerErrorHandler(this.hookServer, {
+      restartHookServer: () => this.restartHookServer(),
     });
 
     this.hookServer.on('permission_expired', (expired: HookPermissionExpired) => {
@@ -1218,28 +1202,10 @@ export class AgentPocketDaemon extends EventEmitter {
       logger.debug('daemon', 'Forwarded Codex PermissionRequest', { tool: toolName, requestId, sessionId });
     });
 
-    // Local API: return tracked sessions for CLI `sessions` command
-    this.hookServer.on('api_sessions', (respond: (sessions: unknown) => void) => {
-      const sessions = this.sessionManager.getAllSessions().map(s => ({
-        sessionId: s.claudeSessionId ?? s.sessionId,
-        status: s.status,
-        pid: s.terminalPid,
-        cwd: s.workingDirectory,
-        isObserved: s.isObserved,
-        customTitle: s.customTitle,
-        entrypoint: s.entrypoint,
-        lastActivity: s.lastActivity,
-      }));
-      respond(sessions);
-    });
-
-    this.hookServer.on('api_status', (respond: (status: unknown) => void) => {
-      respond({
-        relay: this.relayClient?.getConnectionState() ?? 'not configured',
-        phone: this.relayClient?.getPhonePeerOnline() ?? false,
-        offlineQueue: this.relayClient?.getOfflineQueueSize() ?? 0,
-        sessions: this.sessionManager.getAllSessions().length,
-      });
+    registerApiSessionsHandler(this.hookServer, { sessionManager: this.sessionManager });
+    registerApiStatusHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      getRelayClient: () => this.relayClient,
     });
 
     // Stop hook: Claude finished a turn — update session status to ready
@@ -1440,33 +1406,8 @@ export class AgentPocketDaemon extends EventEmitter {
     // SubagentStop hook: fired when a Task-dispatched subagent finishes.
     // Forward to the matching SessionObserver so its SubagentObserver can
     // mark the agent done immediately (instead of waiting for activity timeout).
-    this.hookServer.on('subagent_stop', (claudeSessionId: string, agentId: string, agentType: string, _transcriptPath: string) => {
-      logger.debug('daemon', `SubagentStop hook: session=${claudeSessionId}, agent=${agentId} (${agentType})`);
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      if (!session) {
-        logger.warn('daemon', `SubagentStop: no session found for ${claudeSessionId} — falling back to broadcast`);
-        // Parent session may not yet be tracked when subagent finishes very
-        // fast; fan out to every observer so whoever owns this agent picks it up.
-        for (const s of this.sessionManager.getAllSessions()) {
-          s.observer?.markSubagentDone(agentId);
-        }
-        return;
-      }
-      if (!session.observer) {
-        logger.warn('daemon', `SubagentStop: session ${claudeSessionId} has no observer`);
-        return;
-      }
-      session.observer.markSubagentDone(agentId);
-    });
-
-    // SubagentStart hook: fired when a Task-dispatched subagent is spawned.
-    // Pre-registers the agent so iOS shows the placeholder before the first
-    // jsonl message is polled (~500ms savings).
-    this.hookServer.on('subagent_start', (claudeSessionId: string, agentId: string, agentType: string, _transcriptPath: string) => {
-      logger.debug('daemon', `SubagentStart hook: session=${claudeSessionId}, agent=${agentId} (${agentType})`);
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      session?.observer?.markSubagentStart(agentId, agentType);
-    });
+    registerSubagentStopHandler(this.hookServer, { sessionManager: this.sessionManager });
+    registerSubagentStartHandler(this.hookServer, { sessionManager: this.sessionManager });
 
     // SessionStart hook: fired after /clear with the NEW session ID
     this.hookServer.on('session_start', (claudeSessionId: string, source: string, cwd: string, transcriptPath: string) => {
