@@ -69,6 +69,10 @@ import {
   handleRewindSession as handleRewindSessionExternal,
   type CodexLifecycleDeps,
 } from './commands/handlers/session-lifecycle.js';
+import {
+  handleSetPermissionMode as handleSetPermissionModeExternal,
+  handleSetModel as handleSetModelExternal,
+} from './commands/handlers/runtime-config.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -2653,45 +2657,11 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleSetPermissionMode(command: SetPermissionModeCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'set_permission_mode is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.setPermissionMode(internalId, command.mode);
-      this.sendToPhone({
-        type: 'command_ack',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        command: 'set_permission_mode',
-      });
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_PERMISSION_MODE_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleSetPermissionModeExternal(this.commandContext(), command);
   }
 
   private async handleSetModel(command: SetModelCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'set_model is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.setModel(internalId, command.model);
-      this.sendToPhone({
-        type: 'command_ack',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        command: 'set_model',
-      });
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_MODEL_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleSetModelExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedModels(command: GetSupportedModelsCommand): Promise<void> {
