@@ -6,9 +6,19 @@
 // Each handler file (under ./handlers) lists the subset of CommandContext
 // it actually uses in its signature so callers can see at a glance what a
 // handler touches.
+//
+// Keep this surface small and grow it deliberately — each new field/method
+// added here is one more thing handler tests need to mock.
 
 import type { PcEvent } from 'agent-pocket-protocol';
 import type { SessionManager } from '../sessions/session-manager.js';
+
+export interface SendSessionHistoryOptions {
+  since?: string;
+  sinceSeq?: number;
+  offset?: number;
+  limit?: number;
+}
 
 export interface CommandContext {
   /** Send a PcEvent over the active phone channel (relay or LAN). */
@@ -25,6 +35,14 @@ export interface CommandContext {
    */
   resolveInternalSessionId(externalId: string): string | undefined;
 
+  /**
+   * Reply to the phone with messages from a session's history. Returns the
+   * tail seq of the last message delivered (or undefined when nothing was
+   * sent — empty session, missing session, etc.).
+   */
+  sendSessionHistory(claudeSessionId: string, options?: SendSessionHistoryOptions): number | undefined;
+
   /** The session manager the daemon owns. */
   readonly sessionManager: SessionManager;
 }
+

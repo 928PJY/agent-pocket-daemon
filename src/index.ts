@@ -31,7 +31,6 @@ import {
   gcSessionMap,
   cleanSessionMap,
   removeSessionMapEntries,
-  mergeSyncSessionIds,
 } from './utils/session-map.js';
 export { mergeSyncSessionIds } from './utils/session-map.js';
 import {
@@ -57,6 +56,11 @@ import {
   handleGetSupportedAgents as handleGetSupportedAgentsExternal,
   handleGetMcpServerStatus as handleGetMcpServerStatusExternal,
 } from './commands/handlers/capability-info.js';
+import {
+  handleReadFile as handleReadFileExternal,
+  handleGetHistory as handleGetHistoryExternal,
+  handleSyncRequest as handleSyncRequestExternal,
+} from './commands/handlers/file-and-history.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -3124,73 +3128,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleReadFile(command: ReadFileCommand): Promise<void> {
-    try {
-      // Security: resolve to prevent path traversal
-      const resolvedPath = path.resolve(command.path);
-
-      // Check if file exists and is readable
-      await fs.promises.access(resolvedPath, fs.constants.R_OK);
-
-      const stat = await fs.promises.stat(resolvedPath);
-
-      // Limit file size to 1MB
-      const MAX_FILE_SIZE = 1024 * 1024;
-      if (stat.size > MAX_FILE_SIZE) {
-        this.sendError(
-          command.request_id,
-          `File too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})`,
-          'FILE_TOO_LARGE',
-        );
-        return;
-      }
-
-      const content = await fs.promises.readFile(resolvedPath, 'utf-8');
-
-      // Detect language from extension
-      const ext = path.extname(resolvedPath).toLowerCase();
-      const languageMap: Record<string, string> = {
-        '.ts': 'typescript',
-        '.tsx': 'typescript',
-        '.js': 'javascript',
-        '.jsx': 'javascript',
-        '.py': 'python',
-        '.rs': 'rust',
-        '.go': 'go',
-        '.java': 'java',
-        '.c': 'c',
-        '.cpp': 'cpp',
-        '.h': 'c',
-        '.hpp': 'cpp',
-        '.rb': 'ruby',
-        '.swift': 'swift',
-        '.kt': 'kotlin',
-        '.json': 'json',
-        '.yaml': 'yaml',
-        '.yml': 'yaml',
-        '.toml': 'toml',
-        '.md': 'markdown',
-        '.html': 'html',
-        '.css': 'css',
-        '.sh': 'bash',
-        '.sql': 'sql',
-      };
-
-      const event: FileContentEvent = {
-        type: 'file_content',
-        request_id: command.request_id,
-        path: resolvedPath,
-        content,
-        language: languageMap[ext],
-      };
-
-      this.sendToPhone(event);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to read file ${command.path}: ${(err as Error).message}`,
-        'READ_FILE_ERROR',
-      );
-    }
+    return handleReadFileExternal(this.commandContext(), command);
   }
 
   private handleEmergencyAbort(command: EmergencyAbortCommand): void {
@@ -3224,12 +3162,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handleGetHistory(command: GetHistoryCommand): void {
-    this.sendSessionHistory(command.session_id, {
-      since: command.since,
-      sinceSeq: command.since_seq,
-      offset: command.offset,
-      limit: command.limit,
-    });
+    handleGetHistoryExternal(this.commandContext(), command);
   }
 
   private handleSessionOutputAck(command: SessionOutputAckCommand): void {
@@ -3570,6 +3503,7 @@ export class AgentPocketDaemon extends EventEmitter {
       sendToPhone: (event, wake) => this.sendToPhone(event, wake),
       sendError: (requestId, message, code) => this.sendError(requestId, message, code),
       resolveInternalSessionId: (id) => this.resolveInternalSessionId(id),
+      sendSessionHistory: (id, options) => this.sendSessionHistory(id, options),
       sessionManager: this.sessionManager,
     };
   }
@@ -3989,51 +3923,6 @@ export class AgentPocketDaemon extends EventEmitter {
    * the protocol package's CURRENT_PEER_CAPABILITIES is updated).
    */
   private handleSyncRequest(command: SyncRequestCommand): void {
-    const t0 = Date.now();
-    const cursorMap = new Map<string, number>();
-    for (const cursor of command.cursors ?? []) {
-      cursorMap.set(cursor.session_id, cursor.last_seq);
-    }
-
-    const known = mergeSyncSessionIds(
-      cursorMap,
-      this.sessionManager
-        .getAllSessions()
-        .map((s) => s.claudeSessionId)
-        .filter((id): id is string => typeof id === 'string'),
-    );
-
-    logger.info('daemon', 'sync_request received', {
-      requestId: command.request_id,
-      cursors: cursorMap.size,
-      knownSessions: known.size,
-    });
-
-    const delivered: SyncCompleteEvent['delivered'] = [];
-    const perSessionMs: Record<string, number> = {};
-    for (const sessionId of known) {
-      const sessionStart = Date.now();
-      const lastSeq = cursorMap.get(sessionId);
-      const tail = this.sendSessionHistory(sessionId, {
-        sinceSeq: lastSeq !== undefined && lastSeq >= 0 ? lastSeq : undefined,
-      });
-      perSessionMs[sessionId.slice(0, 8)] = Date.now() - sessionStart;
-      if (tail !== undefined) {
-        delivered.push({ session_id: sessionId, last_seq: tail });
-      }
-    }
-
-    const event: SyncCompleteEvent = {
-      type: 'sync_complete',
-      request_id: command.request_id,
-      delivered,
-    };
-    logger.info('daemon', 'sync_complete', {
-      requestId: command.request_id,
-      sessions: delivered.length,
-      totalMs: Date.now() - t0,
-      perSessionMs,
-    });
-    this.sendToPhone(event);
+    handleSyncRequestExternal(this.commandContext(), command);
   }
 }
