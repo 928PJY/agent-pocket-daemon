@@ -155,6 +155,10 @@ import {
   sendFlattenedSessionOutput as sendFlattenedSessionOutputExternal,
   sendSessionHistory as sendSessionHistoryExternal,
 } from './wiring/session-output-serializer.js';
+import {
+  discoverAndObserveSessions as discoverAndObserveSessionsExternal,
+  discoverAndObserveCodexSessions as discoverAndObserveCodexSessionsExternal,
+} from './wiring/session-discovery-loop.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -183,7 +187,6 @@ import type {
   SyncRequestCommand,
   NotificationDeliveryAckCommand,
   PcEvent,
-  SessionEndedEvent,
   SessionListEvent,
   FileContentEvent,
   ErrorEvent,
@@ -1013,314 +1016,28 @@ export class AgentPocketDaemon extends EventEmitter {
    * Discover running CLI Claude sessions and start observing them.
    */
   private async discoverAndObserveSessions(): Promise<void> {
-    try {
-      const runningCli = this.sessionDiscovery.getRunningAllSessions();
-      if (runningCli.length === 0) return;
-
-      // Discover JSONL files once (not per-session)
-      const discovered = await this.sessionDiscovery.discoverSessions();
-
-      // Detect /clear: when the user runs /clear, Claude Code creates a new session ID
-      // and JSONL file but does NOT update the PID file. The daemon is stuck tailing
-      // the old (frozen) JSONL. Detect this by checking if a newer JSONL file exists
-      // in the same project directory for an observed session whose PID is still alive.
-      //
-      // IMPORTANT: The newer file must not belong to a different terminal process.
-      // Multiple terminals can work in the same project directory, so finding a newer
-      // JSONL doesn't necessarily mean /clear — it could be a different terminal.
-      const observedSessions = this.sessionManager.getAllSessions().filter(s => s.isObserved && s.terminalPid);
-
-      // Build a set of session IDs that are claimed by running CLI PIDs.
-      // If a newer file is claimed by a different PID, it's a different terminal, not /clear.
-      const sessionIdsByPid = new Map<string, number>();
-      for (const cli of runningCli) {
-        sessionIdsByPid.set(cli.sessionId, cli.pid);
-      }
-
-      for (const session of observedSessions) {
-        if (!session.observer || !session.terminalPid) continue;
-
-        // Check if PID is alive
-        try { process.kill(session.terminalPid, 0); } catch { continue; }
-
-        // Only consider /clear if the current session's JSONL has gone stale.
-        // After /clear, Claude stops writing to the old file. If the file was
-        // modified recently, the session is still active — not cleared.
-        const currentJsonlPath = session.observer.getJsonlPath();
-        try {
-          const currentStat = fs.statSync(currentJsonlPath);
-          if (Date.now() - currentStat.mtimeMs < 10_000) continue; // active within 10s
-        } catch { continue; }
-
-        const projectDir = path.dirname(currentJsonlPath);
-
-        // Look for a newer JSONL file in the same directory that we're not observing
-        const observedSessionIds = new Set(
-          this.sessionManager.getAllSessions()
-            .filter(s => s.claudeSessionId)
-            .map(s => s.claudeSessionId!),
-        );
-
-        const newerFile = discovered.find(d =>
-          path.dirname(d.filePath) === projectDir &&
-          !observedSessionIds.has(d.sessionId) &&
-          d.lastModified > (session.lastActivity || 0) &&
-          d.filePath !== currentJsonlPath &&
-          // Only treat as /clear if the newer file is NOT owned by a different PID
-          (!sessionIdsByPid.has(d.sessionId) || sessionIdsByPid.get(d.sessionId) === session.terminalPid) &&
-          // Don't replace if this session is in replacedSessionIds (already identified as stale)
-          !this.replacedSessionIds.has(d.sessionId),
-        );
-
-        if (newerFile) {
-          const pid = session.terminalPid!;
-          const cwd = session.workingDirectory;
-          const target = session.terminalTarget;
-
-          logger.info('daemon', 'Detected /clear', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
-
-          // End the old observation
-          const oldInternalId = session.sessionId;
-          const oldClaudeId = session.claudeSessionId;
-
-          // Notify the phone that the old session ended (so it stops showing as "running")
-          if (oldClaudeId) {
-            const endEvent: SessionEndedEvent = {
-              type: 'session_ended',
-              session_id: oldClaudeId,
-              exit_code: 0,
-              end_reason: 'completed',
-            };
-            this.sendToPhone(endEvent);
-          }
-
-          this.sessionManager.markObservedSessionHistory(oldInternalId);
-          this.sessionIdMap.delete(oldInternalId);
-          this.sessionManager.removeSession(oldInternalId);
-          if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-
-          // Start observing the new session
-          const newInternalId = this.sessionManager.observeSession(
-            newerFile.sessionId,
-            newerFile.filePath,
-            cwd,
-            pid,
-            newerFile.customTitle,
-            target,
-            session.entrypoint,
-          );
-          this.sessionIdMap.set(newInternalId, newerFile.sessionId);
-          if (this.initialDiscoveryDone) {
-            this.sendSessionHistory(newerFile.sessionId);
-          }
-
-          const termInfo = target ? ` [${target.type}: ${target.target}]` : '';
-          logger.debug('daemon', `Now observing ${newerFile.sessionId} (PID ${pid})${termInfo}`);
-        }
-      }
-
-      for (const pidInfo of runningCli) {
-        // Prefer session-map.json over PID JSON when it has a fresher entry
-        // for this PID. This fixes two cases that survive daemon restart:
-        //   1) PID JSON's sessionId is stale after /clear.
-        //   2) PID JSON's cwd is wrong (e.g. parent of the worktree the
-        //      process actually runs in), causing dir-based JSONL matching
-        //      to pick a JSONL from a sibling project.
-        const mapEntry = getLatestSessionMapEntryForPid(pidInfo.pid);
-        if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
-          this.replacedSessionIds.add(pidInfo.sessionId);
-          pidInfo.sessionId = mapEntry.sessionId;
-          pidInfo.cwd = mapEntry.cwd;
-        }
-
-        // Skip sessions already being observed or controlled
-        if (this.sessionManager.findByClaudeSessionId(pidInfo.sessionId)) continue;
-
-        // Check if this PID is already being observed for a different session.
-        // This happens when the PID file was updated (e.g., after /clear) but
-        // SessionManager still has the old session ID. We need to update it.
-        // BUT: if the PID file's session ID is in replacedSessionIds, the PID file
-        // is stale (not yet updated after /clear) — trust our current observation.
-        const existingByPid = this.sessionManager.findByTerminalPid(pidInfo.pid);
-        if (existingByPid && existingByPid.claudeSessionId !== pidInfo.sessionId
-            && !this.replacedSessionIds.has(pidInfo.sessionId)) {
-          logger.warn('daemon', 'PID session ID mismatch — re-observing', { pid: pidInfo.pid, observed: existingByPid.claudeSessionId, pidFile: pidInfo.sessionId });
-
-          const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-          if (match) {
-            // End the old observation
-            const oldInternalId = existingByPid.sessionId;
-            const oldClaudeId = existingByPid.claudeSessionId;
-
-            // DON'T send session_ended for the stale session ID — this is just
-            // correcting our internal tracking, not a real session end event.
-            // The session is still running, we just had the wrong ID for it.
-
-            this.sessionManager.markObservedSessionHistory(oldInternalId);
-            this.sessionIdMap.delete(oldInternalId);
-            this.sessionManager.removeSession(oldInternalId);
-            if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-
-            // Create new observation with correct session ID
-            const newInternalId = this.sessionManager.observeSession(
-              pidInfo.sessionId,
-              match.filePath,
-              pidInfo.cwd,
-              pidInfo.pid,
-              match.customTitle,
-              pidInfo.terminalTarget,
-              pidInfo.entrypoint,
-            );
-            this.sessionIdMap.set(newInternalId, pidInfo.sessionId);
-
-            if (this.initialDiscoveryDone) {
-              this.sendSessionHistory(pidInfo.sessionId);
-            }
-
-            const termInfo = pidInfo.terminalTarget ? ` [${pidInfo.terminalTarget.type}: ${pidInfo.terminalTarget.target}]` : ' [no terminal injection]';
-            logger.debug('daemon', `Re-observing PID ${pidInfo.pid} with updated session ${pidInfo.sessionId}${termInfo}`);
-          }
-          continue;
-        }
-
-        // Skip if PID is already observed with the correct session ID
-        if (existingByPid) continue;
-
-        // If PID file still references a replaced session (stale after /clear),
-        // check session-map.json for the correct new session ID
-        if (this.replacedSessionIds.has(pidInfo.sessionId)) {
-          const mapped = readSessionMap();
-          // Find the most recent session-map entry for this PID
-          let corrected: [string, { pid?: number; cwd: string; timestamp: number }] | undefined;
-          const staleSids: string[] = [];
-          for (const [sid, v] of Object.entries(mapped)) {
-            if (v.pid !== pidInfo.pid) continue;
-            if (this.sessionManager.findByClaudeSessionId(sid)) { staleSids.push(sid); continue; }
-            if (this.replacedSessionIds.has(sid)) { staleSids.push(sid); continue; }
-            if (!corrected || v.timestamp > corrected[1].timestamp) {
-              if (corrected) staleSids.push(corrected[0]);
-              corrected = [sid, v];
-            } else {
-              staleSids.push(sid);
-            }
-          }
-          // Clean up stale entries for this PID
-          if (staleSids.length > 0) {
-            removeSessionMapEntries(staleSids);
-          }
-          if (!corrected) continue;
-          const newSessionId = corrected[0];
-          const mapEntry = corrected[1];
-          const match = discovered.find((s) => s.sessionId === newSessionId);
-          if (!match) continue;
-
-          logger.info('daemon', 'Recovered session from session-map.json', { pid: pidInfo.pid, staleSessionId: pidInfo.sessionId, newSessionId });
-          const newInternalId = this.sessionManager.observeSession(
-            newSessionId,
-            match.filePath,
-            mapEntry.cwd,
-            pidInfo.pid,
-            match.customTitle,
-            pidInfo.terminalTarget,
-            pidInfo.entrypoint,
-          );
-          this.sessionIdMap.set(newInternalId, newSessionId);
-          if (this.initialDiscoveryDone) {
-            this.sendSessionHistory(newSessionId);
-          }
-          continue;
-        }
-
-        const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-        if (!match) continue;
-
-        // PID JSON's sessionId may be stale (the user /clear-ed past it without
-        // the PID file being updated). Prefer the newest unclaimed JSONL in the
-        // project dir over PID JSON when it's actually newer — but never reject
-        // a session purely on age. PIDs that are alive deserve to be tracked.
-        let observeMatch = match;
-        let observeSessionId = pidInfo.sessionId;
-        const projectDir = path.dirname(match.filePath);
-        const otherPidSids = new Set(
-          runningCli.filter(c => c.pid !== pidInfo.pid).map(c => c.sessionId),
-        );
-        const newer = discovered
-          .filter(d => path.dirname(d.filePath) === projectDir)
-          .filter(d => !otherPidSids.has(d.sessionId))
-          .filter(d => !this.replacedSessionIds.has(d.sessionId))
-          .filter(d => d.lastModified > match.lastModified)
-          .sort((a, b) => b.lastModified - a.lastModified)[0];
-        if (newer) {
-          observeMatch = newer;
-          observeSessionId = newer.sessionId;
-          this.replacedSessionIds.add(pidInfo.sessionId);
-        }
-
-        const sessionId = this.sessionManager.observeSession(
-          observeSessionId,
-          observeMatch.filePath,
-          pidInfo.cwd,
-          pidInfo.pid,
-          observeMatch.customTitle,
-          pidInfo.terminalTarget,
-          pidInfo.entrypoint,
-        );
-
-        // Map internal -> external so events use the Claude session ID
-        this.sessionIdMap.set(sessionId, observeSessionId);
-
-        // Send existing conversation history so the phone sees prior messages
-        if (this.initialDiscoveryDone) {
-          this.sendSessionHistory(observeSessionId);
-        }
-
-        const termInfo = pidInfo.terminalTarget ? ` [${pidInfo.terminalTarget.type}: ${pidInfo.terminalTarget.target}]` : ' [no terminal injection]';
-        logger.info('daemon', 'Observing CLI session', { claudeSessionId: observeSessionId, pid: pidInfo.pid });
-      }
-    } catch (err) {
-      logger.error('daemon', `Error discovering sessions: ${(err as Error).message}`);
-    }
+    return discoverAndObserveSessionsExternal({
+      sessionDiscovery: this.sessionDiscovery,
+      sessionManager: this.sessionManager,
+      sessionIdMap: this.sessionIdMap,
+      replacedSessionIds: this.replacedSessionIds,
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      sendToPhone: (e) => this.sendToPhone(e),
+      sendSessionHistory: (id) => { this.sendSessionHistory(id); },
+      readSessionMap,
+      getLatestSessionMapEntryForPid,
+      removeSessionMapEntries,
+    });
   }
 
   private discoverAndObserveCodexSessions(): void {
-    try {
-      const sessions = this.codexDiscovery.discoverSessions();
-      const liveSessions = this.codexDiscovery.discoverLiveSessions(sessions);
-      for (const session of sessions) {
-        const existing = this.codexObservers.get(session.sessionId);
-        if (existing) {
-          const live = liveSessions.has(session.sessionId);
-          const nextStatus = live
-            ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
-            : SessionStatus.HISTORY;
-          if (existing.status !== nextStatus) {
-            existing.status = nextStatus;
-            existing.lastActivity = Date.now();
-            if (this.initialDiscoveryDone) {
-              this.sendToPhone({
-                type: 'session_status',
-                session_id: session.sessionId,
-                status: nextStatus,
-              } as unknown as PcEvent);
-            }
-          }
-          continue;
-        }
-        const observer = new CodexObserver(session.sessionId, session.rolloutPath);
-        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.READY : SessionStatus.HISTORY;
-        const tracked = {
-          observer,
-          session,
-          status: initialStatus,
-          lastActivity: session.updatedAtMs ?? Date.now(),
-        };
-        this.codexObservers.set(session.sessionId, tracked);
-        this.attachCodexObserverHandlers(tracked);
-        observer.start();
-      }
-    } catch (err) {
-      logger.warn('codex-discovery', `Error discovering Codex sessions: ${(err as Error).message}`);
-    }
+    discoverAndObserveCodexSessionsExternal({
+      codexDiscovery: this.codexDiscovery,
+      codexObservers: this.codexObservers,
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      sendToPhone: (e) => this.sendToPhone(e),
+      attachCodexObserverHandlers: (tracked) => this.attachCodexObserverHandlers(tracked),
+    });
   }
 
   // --------------------------------------------------------------------------
