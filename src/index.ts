@@ -138,6 +138,16 @@ import {
   registerSessionTitleHandler,
   registerSessionInterruptedHandler,
 } from './wiring/session-manager-handlers.js';
+import {
+  registerCommandMessageHandler,
+  registerTransportErrorHandler,
+  registerDecryptErrorHandler,
+  registerRelayConnectedHandler,
+  registerLanConnectedHandler,
+  registerDisconnectedHandler,
+  registerPhoneOnlineHandler,
+  registerKeyVerifyHandler,
+} from './wiring/transport-handlers.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -600,134 +610,51 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireRelayClientEvents(): void {
-    this.relayClient!.on('message', (payload: unknown) => {
-      const cmdType = (payload as { type?: string; request_id?: string })?.type;
-      const reqId = (payload as { request_id?: string })?.request_id;
-      logger.trace('daemon', 'IN relay command', { type: cmdType, requestId: reqId, preview: JSON.stringify(payload).slice(0, 100) });
+    const relay = this.relayClient!;
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
 
-      if (cmdType === 'peer_hello') {
-        this.handlePeerHello(payload as PeerHello);
-        return;
-      }
-
-      const command = payload as PhoneCommand;
-      this.handleCommand(command).catch((err) => {
-        logger.error('daemon', `Command handler error: ${(err as Error).message}`, { type: cmdType, requestId: reqId });
-        const errorEvent: ErrorEvent = {
-          type: 'error',
-          request_id: (command as { request_id?: string }).request_id,
-          message: `Command handler error: ${(err as Error).message}`,
-          code: 'COMMAND_ERROR',
-        };
-        this.sendToPhone(errorEvent);
-      });
+    registerCommandMessageHandler(relay, {
+      source: 'relay',
+      handlePeerHello: (p) => this.handlePeerHello(p),
+      handleCommand: (c) => this.handleCommand(c),
+      sendToPhone,
     });
 
-    this.relayClient!.on('connected', () => {
-      logger.debug('daemon', '=== CONNECTED to relay ===');
-      logger.info('daemon', 'Connected to relay');
-      this.emit('connected');
+    registerRelayConnectedHandler(relay, {
+      emitConnected: () => this.emit('connected'),
     });
 
-    this.relayClient!.on('phone_online', () => {
-      logger.debug('daemon', 'Phone online, resending pending requests', { count: this.pendingBlockingRequests.size });
-
-      // Send peer_hello over the encrypted channel so the phone can learn
-      // our product version and capability set.
-      this.sendPeerHello();
-
-      // Send key fingerprint for E2E verification
-      const fp = this.cryptoEngine.sendKeyFingerprint();
-      if (fp) {
-        this.relayClient!.sendControlFrame({ action: 'key_verify', key_fingerprint: fp });
-      }
-
-      let resent = 0;
-      for (const [requestId, entry] of this.pendingBlockingRequests) {
-        logger.debug('daemon', 'reconnect resend candidate', {
-          requestId,
-          sessionId: entry.sessionId,
-          eventType: (entry.event as any)?.type,
-          actionType: (entry as any).type,
-          expiredToTerminal: !!(entry as any).expiredToTerminal,
-        });
-        // Expired-to-terminal entries: still resend so a freshly launched phone
-        // (no in-memory cache) can rebuild the card. Then send a
-        // permission_expired event so the card shows the timed-out banner.
-        if ((entry as any).expiredToTerminal) {
-          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
-          const expiredToolName = (entry.event as any)?.tool_name ?? (entry as any).toolName ?? entry.type;
-          this.sendToPhone({
-            type: 'permission_expired',
-            session_id: entry.sessionId,
-            request_id: requestId,
-            tool_name: expiredToolName,
-          } as unknown as PcEvent);
-          logger.info('daemon', 'Resent expired pending action to phone', {
-            sessionId: entry.sessionId,
-            requestId,
-            toolName: expiredToolName,
-            actionType: entry.type,
-          });
-          this.sendExpiredPendingSystemMessage(entry.sessionId, requestId, expiredToolName, entry.type, entry);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-          this.sendToPhone({
-            type: 'session_status',
-            session_id: entry.sessionId,
-            status: SessionStatus.PENDING_ACTIONS,
-            action_type: entry.type,
-          } as unknown as PcEvent);
-          resent++;
-          continue;
-        }
-
-        const hookPending = this.hookServer.hasPendingPermission(requestId);
-        const sdkPending = this.sessionManager.getAllSessions().some(
-          s => s.pendingPermissions?.has(requestId),
-        );
-        if (hookPending || sdkPending) {
-          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
-          entry.sentAt = Date.now();
-          resent++;
-        } else {
-          this.pendingBlockingRequests.delete(requestId);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-        }
-      }
-      logger.debug('daemon', `Resent ${resent} pending blocking requests`);
+    registerPhoneOnlineHandler(relay, {
+      hookServer: this.hookServer,
+      sessionManager: this.sessionManager,
+      sendPeerHello: () => this.sendPeerHello(),
+      getKeyFingerprint: () => this.cryptoEngine.sendKeyFingerprint(),
+      sendControlFrame: (f) => relay.sendControlFrame(f),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      resendTrackedBlockingEvent: (type, sId, rId, event) =>
+        this.resendTrackedBlockingEvent(type, sId, rId, event),
+      sendToPhone,
+      sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) =>
+        this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
+      clearNotificationDelivery: (et, sId, rId) =>
+        this.clearNotificationDelivery(et, sId, rId),
     });
 
-    this.relayClient!.on('key_verify', (peerFingerprint: string) => {
-      const expected = this.cryptoEngine.recvKeyFingerprint();
-      if (!expected) return;
-      if (peerFingerprint === expected) {
-        logger.info('daemon', 'E2E key verification passed');
-      } else {
-        logger.error('daemon', 'E2E key mismatch — phone has stale keys', { expected, received: peerFingerprint });
-        this.relayClient!.sendControlFrame({
-          action: 'e2e_error',
-          message: 'E2E key mismatch. Please re-pair the device.',
-        });
-      }
+    registerKeyVerifyHandler(relay, {
+      getExpectedFingerprint: () => this.cryptoEngine.recvKeyFingerprint(),
+      sendControlFrame: (f) => relay.sendControlFrame(f),
     });
 
-    this.relayClient!.on('disconnected', (reason: string) => {
-      logger.warn('daemon', `Disconnected from relay: ${reason}`);
-      this.emit('disconnected', reason);
+    registerDisconnectedHandler(relay, {
+      source: 'relay',
+      emitDisconnected: (reason) => { this.emit('disconnected', reason); },
     });
 
-    this.relayClient!.on('error', (error: Error) => {
-      logger.error('daemon', `Relay error: ${error.message}`);
-    });
+    registerTransportErrorHandler(relay, 'relay');
 
-    this.relayClient!.on('decrypt_error', (count: number) => {
-      logger.warn('daemon', `E2E decrypt failed ${count} times — phone may need to re-pair`);
-      if (count === 3) {
-        this.relayClient!.sendControlFrame({
-          action: 'e2e_error',
-          message: 'Decryption failed. Please re-pair the device.',
-        });
-      }
+    registerDecryptErrorHandler(relay, {
+      source: 'relay',
+      sendE2EError: (message) => relay.sendControlFrame({ action: 'e2e_error', message }),
     });
   }
 
@@ -736,55 +663,31 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireLanServerEvents(): void {
-    this.lanServer!.on('message', (payload: unknown) => {
-      const cmdType = (payload as { type?: string })?.type;
-      const reqId = (payload as { request_id?: string })?.request_id;
-      logger.trace('daemon', 'IN lan command', { type: cmdType, requestId: reqId, preview: JSON.stringify(payload).slice(0, 100) });
+    const lan = this.lanServer!;
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
 
-      if (cmdType === 'peer_hello') {
-        this.handlePeerHello(payload as PeerHello);
-        return;
-      }
-
-      const command = payload as PhoneCommand;
-      this.handleCommand(command).catch((err) => {
-        logger.error('daemon', `Command handler error (lan): ${(err as Error).message}`, { type: cmdType, requestId: reqId });
-        const errorEvent: ErrorEvent = {
-          type: 'error',
-          request_id: (command as { request_id?: string }).request_id,
-          message: `Command handler error: ${(err as Error).message}`,
-          code: 'COMMAND_ERROR',
-        };
-        this.sendToPhone(errorEvent);
-      });
+    registerCommandMessageHandler(lan, {
+      source: 'lan',
+      handlePeerHello: (p) => this.handlePeerHello(p),
+      handleCommand: (c) => this.handleCommand(c),
+      sendToPhone,
     });
 
-    this.lanServer!.on('connected', () => {
-      logger.debug('daemon', '=== CONNECTED via LAN ===');
-      logger.info('daemon', 'Connected via LAN');
-      // LAN connect implies authenticated + E2E session keys ready, so we can
-      // send peer_hello immediately.
-      this.sendPeerHello();
-      this.emit('connected');
+    registerLanConnectedHandler(lan, {
+      sendPeerHello: () => this.sendPeerHello(),
+      emitConnected: () => this.emit('connected'),
     });
 
-    this.lanServer!.on('disconnected', (reason: string) => {
-      logger.warn('daemon', `Disconnected from LAN: ${reason}`);
-      this.emit('disconnected', reason);
+    registerDisconnectedHandler(lan, {
+      source: 'lan',
+      emitDisconnected: (reason) => { this.emit('disconnected', reason); },
     });
 
-    this.lanServer!.on('error', (error: Error) => {
-      logger.error('daemon', `LAN error: ${error.message}`);
-    });
+    registerTransportErrorHandler(lan, 'lan');
 
-    this.lanServer!.on('decrypt_error', (count: number) => {
-      logger.warn('daemon', `E2E decrypt failed ${count} times (LAN) — phone may need to re-pair`);
-      if (count === 3) {
-        this.lanServer!.send({
-          type: 'e2e_error',
-          message: 'Decryption failed. Please re-pair the device.',
-        });
-      }
+    registerDecryptErrorHandler(lan, {
+      source: 'lan',
+      sendE2EError: (message) => lan.send({ type: 'e2e_error', message }),
     });
   }
 
