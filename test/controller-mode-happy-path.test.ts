@@ -32,6 +32,9 @@ interface FakeQueryHandle {
   mcpServerStatusCalls: number;
   setMcpServerStatusResult(servers: unknown[]): void;
   setMcpServerStatusError(err: Error): void;
+  rewindFilesCalls: Array<{ userMessageId: string; dryRun: boolean | undefined }>;
+  setRewindFilesResult(result: { canRewind: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number }): void;
+  setRewindFilesError(err: Error): void;
 }
 
 function createFakeQuery(): FakeQueryHandle {
@@ -76,6 +79,9 @@ function createFakeQuery(): FakeQueryHandle {
     mcpServerStatusCalls: 0,
     mcpServerStatusResult: [] as unknown[],
     mcpServerStatusError: undefined as Error | undefined,
+    rewindFilesCalls: [] as Array<{ userMessageId: string; dryRun: boolean | undefined }>,
+    rewindFilesResult: { canRewind: true } as { canRewind: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number },
+    rewindFilesError: undefined as Error | undefined,
     async interrupt() { fakeQuery.interruptCalls += 1; },
     async setPermissionMode(...args: unknown[]) { fakeQuery.setPermissionModeCalls.push(args); },
     async setModel(...args: unknown[]) { fakeQuery.setModelCalls.push(args); },
@@ -108,7 +114,11 @@ function createFakeQuery(): FakeQueryHandle {
       if (fakeQuery.contextUsageError) throw fakeQuery.contextUsageError;
       return fakeQuery.contextUsageResult as never;
     },
-    async rewindFiles() { return undefined as never; },
+    async rewindFiles(userMessageId: string, options?: { dryRun?: boolean }) {
+      fakeQuery.rewindFilesCalls.push({ userMessageId, dryRun: options?.dryRun });
+      if (fakeQuery.rewindFilesError) throw fakeQuery.rewindFilesError;
+      return fakeQuery.rewindFilesResult as never;
+    },
   };
 
   const handle: FakeQueryHandle = {
@@ -132,6 +142,9 @@ function createFakeQuery(): FakeQueryHandle {
     mcpServerStatusCalls: 0,
     setMcpServerStatusResult(servers) { fakeQuery.mcpServerStatusResult = servers; },
     setMcpServerStatusError(err) { fakeQuery.mcpServerStatusError = err; },
+    rewindFilesCalls: [] as Array<{ userMessageId: string; dryRun: boolean | undefined }>,
+    setRewindFilesResult(result) { fakeQuery.rewindFilesResult = result; },
+    setRewindFilesError(err) { fakeQuery.rewindFilesError = err; },
     emit(message) {
       if (waiting) deliver({ done: false, value: message });
       else queue.push(message);
@@ -147,6 +160,7 @@ function createFakeQuery(): FakeQueryHandle {
   Object.defineProperty(handle, 'supportedCommandsCalls', { get: () => fakeQuery.supportedCommandsCalls });
   Object.defineProperty(handle, 'supportedAgentsCalls', { get: () => fakeQuery.supportedAgentsCalls });
   Object.defineProperty(handle, 'mcpServerStatusCalls', { get: () => fakeQuery.mcpServerStatusCalls });
+  Object.defineProperty(handle, 'rewindFilesCalls', { get: () => fakeQuery.rewindFilesCalls });
 
   return handle;
 }
@@ -595,6 +609,80 @@ test('getMcpServerStatus propagates SDK errors', async () => {
     await assert.rejects(
       () => manager.getMcpServerStatus(sessionId),
       (err: Error) => err.message.includes('boom mcp'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('rewindSession dry-run forwards user_message_id + dryRun and returns the SDK preview without forking', async () => {
+  const fake = createFakeQuery();
+  fake.setRewindFilesResult({
+    canRewind: true,
+    filesChanged: ['a.ts', 'b.ts'],
+    insertions: 12,
+    deletions: 5,
+  });
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-rewind-dry-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const before = manager.getSession(sessionId)?.lastActivity ?? 0;
+    const result = await manager.rewindSession(sessionId, 'msg-uuid-1', true);
+    assert.equal(fake.rewindFilesCalls.length, 1);
+    assert.deepEqual(fake.rewindFilesCalls[0], { userMessageId: 'msg-uuid-1', dryRun: true });
+    assert.equal(result.canRewind, true);
+    assert.equal(result.filesChanged?.length, 2);
+    assert.equal(result.newSessionId, undefined);
+    // Dry-run must NOT bump lastActivity (no user-visible change).
+    assert.equal(manager.getSession(sessionId)?.lastActivity, before);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('rewindSession surfaces canRewind:false from the SDK without forking', async () => {
+  const fake = createFakeQuery();
+  fake.setRewindFilesResult({ canRewind: false, error: 'unknown user message id' });
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-rewind-deny-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    const result = await manager.rewindSession(sessionId, 'bogus', false);
+    assert.equal(result.canRewind, false);
+    assert.equal(result.error, 'unknown user message id');
+    assert.equal(result.newSessionId, undefined);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('rewindSession rejects unknown sessions', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  await assert.rejects(
+    () => manager.rewindSession('does-not-exist', 'm', false),
+    (err: Error) => err.message.includes('Session not found'),
+  );
+  manager.shutdown();
+});
+
+test('rewindSession propagates SDK errors', async () => {
+  const fake = createFakeQuery();
+  fake.setRewindFilesError(new Error('boom rewind'));
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-rewind-err-'));
+  try {
+    const sessionId = manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    await assert.rejects(
+      () => manager.rewindSession(sessionId, 'm', true),
+      (err: Error) => err.message.includes('boom rewind'),
     );
   } finally {
     manager.shutdown();

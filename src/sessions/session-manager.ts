@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, forkSession } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Query,
   SDKMessage,
@@ -143,13 +143,18 @@ class StreamInputController {
   private queue: SDKUserMessage[] = [];
   private waiting: ((msg: SDKUserMessage) => void) | null = null;
   private _closed = false;
+  /** Tag for log correlation — set by SessionManager.create*() right after construction. */
+  ownerSessionId?: string;
 
   get closed(): boolean {
     return this._closed;
   }
 
   push(msg: SDKUserMessage): void {
-    if (this._closed) return;
+    if (this._closed) {
+      logger.warn('stream-input', 'push() on closed controller — dropped', { sessionId: this.ownerSessionId?.substring(0, 8) });
+      return;
+    }
     if (this.waiting) {
       const resolve = this.waiting;
       this.waiting = null;
@@ -317,6 +322,7 @@ export class SessionManager extends EventEmitter {
     const claudeSessionId = randomUUID();
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const state: SessionState = {
       sessionId,
@@ -375,6 +381,7 @@ export class SessionManager extends EventEmitter {
     assertWorkingDirectoryExists(workingDir);
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const state: SessionState = {
       sessionId,
@@ -422,7 +429,7 @@ export class SessionManager extends EventEmitter {
   /**
    * Send a user message to an active session.
    */
-  async sendMessage(sessionId: string, message: string): Promise<void> {
+  async sendMessage(sessionId: string, message: string): Promise<{ sdkUuid?: string }> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -491,25 +498,35 @@ export class SessionManager extends EventEmitter {
           });
         }
       }, probeTimeoutMs).unref();
-      return;
+      // Observed-mode echo carries sdkUuid via session_output user_message;
+      // no need to wait for it here.
+      return {};
     }
+
+    // Controller mode: pre-generate the SDK transcript uuid and stamp it on
+    // the pushed SDKUserMessage. The SDK accepts a caller-provided uuid on
+    // streaming-input pushes (per the Agent SDK docs), so we can return it
+    // synchronously instead of awaiting an echo frame.
+    const sdkUuid = randomUUID();
 
     // If the query is still alive, push directly
     if (session.queryHandle && !session.inputController.closed) {
       session.inputController.push({
         type: 'user',
+        uuid: sdkUuid,
         message: { role: 'user', content: message },
         parent_tool_use_id: null,
       } as SDKUserMessage);
       session.status = SessionStatus.RUNNING;
       session.lastActivity = Date.now();
       this.emit('session_status', sessionId, SessionStatus.RUNNING);
-      logger.trace('session-manager', 'Pushed user message', { sessionId });
-      return;
+      logger.trace('session-manager', 'Pushed user message', { sessionId, sdkUuid });
+      return { sdkUuid };
     }
 
     // Query ended — resume with a new query
-    this.resumeWithMessage(session, message);
+    this.resumeWithMessage(session, message, sdkUuid);
+    return { sdkUuid };
   }
 
   /**
@@ -601,6 +618,7 @@ export class SessionManager extends EventEmitter {
     const sessionId = this.generateSessionId();
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = sessionId;
 
     const observer = new SessionObserver(claudeSessionId, jsonlPath);
 
@@ -953,6 +971,99 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Rewind a session to a given user message.
+   *
+   * Two-phase. `dryRun: true` only previews file changes (`filesChanged` /
+   * `insertions` / `deletions`) — disk untouched, no fork happens, the
+   * session keeps running. The phone uses dry-run to populate the
+   * confirmation sheet.
+   *
+   * `dryRun: false` performs the real rewind:
+   *   1. `Query.rewindFiles(uuid)` restores tracked files. **Must run on
+   *      the live (pre-fork) query** — fork drops the checkpoint history
+   *      ("Forked sessions start without undo history").
+   *   2. `forkSession(claudeSessionId, { upToMessageId: uuid })` slices
+   *      the SDK transcript inclusive of the target message and returns a
+   *      new claudeSessionId. The source session's query keeps running so
+   *      the user can continue the original timeline in parallel.
+   *   3. A new internal session is created via `resumeSession(...)` against
+   *      the fork's claude session id, inheriting the original's working
+   *      directory + config.
+   *
+   * The returned `newSessionId` is the new internal id the phone should
+   * navigate to. Controller-mode only — observer sessions throw
+   * `not_supported`. If `rewindFiles` reports `canRewind: false` the
+   * fork is skipped and `newSessionId` is omitted.
+   */
+  async rewindSession(
+    sessionId: string,
+    userMessageId: string,
+    dryRun: boolean,
+  ): Promise<{
+    canRewind: boolean;
+    error?: string;
+    filesChanged?: string[];
+    insertions?: number;
+    deletions?: number;
+    newSessionId?: string;
+  }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.isObserved) throw new Error('not_supported: observed sessions cannot be rewound');
+    if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
+    if (!session.claudeSessionId) throw new Error('Session has no claudeSessionId — cannot fork');
+
+    const fileResult = await session.queryHandle.rewindFiles(userMessageId, { dryRun });
+
+    if (dryRun || !fileResult.canRewind) {
+      logger.debug('session-manager', 'rewindSession (preview/denied)', {
+        sessionId,
+        userMessageId,
+        dryRun,
+        canRewind: fileResult.canRewind,
+        filesChanged: fileResult.filesChanged?.length ?? 0,
+      });
+      return {
+        canRewind: fileResult.canRewind,
+        error: fileResult.error,
+        filesChanged: fileResult.filesChanged,
+        insertions: fileResult.insertions,
+        deletions: fileResult.deletions,
+      };
+    }
+
+    const sourceClaudeSessionId = session.claudeSessionId;
+    const forkResult = await forkSession(sourceClaudeSessionId, { upToMessageId: userMessageId });
+
+    // Keep the source query alive so the user can continue the original
+    // timeline. fork returns a distinct claudeSessionId, so the two SDK
+    // processes don't collide on hook routing.
+
+    const newSessionId = this.resumeSession(forkResult.sessionId, {
+      ...(session.config ?? {}),
+      working_directory: session.workingDirectory,
+      name: session.customTitle,
+    });
+
+    logger.info('session-manager', 'rewindSession applied', {
+      sessionId,
+      userMessageId,
+      sourceClaudeSessionId,
+      forkClaudeSessionId: forkResult.sessionId,
+      newSessionId,
+      filesChanged: fileResult.filesChanged?.length ?? 0,
+    });
+
+    return {
+      canRewind: true,
+      filesChanged: fileResult.filesChanged,
+      insertions: fileResult.insertions,
+      deletions: fileResult.deletions,
+      newSessionId,
+    };
+  }
+
+  /**
    * Emergency abort -- kill all sessions immediately.
    */
   emergencyAbort(): void {
@@ -997,6 +1108,10 @@ export class SessionManager extends EventEmitter {
       ...(config.allowed_tools?.length ? { allowedTools: config.allowed_tools } : {}),
       canUseTool: this.buildCanUseTool(state),
       abortController: state.abortController,
+      // Enables Query.rewindFiles() — backs the phone's "Rewind to here"
+      // affordance. SDK keeps per-file backups before each modifying tool
+      // call; restoring is bounded by user-message id.
+      enableFileCheckpointing: true,
     };
   }
 
@@ -1090,7 +1205,7 @@ export class SessionManager extends EventEmitter {
   /**
    * Resume a session that has ended, creating a new query with --resume.
    */
-  private resumeWithMessage(session: SessionState, message: string): void {
+  private resumeWithMessage(session: SessionState, message: string, sdkUuid?: string): void {
     if (!session.claudeSessionId) {
       throw new Error(`Session ${session.sessionId} has ended and no Claude session ID available for resume`);
     }
@@ -1099,9 +1214,11 @@ export class SessionManager extends EventEmitter {
 
     const abortController = new AbortController();
     const inputController = new StreamInputController();
+    inputController.ownerSessionId = session.sessionId;
 
     inputController.push({
       type: 'user',
+      ...(sdkUuid ? { uuid: sdkUuid } : {}),
       message: { role: 'user', content: message },
       parent_tool_use_id: null,
     } as SDKUserMessage);
@@ -1111,11 +1228,13 @@ export class SessionManager extends EventEmitter {
     session.status = SessionStatus.STARTING;
     session.lastActivity = Date.now();
 
-    // Suppress replayed assistant content from resume — set counters high so
-    // the delta logic produces zero output. They reset to 0 on the next 'user'
-    // message in handleSDKMessage, which arrives before the new response.
-    session.lastEmittedTextLength = Number.MAX_SAFE_INTEGER;
-    session.lastEmittedThinkingLength = Number.MAX_SAFE_INTEGER;
+    // Fresh SDK process: it won't replay prior assistant content over the
+    // streaming-input channel, so start delta tracking at 0. (Initializing
+    // these to MAX_SAFE_INTEGER would silently drop the first response
+    // because slice(MAX) is "" and the resume path never sees a 'user'
+    // frame to reset the counter back to 0.)
+    session.lastEmittedTextLength = 0;
+    session.lastEmittedThinkingLength = 0;
     // Don't clear emittedToolUseIds — old tool IDs should remain suppressed
 
     const handle = this.queryFactory({
@@ -1165,16 +1284,17 @@ export class SessionManager extends EventEmitter {
       logger.debug('session-manager', 'Query stream ended', { sessionId });
 
     } catch (err) {
+      const e = err as Error;
       // Mark query as done
       state.queryHandle = null;
       state.inputController.close();
 
-      if ((err as Error).name === 'AbortError') {
+      if (e.name === 'AbortError') {
         state.status = SessionStatus.HISTORY;
         this.emit('session_ended', sessionId, 0);
         logger.debug('session-manager', 'Session aborted', { sessionId });
       } else {
-        logger.error('session-manager', `Query stream error: ${(err as Error).message}`, { sessionId });
+        logger.error('session-manager', `Query stream error: ${e.message}`, { sessionId });
         this.emit('error', sessionId, err instanceof Error ? err : new Error(String(err)));
         if (state.claudeSessionId) {
           state.status = SessionStatus.READY;
