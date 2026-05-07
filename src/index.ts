@@ -91,6 +91,10 @@ import {
   handleSendMessage as handleSendMessageExternal,
   type SendMessageDeps,
 } from './commands/handlers/send-message.js';
+import {
+  handleListSessions as handleListSessionsExternal,
+  type ListSessionsDeps,
+} from './commands/handlers/list-sessions.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -2436,286 +2440,30 @@ export class AgentPocketDaemon extends EventEmitter {
     return handleRewindSessionExternal(this.commandContext(), command);
   }
 
-  private async handleListSessions(command: ListSessionsCommand): Promise<void> {
-    fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions CALLED\n`);
-    try {
-      const offset = command.offset ?? 0;
-      const limit = command.limit ?? 20;
+  private handleListSessions(command: ListSessionsCommand): Promise<void> {
+    return handleListSessionsExternal(this.commandContext(), this.listSessionsDeps(), command);
+  }
 
-      const discoveredSessions = this.sessionDiscovery.getCachedSessions()
-        ?? await this.sessionDiscovery.discoverSessions();
-
-      const allSessions: Array<{ entry: Record<string, unknown>; historyKey: string }> = [];
-
-      // ── Phase 1: Daemon-tracked sessions (SessionManager) ──
-      // These have observers attached and carry rich status.
-      const activeSessions = this.sessionManager.getAllSessions();
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Phase 1 has ${activeSessions.length} sessions: ${activeSessions.map(s => `${s.claudeSessionId?.slice(0,8)}(status=${s.status},pid=${s.terminalPid})`).join(', ')}\n`);
-      const claimedPids = new Set<number>();
-      const claimedSessionIds = new Set<string>();
-
-      // Snapshot live PID metadata once so we can use the friendly `name`
-      // (written by Claude Code 4.x into ~/.claude/sessions/<pid>.json) as a
-      // title fallback in every phase.
-      const runningAll = this.sessionDiscovery.getRunningAllSessions();
-      const pidNameByPid = new Map<number, string>();
-      for (const r of runningAll) {
-        if (r.name) pidNameByPid.set(r.pid, r.name);
-      }
-
-      for (const active of activeSessions) {
-        const externalId = this.resolveExternalSessionId(active.sessionId);
-        const claudeId = active.claudeSessionId ?? externalId;
-
-        // Check if this session has a pending permission in the hook server.
-        // Real (non-synthetic) entries always win — they're live blocking requests.
-        // Synthetic startup_pending_* entries are heuristic guesses from JSONL state
-        // at startup; if the session has been silent for a long time, the user has
-        // likely moved past it — clean up the synthetic so it doesn't keep firing,
-        // but keep trusting SessionManager's own status (it's tracked from observer
-        // events, not from the hook server).
-        let effectiveStatus = active.status as SessionStatus;
-        let actionType: string | undefined;
-        const realPending = Array.from(this.pendingBlockingRequests.entries()).find(
-          ([reqId, entry]) =>
-            entry.sessionId === externalId && !reqId.startsWith('startup_pending_'),
-        );
-        if (realPending) {
-          effectiveStatus = SessionStatus.PENDING_ACTIONS;
-          actionType = realPending[1].type;
-        } else if (effectiveStatus === SessionStatus.PENDING_ACTIONS) {
-          const idleMs = Date.now() - (active.lastActivity ?? 0);
-          if (idleMs > 10 * 60 * 1000) {
-            const syntheticId = `startup_pending_${externalId}`;
-            if (this.pendingBlockingRequests.has(syntheticId)) {
-              this.pendingBlockingRequests.delete(syntheticId);
-            }
-          }
-          // Do NOT downgrade to READY here — SessionManager set this status
-          // for a reason (real PreToolUse, observer detection, or startup
-          // JSONL analysis). The hook server can lose track of a permission
-          // that was timed out / transferred to terminal, but the session is
-          // still genuinely waiting.
-        }
-
-        allSessions.push({
-          entry: {
-            session_id: externalId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-            status: effectiveStatus,
-            action_type: actionType,
-            working_directory: active.workingDirectory,
-            project_name: active.customTitle
-              ?? (active.terminalPid ? pidNameByPid.get(active.terminalPid) : undefined)
-              ?? path.basename(active.workingDirectory),
-            last_activity: active.lastActivity,
-            entrypoint: active.entrypoint,
-            pid: active.terminalPid,
-            is_observed: active.isObserved,
-            ...(active.isObserved
-              ? {}
-              : {
-                  permission_mode: active.permissionMode ?? 'default',
-                  dangerously_skip_permissions: active.config?.dangerously_skip_permissions === true,
-                }),
-          },
-          historyKey: claudeId,
-        });
-        if (active.terminalPid) claimedPids.add(active.terminalPid);
-        claimedSessionIds.add(externalId);
-        if (active.claudeSessionId) claimedSessionIds.add(active.claudeSessionId);
-      }
-
-      // ── Phase 2: Alive PIDs not claimed by Phase 1 ──
-      // A live PID = an active session, even if the daemon hasn't attached an observer.
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Phase 2 has ${runningAll.length} running PIDs: ${runningAll.map(s => `pid=${s.pid},sid=${s.sessionId.slice(0,8)}`).join(', ')}\n`);
-      for (const pidInfo of runningAll) {
-        if (claimedPids.has(pidInfo.pid)) continue;
-
-        // Override stale PID JSON metadata with the latest session-map entry,
-        // matching the live discovery loop. Without this, restarted daemons
-        // resolve the wrong sessionId for PIDs whose JSON wasn't updated
-        // after /clear or whose cwd is wrong (e.g. worktree launches).
-        const mapEntry = getLatestSessionMapEntryForPid(pidInfo.pid);
-        if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
-          pidInfo.sessionId = mapEntry.sessionId;
-          pidInfo.cwd = mapEntry.cwd;
-        }
-
-        // Phase 1 records the SDK session's externalId/claudeSessionId in
-        // claimedSessionIds even when terminalPid is undefined (controller
-        // mode). Skip here so we don't emit a second copy of the same
-        // session when its sessionId also shows up in ~/.claude/sessions/.
-        if (claimedSessionIds.has(pidInfo.sessionId)) continue;
-
-        // Best-effort JSONL match: try PID file's sessionId first.
-        // If JSONL is missing or stale, still emit the PID with its tracked
-        // sessionId — long-idle sessions are still real sessions with valid
-        // history. Mtime is not a reliable liveness signal.
-        let historyKey = pidInfo.sessionId;
-        let lastActivity: number | undefined;
-        let customTitle: string | undefined;
-
-        const exactMatch = discoveredSessions.find(d => d.sessionId === pidInfo.sessionId);
-        if (exactMatch) {
-          lastActivity = exactMatch.lastModified;
-          customTitle = exactMatch.customTitle;
-        }
-
-        allSessions.push({
-          entry: {
-            session_id: pidInfo.sessionId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-            status: SessionStatus.READY,
-            working_directory: pidInfo.cwd,
-            project_name: customTitle ?? pidInfo.name ?? path.basename(pidInfo.cwd),
-            last_activity: lastActivity,
-            entrypoint: pidInfo.entrypoint,
-            pid: pidInfo.pid,
-            is_observed: true,
-          },
-          historyKey,
-        });
-        claimedPids.add(pidInfo.pid);
-        claimedSessionIds.add(pidInfo.sessionId);
-        claimedSessionIds.add(historyKey);
-      }
-
-      // ── Phase 3: History sessions (discovered JSONL files not tied to a live PID) ──
-      for (const discovered of discoveredSessions) {
-        if (claimedSessionIds.has(discovered.sessionId)) continue;
-        if (this.replacedSessionIds.has(discovered.sessionId)) continue;
-        allSessions.push({
-          entry: {
-            session_id: discovered.sessionId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe'],
-            status: SessionStatus.HISTORY,
-            working_directory: discovered.projectDir,
-            project_name: discovered.customTitle ?? path.basename(discovered.projectDir),
-            last_activity: discovered.lastModified,
-            is_observed: true,
-          },
-          historyKey: discovered.sessionId,
-        });
-        claimedSessionIds.add(discovered.sessionId);
-      }
-
-      // ── Phase 4: Codex history/observe sessions ──
-      const codexSessions = this.codexDiscovery.discoverSessions();
-      const liveCodexSessions = this.codexDiscovery.discoverLiveSessions(codexSessions);
-      for (const codex of codexSessions) {
-        if (claimedSessionIds.has(codex.sessionId)) continue;
-        const observed = this.codexObservers.get(codex.sessionId);
-        const liveCodex = liveCodexSessions.get(codex.sessionId);
-        const observedStatus = observed?.status;
-        const codexStatus = liveCodex
-          ? (observedStatus === SessionStatus.RUNNING || observedStatus === SessionStatus.PENDING_ACTIONS ? observedStatus : SessionStatus.READY)
-          : SessionStatus.HISTORY;
-        const terminal = liveCodex ? this.resolveCodexTerminalTarget(codex.sessionId, liveCodex) : undefined;
-        const capabilities = liveCodex ? this.getCodexCapabilities(codex.sessionId) : ['observe'];
-        allSessions.push({
-          entry: {
-            session_id: codex.sessionId,
-            agent_type: 'codex',
-            agent_display_name: 'Codex',
-            agent_version: codex.cliVersion,
-            status: codexStatus,
-            capabilities,
-            working_directory: codex.cwd,
-            project_name: codex.title ?? path.basename(codex.cwd),
-            last_activity: observed?.lastActivity ?? codex.updatedAtMs,
-            entrypoint: 'codex-cli',
-            pid: liveCodex?.pid ?? terminal?.pid,
-            is_observed: true,
-          },
-          historyKey: codex.sessionId,
-        });
-        claimedSessionIds.add(codex.sessionId);
-      }
-
-      // Overlay pending_actions from the hook server onto whatever status
-      // each phase produced. Phase 2 (alive PID without an attached observer)
-      // hardcodes READY, so a real blocking permission request would otherwise
-      // be invisible to the phone. Only real pending entries qualify —
-      // synthetic startup_pending_* are heuristic guesses, not live blocks.
-      const realPendingBySessionId = new Map<string, string>();
-      for (const [reqId, entry] of this.pendingBlockingRequests.entries()) {
-        if (reqId.startsWith('startup_pending_')) continue;
-        if (!realPendingBySessionId.has(entry.sessionId)) {
-          realPendingBySessionId.set(entry.sessionId, entry.type);
-        }
-      }
-      for (const item of allSessions) {
-        const sid = item.entry.session_id as string;
-        const pendingType = realPendingBySessionId.get(sid);
-        if (pendingType && item.entry.status !== SessionStatus.PENDING_ACTIONS) {
-          item.entry.status = SessionStatus.PENDING_ACTIONS;
-          item.entry.action_type = pendingType;
-        }
-      }
-
-      // Sort: active sessions first, then by last_activity descending
-      allSessions.sort((a, b) => {
-        const activeStatuses = new Set([SessionStatus.RUNNING, SessionStatus.PENDING_ACTIONS, SessionStatus.READY, SessionStatus.STARTING]);
-        const aActive = activeStatuses.has(a.entry.status as SessionStatus) ? 1 : 0;
-        const bActive = activeStatuses.has(b.entry.status as SessionStatus) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return ((b.entry.last_activity as number) ?? 0) - ((a.entry.last_activity as number) ?? 0);
-      });
-
-      const totalCount = allSessions.length;
-      const pageSlice = allSessions.slice(offset, offset + limit);
-
-      // Only fetch history for sessions in the current page
-      const sessions = pageSlice.map(({ entry, historyKey }) => {
-        const historyPage = isCodexSessionId(historyKey)
-          ? this.codexDiscovery.getSessionHistory(historyKey, { limit: 3 })
-          : this.sessionDiscovery.getSessionHistory(historyKey, { limit: 3 });
-        return {
-          ...entry,
-          recent_messages: historyPage.messages.map((m) => ({
-            role: m.role,
-            content: m.content.slice(0, 200),
-            tool_name: m.toolName,
-          })),
-        };
-      });
-
-      logger.debug('daemon', 'handleListSessions returning page', {
-        count: sessions.length,
-        sessions: pageSlice.map(({ entry }) => ({
-          sessionId: entry.session_id,
-          pid: entry.pid,
-          capabilities: entry.capabilities,
-        })),
-      });
-
-      const event = {
-        type: 'session_list',
-        request_id: command.request_id,
-        sessions,
-        total_count: totalCount,
-        offset,
-        has_more: offset + limit < totalCount,
-      };
-
-      this.sendToPhone(event as unknown as PcEvent);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to list sessions: ${(err as Error).message}`,
-        'LIST_SESSIONS_ERROR',
-      );
-    }
+  private listSessionsDeps(): ListSessionsDeps {
+    return {
+      getCachedSessions: () => this.sessionDiscovery.getCachedSessions(),
+      discoverSessions: () => this.sessionDiscovery.discoverSessions(),
+      getRunningAllSessions: () => this.sessionDiscovery.getRunningAllSessions(),
+      getSessionHistory: (id, options) => this.sessionDiscovery.getSessionHistory(id, options),
+      discoverCodexSessions: () => this.codexDiscovery.discoverSessions(),
+      discoverCodexLiveSessions: (sessions) => this.codexDiscovery.discoverLiveSessions(sessions),
+      getCodexHistory: (id, options) => this.codexDiscovery.getSessionHistory(id, options),
+      resolveCodexTerminalTarget: (id, liveCodex) => this.resolveCodexTerminalTarget(id, liveCodex),
+      getCodexCapabilities: (id) => this.getCodexCapabilities(id),
+      getCodexObserver: (id) => {
+        const o = this.codexObservers.get(id);
+        return o ? { status: o.status, lastActivity: o.lastActivity } : undefined;
+      },
+      getAllTrackedSessions: () => this.sessionManager.getAllSessions(),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      replacedSessionIds: this.replacedSessionIds,
+      claudeAgentVersion: this.claudeAgentVersion,
+    };
   }
 
   private async handleReadFile(command: ReadFileCommand): Promise<void> {
