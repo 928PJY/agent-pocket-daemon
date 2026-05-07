@@ -95,6 +95,11 @@ import {
   handleListSessions as handleListSessionsExternal,
   type ListSessionsDeps,
 } from './commands/handlers/list-sessions.js';
+import {
+  handleSetPreferences as handleSetPreferencesExternal,
+  handlePeerHello as handlePeerHelloExternal,
+  type PhonePreferences,
+} from './commands/handlers/preferences-and-peer.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -282,7 +287,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // Last seq the phone has acked per session (best-effort telemetry)
   private lastAckedSeqs: Map<string, number> = new Map();
   // Phone preferences (sent via set_preferences command)
-  private phonePreferences: { showToolUse: boolean; showCompletionMetrics: boolean } = {
+  private phonePreferences: PhonePreferences = {
     showToolUse: false,
     showCompletionMetrics: true,
   };
@@ -2496,13 +2501,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handleSetPreferences(command: SetPreferencesCommand): void {
-    if (command.preferences.show_tool_use !== undefined) {
-      this.phonePreferences.showToolUse = command.preferences.show_tool_use;
-    }
-    if (command.preferences.show_completion_metrics !== undefined) {
-      this.phonePreferences.showCompletionMetrics = command.preferences.show_completion_metrics;
-    }
-    logger.debug('daemon', `Phone preferences updated: ${JSON.stringify(this.phonePreferences)}`);
+    handleSetPreferencesExternal(this.phonePreferences, command);
   }
 
   // --------------------------------------------------------------------------
@@ -2788,13 +2787,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handlePeerHello(hello: PeerHello): void {
-    this.peers.update(hello);
-    logger.debug('daemon', 'Received peer_hello', {
-      product: hello.product,
-      product_version: hello.product_version,
-      wire: hello.wire_version,
-      capabilities: this.peers.list(),
-    });
+    handlePeerHelloExternal(this.peers, hello);
   }
 
   /**
