@@ -81,6 +81,11 @@ import {
   notificationDeliveryKey as buildNotificationDeliveryKey,
   type VerifyHistoryDeps,
 } from './commands/handlers/acks.js';
+import {
+  handlePermissionResponse as handlePermissionResponseExternal,
+  handleQuestionResponse as handleQuestionResponseExternal,
+  type ResponseDeps,
+} from './commands/handlers/responses.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -2505,155 +2510,25 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handlePermissionResponse(command: PermissionResponseCommand): void {
-    logger.debug('daemon', `handlePermissionResponse: request_id=${command.request_id}, decision=${command.decision}, hasPending=${this.hookServer.hasPendingPermission(command.request_id)}`);
-    this.untrackBlockingRequest(command.request_id);
-    this.clearNotificationDelivery('permission_request', command.session_id, command.request_id);
-    this.clearNotificationDelivery('plan_review', command.session_id, command.request_id);
-    try {
-      // Verify the phone signature if we have peer identity key
-      if (command.phone_signature && this.cryptoEngine.hasSessionKeys()) {
-        const signaturePayload = JSON.stringify({
-          session_id: command.session_id,
-          request_id: command.request_id,
-          decision: command.decision,
-          seq: command.seq,
-          timestamp: command.timestamp,
-        });
-
-        const valid = this.cryptoEngine.verifyPeer(signaturePayload, command.phone_signature);
-        if (!valid) {
-          this.sendError(
-            command.request_id,
-            'Invalid permission response signature',
-            'SIGNATURE_INVALID',
-          );
-          return;
-        }
-      }
-
-      // Check if this is a hook-based permission (from observed terminal session)
-      if (this.hookServer.hasPendingPermission(command.request_id)) {
-        const isManual = command.decision === PermissionDecision.APPROVE_MANUAL;
-        const allowed = command.decision === PermissionDecision.APPROVE
-          || command.decision === PermissionDecision.ALWAYS_ALLOW
-          || isManual;
-
-        const pendingToolInput = this.hookServer.getPendingToolInput(command.request_id);
-        const pendingToolName = this.hookServer.getPendingToolName(command.request_id);
-
-        logger.debug('daemon', `Hook permission response for ${command.request_id}: tool=${pendingToolName}, decision=${command.decision}, isManual=${isManual}, allowed=${allowed}`);
-
-        if (pendingToolName === 'ExitPlanMode') {
-          // ExitPlanMode is now handled at PermissionRequest stage,
-          // so we use resolvePermissionPrompt which supports updatedPermissions.
-          if (allowed) {
-            const updatedPermissions = isManual ? undefined : [
-              { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
-            ];
-            const planInput = pendingToolInput ?? {};
-            const exitInput = isManual
-              ? { ...planInput, allowedPrompts: [] }
-              : planInput;
-
-            this.hookServer.resolvePermissionPrompt(
-              command.request_id,
-              'allow',
-              exitInput,
-              updatedPermissions,
-            );
-            logger.debug('daemon', `Resolved ExitPlanMode via PermissionRequest hook: ${isManual ? 'manual' : 'acceptEdits'}`);
-          } else {
-            this.hookServer.resolvePermissionPrompt(command.request_id, 'deny');
-            logger.debug('daemon', `Denied ExitPlanMode via PermissionRequest hook`);
-          }
-          return;
-        }
-
-        // All other tools: resolve via PermissionRequest hook format
-        if (allowed && command.decision === PermissionDecision.ALWAYS_ALLOW) {
-          // "Always Allow" — pass the permission suggestions so Claude Code adds the rule
-          const suggestions = this.hookServer.getPendingPermissionSuggestions(command.request_id);
-          const updatedPermissions = Array.isArray(suggestions) ? suggestions as Array<Record<string, unknown>> : undefined;
-          this.hookServer.resolvePermissionPrompt(
-            command.request_id,
-            'allow',
-            undefined,
-            updatedPermissions,
-          );
-          logger.debug('daemon', `Resolved PermissionRequest hook ${command.request_id} (${pendingToolName}): always_allow, updatedPermissions=${!!updatedPermissions}`);
-        } else {
-          this.hookServer.resolvePermissionPrompt(
-            command.request_id,
-            allowed ? 'allow' : 'deny',
-          );
-          logger.debug('daemon', `Resolved PermissionRequest hook ${command.request_id} (${pendingToolName}): ${allowed ? 'allow' : 'deny'}`);
-        }
-        return;
-      }
-
-      // Otherwise, it's an SDK-based permission
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-
-      // For approve_manual: approve but override allowedPrompts to empty
-      if (command.decision === PermissionDecision.APPROVE_MANUAL) {
-        this.sessionManager.respondPermission(
-          internalId,
-          command.request_id,
-          PermissionDecision.APPROVE,
-          { allowedPrompts: [] },
-        );
-      } else {
-        this.sessionManager.respondPermission(
-          internalId,
-          command.request_id,
-          command.decision,
-        );
-      }
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to respond to permission: ${(err as Error).message}`,
-        'PERMISSION_RESPONSE_ERROR',
-      );
-    }
+    handlePermissionResponseExternal(
+      this.commandContext(),
+      this.hookServer,
+      this.cryptoEngine,
+      this.responseDeps(),
+      command,
+    );
   }
 
   private handleQuestionResponse(command: QuestionResponseCommand): void {
-    this.untrackBlockingRequest(command.request_id);
-    this.clearNotificationDelivery('user_question', command.session_id, command.request_id);
-    try {
-      // AskUserQuestion answers come back through the PermissionRequest hook system
-      if (this.hookServer.hasPendingPermission(command.request_id)) {
-        const originalInput = this.hookServer.getPendingToolInput(command.request_id) ?? {};
-        // Use PermissionRequest format: allow with updatedInput containing answers
-        this.hookServer.resolvePermissionPrompt(
-          command.request_id,
-          'allow',
-          { ...originalInput, answers: command.answers },
-        );
-        logger.debug('daemon', `Resolved AskUserQuestion ${command.request_id} via PermissionRequest hook with answers: ${JSON.stringify(command.answers)}`);
-        return;
-      }
+    handleQuestionResponseExternal(this.commandContext(), this.hookServer, this.responseDeps(), command);
+  }
 
-      // For SDK-based sessions, approve with updatedInput containing answers
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const session = this.sessionManager.getSession(internalId);
-      const pending = session?.pendingPermissions.get(command.request_id);
-      const originalInput = pending?.toolInput ?? {};
-      this.sessionManager.respondPermission(
-        internalId,
-        command.request_id,
-        PermissionDecision.APPROVE,
-        { ...originalInput, answers: command.answers },
-      );
-      logger.debug('daemon', `Resolved SDK AskUserQuestion ${command.request_id}`);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to respond to question: ${(err as Error).message}`,
-        'QUESTION_RESPONSE_ERROR',
-      );
-    }
+  private responseDeps(): ResponseDeps {
+    return {
+      untrackBlockingRequest: (requestId) => this.untrackBlockingRequest(requestId),
+      clearNotificationDelivery: (eventType, sessionId, requestId) =>
+        this.clearNotificationDelivery(eventType, sessionId, requestId),
+    };
   }
 
   private async handleKillSession(command: KillSessionCommand): Promise<void> {
