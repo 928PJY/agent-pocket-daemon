@@ -343,13 +343,13 @@ export class SessionObserver extends EventEmitter {
       if (typeof message.content === 'string') {
         // Skip internal protocol messages (XML-tagged: teammate, system, task, command)
         if (message.content.length > 0 && !this.isInternalMessage(message.content)) {
-          const event: UserMessageEvent = { type: 'user_message', message: message.content, sdkUuid };
+          const event: UserMessageEvent = { type: 'user_message', message: message.content, ...(sdkUuid ? { sdkUuid } : {}) };
           this.emit('output', event);
         }
       } else if (Array.isArray(message.content)) {
         for (const block of message.content) {
           if (block.type === 'text' && block.text && !this.isInternalMessage(block.text)) {
-            const event: UserMessageEvent = { type: 'user_message', message: block.text, sdkUuid };
+            const event: UserMessageEvent = { type: 'user_message', message: block.text, ...(sdkUuid ? { sdkUuid } : {}) };
             this.emit('output', event);
           } else if (block.type === 'tool_result' && block.tool_use_id) {
             this.pendingToolUseIds.delete(block.tool_use_id);
