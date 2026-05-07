@@ -10,6 +10,8 @@ import {
   getCodexCapabilities,
   refreshCodexTerminalTarget,
   resolveCodexExternalSessionId,
+  incrementInjectedMessageCount,
+  consumeInjectedMessage,
   type CodexTerminalTargetEntry,
 } from '../src/codex/codex-handler.js';
 import type { CodexHookRequest } from '../src/hooks/hook-server.js';
@@ -267,4 +269,32 @@ test('refreshCodexTerminalTarget tolerates findTerminal returning null', () => {
   );
   assert.equal(result?.pid, 200);
   assert.equal(result?.target, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// injected-message bookkeeping
+// ---------------------------------------------------------------------------
+
+test('incrementInjectedMessageCount bumps the counter and tracks repeat strings', () => {
+  const m = new Map<string, number>();
+  incrementInjectedMessageCount(m, 'hi');
+  incrementInjectedMessageCount(m, 'hi');
+  incrementInjectedMessageCount(m, 'bye');
+  assert.equal(m.get('hi'), 2);
+  assert.equal(m.get('bye'), 1);
+});
+
+test('consumeInjectedMessage decrements when count > 1, deletes when it hits 0, returns true on hit', () => {
+  const m = new Map<string, number>();
+  m.set('hi', 2);
+  assert.equal(consumeInjectedMessage(m, 'hi'), true);
+  assert.equal(m.get('hi'), 1);
+  assert.equal(consumeInjectedMessage(m, 'hi'), true);
+  assert.equal(m.has('hi'), false);
+});
+
+test('consumeInjectedMessage returns false when the message is unknown or the map is undefined', () => {
+  const m = new Map<string, number>();
+  assert.equal(consumeInjectedMessage(m, 'missing'), false);
+  assert.equal(consumeInjectedMessage(undefined, 'missing'), false);
 });
