@@ -61,6 +61,14 @@ import {
   handleGetHistory as handleGetHistoryExternal,
   handleSyncRequest as handleSyncRequestExternal,
 } from './commands/handlers/file-and-history.js';
+import {
+  handleNewSession as handleNewSessionExternal,
+  handleResumeSession as handleResumeSessionExternal,
+  handleKillSession as handleKillSessionExternal,
+  handleInterruptSession as handleInterruptSessionExternal,
+  handleRewindSession as handleRewindSessionExternal,
+  type CodexLifecycleDeps,
+} from './commands/handlers/session-lifecycle.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -2334,58 +2342,11 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private handleNewSession(command: NewSessionCommand): void {
-    try {
-      if (command.config.agent_type !== 'claude_code') {
-        throw new Error(`agent_type '${command.config.agent_type}' is not yet supported by the controller`);
-      }
-      const sessionConfig: SessionConfig = {
-        name: command.config.name,
-        agent_type: command.config.agent_type,
-        working_directory: command.config.working_directory,
-        model: command.config.model,
-        system_prompt: command.config.system_prompt,
-        allowed_tools: command.config.allowed_tools,
-        dangerously_skip_permissions: command.config.dangerously_skip_permissions,
-      };
-
-      const sessionId = this.sessionManager.createSession(sessionConfig);
-
-      // Track request_id -> session_id mapping
-      this.pendingSessionRequests.set(command.request_id, sessionId);
-
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to create session: ${(err as Error).message}`,
-        'SESSION_CREATE_ERROR',
-      );
-    }
+    handleNewSessionExternal(this.commandContext(), command);
   }
 
   private handleResumeSession(command: ResumeSessionCommand): void {
-    try {
-      // If an observer already exists for this Claude session ID, stop and remove it
-      // to prevent duplicate message emission when switching from observe to SDK control.
-      const existing = this.sessionManager.findByClaudeSessionId(command.session_id);
-      if (existing) {
-        logger.debug('daemon', `Stopping existing observer ${existing.sessionId} before resuming session ${command.session_id}`);
-        this.sessionManager.markObservedSessionHistory(existing.sessionId);
-        cleanSessionMap([existing.terminalPid ?? -1]);
-      }
-
-      const sessionId = this.sessionManager.resumeSession(command.session_id, {});
-
-      // Map internal session ID to Claude session ID
-      this.sessionIdMap.set(sessionId, command.session_id);
-      this.pendingSessionRequests.set(command.request_id, sessionId);
-
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to resume session: ${(err as Error).message}`,
-        'SESSION_RESUME_ERROR',
-      );
-    }
+    handleResumeSessionExternal(this.commandContext(), command);
   }
 
   private async handleSendMessage(command: SendMessageCommand): Promise<void> {
@@ -2684,57 +2645,11 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleKillSession(command: KillSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      const observed = this.codexObservers.get(command.session_id);
-      if (observed) {
-        observed.observer.stop();
-        observed.status = SessionStatus.HISTORY;
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: command.session_id,
-          status: SessionStatus.HISTORY,
-        } as unknown as PcEvent);
-      }
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.killSession(internalId);
-    } catch (err) {
-      this.sendError(
-        undefined,
-        `Failed to kill session ${command.session_id}: ${(err as Error).message}`,
-        'KILL_SESSION_ERROR',
-      );
-    }
+    return handleKillSessionExternal(this.commandContext(), this.codexLifecycleDeps(), command);
   }
 
   private async handleInterruptSession(command: InterruptSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
-      if (!target) {
-        this.sendError(undefined, 'Codex interrupt is not available until a terminal target is attached for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
-        return;
-      }
-      try {
-        terminalSendInterrupt(target);
-        logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
-      } catch (err) {
-        this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');
-      }
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.interruptSession(internalId);
-      logger.debug('daemon', `Interrupted session ${command.session_id}`);
-    } catch (err) {
-      this.sendError(
-        undefined,
-        `Failed to interrupt session ${command.session_id}: ${(err as Error).message}`,
-        'INTERRUPT_SESSION_ERROR',
-      );
-    }
+    return handleInterruptSessionExternal(this.commandContext(), this.codexLifecycleDeps(), command);
   }
 
   private async handleSetPermissionMode(command: SetPermissionModeCommand): Promise<void> {
@@ -2800,49 +2715,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleRewindSession(command: RewindSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'rewind_session is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    const dryRun = command.dry_run ?? false;
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const result = await this.sessionManager.rewindSession(internalId, command.user_message_id, dryRun);
-      const externalNewId = result.newSessionId
-        ? this.resolveExternalSessionId(result.newSessionId)
-        : undefined;
-      this.sendToPhone({
-        type: 'rewind_session_response',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        can_rewind: result.canRewind,
-        dry_run: dryRun,
-        error: result.error,
-        files_changed: result.filesChanged,
-        insertions: result.insertions,
-        deletions: result.deletions,
-        new_session_id: externalNewId,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      logger.warn('daemon', 'rewind_session failed', {
-        sessionId: command.session_id,
-        userMessageId: command.user_message_id,
-        dryRun,
-        error: message,
-      });
-      // Reply on the rewind_session_response channel rather than the generic
-      // error channel so the phone's pending resolver fires instead of timing
-      // out. The phone surfaces `error` directly to the user.
-      this.sendToPhone({
-        type: 'rewind_session_response',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        can_rewind: false,
-        dry_run: dryRun,
-        error: message,
-      } as unknown as PcEvent);
-    }
+    return handleRewindSessionExternal(this.commandContext(), command);
   }
 
   private async handleListSessions(command: ListSessionsCommand): Promise<void> {
@@ -3503,8 +3376,19 @@ export class AgentPocketDaemon extends EventEmitter {
       sendToPhone: (event, wake) => this.sendToPhone(event, wake),
       sendError: (requestId, message, code) => this.sendError(requestId, message, code),
       resolveInternalSessionId: (id) => this.resolveInternalSessionId(id),
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
       sendSessionHistory: (id, options) => this.sendSessionHistory(id, options),
       sessionManager: this.sessionManager,
+      sessionIdMap: this.sessionIdMap,
+      pendingSessionRequests: this.pendingSessionRequests,
+    };
+  }
+
+  private codexLifecycleDeps(): CodexLifecycleDeps {
+    return {
+      codexObservers: this.codexObservers,
+      resolveCodexTerminalTarget: (id) => this.resolveCodexTerminalTarget(id),
+      sendTerminalInterrupt: (target) => terminalSendInterrupt(target as TerminalTarget),
     };
   }
 

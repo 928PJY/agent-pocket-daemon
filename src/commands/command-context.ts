@@ -36,6 +36,12 @@ export interface CommandContext {
   resolveInternalSessionId(externalId: string): string | undefined;
 
   /**
+   * Reverse of `resolveInternalSessionId`: given an internal id, return the
+   * id the phone knows. Falls back to the internal id when no mapping exists.
+   */
+  resolveExternalSessionId(internalId: string): string;
+
+  /**
    * Reply to the phone with messages from a session's history. Returns the
    * tail seq of the last message delivered (or undefined when nothing was
    * sent — empty session, missing session, etc.).
@@ -44,5 +50,11 @@ export interface CommandContext {
 
   /** The session manager the daemon owns. */
   readonly sessionManager: SessionManager;
+
+  /** internal session id -> claude session id (when resumed from disk). */
+  readonly sessionIdMap: Map<string, string>;
+
+  /** request_id -> internal session id (resolved when SDK assigns one). */
+  readonly pendingSessionRequests: Map<string, string>;
 }
 
