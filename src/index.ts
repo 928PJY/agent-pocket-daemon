@@ -73,6 +73,14 @@ import {
   handleSetPermissionMode as handleSetPermissionModeExternal,
   handleSetModel as handleSetModelExternal,
 } from './commands/handlers/runtime-config.js';
+import {
+  handleEmergencyAbort as handleEmergencyAbortExternal,
+  handleSessionOutputAck as handleSessionOutputAckExternal,
+  handleNotificationDeliveryAck as handleNotificationDeliveryAckExternal,
+  handleVerifyHistory as handleVerifyHistoryExternal,
+  notificationDeliveryKey as buildNotificationDeliveryKey,
+  type VerifyHistoryDeps,
+} from './commands/handlers/acks.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -2975,33 +2983,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handleEmergencyAbort(command: EmergencyAbortCommand): void {
-    // Verify signature for emergency abort if peer key is available
-    if (command.phone_signature && this.cryptoEngine.hasSessionKeys()) {
-      const signaturePayload = JSON.stringify({
-        type: 'emergency_abort',
-      });
-
-      const valid = this.cryptoEngine.verifyPeer(signaturePayload, command.phone_signature);
-      if (!valid) {
-        this.sendError(
-          undefined,
-          'Invalid emergency abort signature',
-          'SIGNATURE_INVALID',
-        );
-        return;
-      }
-    }
-
-    this.sessionManager.emergencyAbort();
-
-    // Notify the phone that abort is complete
-    const event: ErrorEvent = {
-      type: 'error',
-      message: 'Emergency abort completed -- all sessions terminated',
-      code: 'EMERGENCY_ABORT_COMPLETE',
-    };
-
-    this.sendToPhone(event);
+    handleEmergencyAbortExternal(this.commandContext(), this.cryptoEngine, command);
   }
 
   private handleGetHistory(command: GetHistoryCommand): void {
@@ -3009,90 +2991,20 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handleSessionOutputAck(command: SessionOutputAckCommand): void {
-    const prev = this.lastAckedSeqs.get(command.session_id) ?? 0;
-    if (command.last_seq > prev) {
-      this.lastAckedSeqs.set(command.session_id, command.last_seq);
-    }
-    logger.trace('daemon', 'session_output_ack', { sessionId: command.session_id, lastSeq: command.last_seq });
+    handleSessionOutputAckExternal(this.lastAckedSeqs, command);
   }
 
   private handleNotificationDeliveryAck(command: NotificationDeliveryAckCommand): void {
-    const key = this.notificationDeliveryKey(command.event_type, command.session_id, command.request_id);
-    const pending = this.pendingNotificationDeliveries.get(key);
-    if (pending) {
-      this.pendingNotificationDeliveries.delete(key);
-      logger.debug('daemon', 'notification_delivery_ack received', {
-        eventType: command.event_type,
-        sessionId: command.session_id,
-        requestId: command.request_id,
-        attempts: pending.attempts,
-      });
-    } else {
-      logger.trace('daemon', 'notification_delivery_ack for untracked event', {
-        eventType: command.event_type,
-        sessionId: command.session_id,
-        requestId: command.request_id,
-      });
-    }
+    handleNotificationDeliveryAckExternal(this.pendingNotificationDeliveries, command);
   }
 
   private handleVerifyHistory(command: VerifyHistoryCommand): void {
-    // Read entire history (limit large enough to cover any session) to compare
-    // against the phone's claimed count/tail. Silence = match.
-    const result = isCodexSessionId(command.session_id)
-      ? this.codexDiscovery.getSessionHistory(command.session_id, {
-          offset: 0,
-          limit: 100_000,
-        })
-      : this.sessionDiscovery.getSessionHistory(command.session_id, {
-      offset: 0,
-      limit: 100_000,
-    });
-
-    // Apply the same phone-side filter (tool_use/tool_result hidden when pref is off).
-    const visible = this.phonePreferences.showToolUse
-      ? result.messages
-      : result.messages.filter(m => m.role !== 'tool_use' && m.role !== 'tool_result');
-
-    // Match phone-side parsing: skip empty user messages, blank assistant messages,
-    // and unrecognized roles (phone only handles user/assistant/tool_use/subagent).
-    const phoneVisible = visible.filter(m => {
-      if (m.role === 'user') return m.content.length > 0;
-      if (m.role === 'assistant') return m.content.trim().length > 0;
-      if (m.role === 'tool_use' || m.role === 'subagent') return true;
-      return false; // tool_result and unknown roles are skipped by phone
-    });
-
-    const expectedCount = phoneVisible.length;
-    const expectedTailSeq = result.tailSeq;
-
-    let reason: 'count_mismatch' | 'tail_seq_mismatch' | 'head_seq_mismatch' | null = null;
-    if (command.tail_seq !== undefined && expectedTailSeq !== undefined && command.tail_seq !== expectedTailSeq) {
-      reason = 'tail_seq_mismatch';
-    } else if (command.count !== expectedCount) {
-      // If the phone reports max_count and its count equals that max, it's trimming
-      // older messages — only tail_seq matters, count divergence is expected.
-      const phoneAtMax = (command as unknown as Record<string, unknown>).max_count !== undefined
-        && command.count === (command as unknown as Record<string, unknown>).max_count;
-      if (!phoneAtMax) {
-        reason = 'count_mismatch';
-      }
-    }
-
-    if (!reason) {
-      logger.trace('daemon', 'verify_history match', { sessionId: command.session_id, count: expectedCount });
-      return;
-    }
-
-    const event: HistoryDivergenceEvent = {
-      type: 'history_divergence',
-      session_id: command.session_id,
-      expected_count: expectedCount,
-      expected_tail_seq: expectedTailSeq,
-      reason,
+    const deps: VerifyHistoryDeps = {
+      getSdkHistory: (id, opts) => this.sessionDiscovery.getSessionHistory(id, opts),
+      getCodexHistory: (id, opts) => this.codexDiscovery.getSessionHistory(id, opts),
+      phonePreferences: this.phonePreferences,
     };
-    logger.info('daemon', 'history_divergence', { sessionId: command.session_id, reason, expectedCount, expectedTailSeq, phoneCount: command.count, phoneTail: command.tail_seq });
-    this.sendToPhone(event);
+    handleVerifyHistoryExternal(this.commandContext(), deps, command);
   }
 
   private handleSetPreferences(command: SetPreferencesCommand): void {
@@ -3179,7 +3091,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private notificationDeliveryKey(eventType: string, sessionId: string, requestId: string): string {
-    return `${eventType}|${sessionId}|${requestId}`;
+    return buildNotificationDeliveryKey(eventType, sessionId, requestId);
   }
 
   private resendTrackedBlockingEvent(
