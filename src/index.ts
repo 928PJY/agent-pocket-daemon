@@ -100,6 +100,7 @@ import {
   handlePeerHello as handlePeerHelloExternal,
   type PhonePreferences,
 } from './commands/handlers/preferences-and-peer.js';
+import { DiscoveryLoop } from './discovery/discovery-orchestrator.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -263,7 +264,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
-  private pidCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private discoveryLoop: DiscoveryLoop | null = null;
   // Hook server restart backoff state
   private hookRestartAttempts: number = 0;
   private hookRestartTimer: ReturnType<typeof setTimeout> | null = null;
@@ -424,13 +425,12 @@ export class AgentPocketDaemon extends EventEmitter {
     gcSessionMap();
 
     // Periodically check observed PIDs and discover new CLI sessions
-    this.pidCheckInterval = setInterval(() => {
-      this.checkObservedSessionPids();
-      this.discoverAndObserveSessions().catch((err) => {
-        logger.error('daemon', `Periodic discovery error: ${(err as Error).message}`);
-      });
-      this.discoverAndObserveCodexSessions();
-    }, 5000);
+    this.discoveryLoop = new DiscoveryLoop({
+      checkObservedSessionPids: () => this.checkObservedSessionPids(),
+      discoverAndObserveSessions: () => this.discoverAndObserveSessions(),
+      discoverAndObserveCodexSessions: () => this.discoverAndObserveCodexSessions(),
+    });
+    this.discoveryLoop.start();
 
     // Periodically retry blocking requests that haven't received a phone response
     this.blockingRetryInterval = setInterval(() => {
@@ -447,9 +447,9 @@ export class AgentPocketDaemon extends EventEmitter {
    * Stop the daemon gracefully.
    */
   async stop(): Promise<void> {
-    if (this.pidCheckInterval) {
-      clearInterval(this.pidCheckInterval);
-      this.pidCheckInterval = null;
+    if (this.discoveryLoop) {
+      this.discoveryLoop.stop();
+      this.discoveryLoop = null;
     }
     if (this.hookRestartTimer) {
       clearTimeout(this.hookRestartTimer);
