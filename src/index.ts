@@ -18,13 +18,14 @@ import { CodexDiscovery, codexExternalSessionId, findOpenCodexRollouts, isCodexS
 import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
-import type { CodexHookRequest, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import type { CodexHookRequest, HookPermissionPrompt } from './hooks/hook-server.js';
 import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
 import { readLastTurnSummary } from './utils/transcript-reader.js';
+import { truncateUtf8 } from './utils/truncate-utf8.js';
 import {
   readSessionMap,
   getLatestSessionMapEntryForPid,
@@ -110,6 +111,14 @@ import {
   registerApiSessionsHandler,
   registerApiStatusHandler,
 } from './wiring/hook-handlers.js';
+import {
+  registerPermissionExpiredHandler,
+  registerCodexSessionStartHandler,
+  registerCodexUserPromptSubmitHandler,
+  registerCodexStopHandler,
+  registerCodexPermissionRequestHandler,
+  type MessageSeqRef,
+} from './wiring/hook-handlers-codex.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -235,17 +244,9 @@ function formatCompletionSubtitle(summary: { toolUseCount: number; totalTokens: 
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 
-function truncateUtf8(value: string, maxBytes: number): string {
-  let bytes = 0;
-  let result = '';
-  for (const char of value) {
-    const charBytes = Buffer.byteLength(char, 'utf-8');
-    if (bytes + charBytes > maxBytes) break;
-    result += char;
-    bytes += charBytes;
-  }
-  return result;
-}
+// truncateUtf8 lives in ./utils/truncate-utf8.ts; imported below alongside the
+// other utils. Removing the duplicate local copy keeps a single source of
+// truth for APNs body sizing.
 
 function detectClaudeVersion(): string | undefined {
   try {
@@ -1059,147 +1060,51 @@ export class AgentPocketDaemon extends EventEmitter {
       restartHookServer: () => this.restartHookServer(),
     });
 
-    this.hookServer.on('permission_expired', (expired: HookPermissionExpired) => {
-      const session = this.sessionManager.findByClaudeSessionId(expired.sessionId);
-      const codexExternalId = this.resolveCodexExternalSessionId(expired.sessionId);
-      const externalId = codexExternalId
-        ? codexExternalId
-        : session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : expired.sessionId;
-
-      const event = {
-        type: 'permission_expired',
-        session_id: externalId,
-        request_id: expired.toolUseId,
-        tool_name: expired.toolName,
-      };
-
-      this.sendToPhone(event as unknown as PcEvent);
-
-      // Timeout transfers the request back to the terminal. Keep the expired
-      // banner in chat, but stop treating it as an app-blocking action so a
-      // later permission can surface normally.
-      const blocking = this.pendingBlockingRequests.get(expired.toolUseId);
-      if (blocking) {
-        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, blocking.type, blocking);
-        this.pendingBlockingRequests.delete(expired.toolUseId);
-        this.clearNotificationDelivery(blocking.type, externalId, expired.toolUseId);
-      } else {
-        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, 'permission_request');
-        this.clearNotificationDelivery('permission_request', externalId, expired.toolUseId);
-      }
-      const hasOtherBlocking = Array.from(this.pendingBlockingRequests.values()).some(
-        entry => entry.sessionId === externalId,
-      );
-      if (!hasOtherBlocking) {
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: externalId,
-          status: SessionStatus.READY,
-        } as unknown as PcEvent);
-      }
-      logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
+    registerPermissionExpiredHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      resolveCodexExternalSessionId: (id) => this.resolveCodexExternalSessionId(id),
+      sendToPhone: (event) => this.sendToPhone(event),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) => this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
+      clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
     });
 
-    this.hookServer.on('codex_session_start', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.READY;
-        tracked.lastActivity = Date.now();
-      }
-      if (this.initialDiscoveryDone) {
-        const cwd = request.cwd || tracked?.session.cwd || '';
-        const event: SessionStartedEvent = {
-          type: 'session_started',
-          session_id: sessionId,
-          request_id: sessionId,
-          working_directory: cwd,
-          project_name: tracked?.session.title ?? (cwd ? path.basename(cwd) : 'Codex'),
-          agent_type: 'codex',
-          agent_display_name: 'Codex',
-          agent_version: tracked?.session.cliVersion,
-          capabilities: this.getCodexCapabilities(sessionId),
-        };
-        this.sendToPhone(event);
-      }
-      logger.info('daemon', 'Codex SessionStart hook', { sessionId, source: request.source, pid: request.codexPid });
+    const messageSeqRef: MessageSeqRef = {
+      peek: () => this.messageSeq,
+      getAndIncrement: () => this.messageSeq++,
+    };
+
+    registerCodexSessionStartHandler(this.hookServer, {
+      codexObservers: this.codexObservers,
+      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+      sendToPhone: (event) => this.sendToPhone(event),
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      getCodexCapabilities: (id) => this.getCodexCapabilities(id),
     });
 
-    this.hookServer.on('codex_user_prompt_submit', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.RUNNING;
-        tracked.lastActivity = Date.now();
-      }
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: sessionId,
-        status: SessionStatus.RUNNING,
-      } as unknown as PcEvent);
+    registerCodexUserPromptSubmitHandler(this.hookServer, {
+      codexObservers: this.codexObservers,
+      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+      sendToPhone: (event) => this.sendToPhone(event),
     });
 
-    this.hookServer.on('codex_stop', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.READY;
-        tracked.lastActivity = Date.now();
-      }
-      this.codexStopHookDeduper.record(sessionId);
-      this.sendCodexCompletion(sessionId, tracked?.session);
+    registerCodexStopHandler(this.hookServer, {
+      codexObservers: this.codexObservers,
+      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+      sendToPhone: (event) => this.sendToPhone(event),
+      codexStopHookDeduper: this.codexStopHookDeduper,
+      sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
     });
 
-    this.hookServer.on('codex_permission_request', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const requestId = request.toolUseId ?? `codex_hook_${Date.now()}`;
-      const toolName = request.toolName ?? 'unknown';
-      const toolInput = request.toolInput ?? {};
-      const riskLevel = (RISK_CLASSIFICATION[toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-      const context = this.buildPermissionContext(toolName, toolInput);
-
-      let pcSignature: string;
-      try {
-        pcSignature = this.cryptoEngine.sign(JSON.stringify({
-          session_id: sessionId,
-          request_id: requestId,
-          tool_name: toolName,
-          seq: this.messageSeq,
-          timestamp: Date.now(),
-        }));
-      } catch {
-        pcSignature = '';
-      }
-
-      const event: PermissionRequestEvent = {
-        type: 'permission_request',
-        session_id: sessionId,
-        request_id: requestId,
-        tool_name: toolName,
-        tool_input: toolInput,
-        risk_level: riskLevel as unknown as RiskLevel,
-        context,
-        pc_signature: pcSignature,
-        seq: this.messageSeq++,
-        timestamp: new Date().toISOString() as unknown as number,
-        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        // Codex PermissionRequest hook payloads do not expose always-allow suggestions yet.
-        has_always_allow: false,
-      };
-
-      this.sendNotificationEventToPhone(event, 'permission_request', sessionId, requestId, {
-        type: 'permission_request',
-        session_name: this.getSessionName(sessionId),
-        body: truncateUtf8(`${toolName}: ${context}`, 256),
-        sound: 'default',
-        category: 'PERMISSION_REQUEST',
-        session_id: sessionId,
-        request_id: requestId,
-      });
-      this.trackBlockingRequest(requestId, sessionId, event, 'permission_request');
-      logger.debug('daemon', 'Forwarded Codex PermissionRequest', { tool: toolName, requestId, sessionId });
+    registerCodexPermissionRequestHandler(this.hookServer, {
+      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+      cryptoEngine: this.cryptoEngine,
+      messageSeq: messageSeqRef,
+      buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+      getSessionName: (id) => this.getSessionName(id),
+      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+      trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
     });
 
     registerApiSessionsHandler(this.hookServer, { sessionManager: this.sessionManager });
