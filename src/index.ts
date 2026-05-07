@@ -18,13 +18,12 @@ import { CodexDiscovery, codexExternalSessionId, findOpenCodexRollouts, isCodexS
 import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
-import type { CodexHookRequest, HookPermissionPrompt } from './hooks/hook-server.js';
+import type { CodexHookRequest } from './hooks/hook-server.js';
 import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
-import { readLastTurnSummary } from './utils/transcript-reader.js';
 import { truncateUtf8 } from './utils/truncate-utf8.js';
 import {
   readSessionMap,
@@ -119,6 +118,14 @@ import {
   registerCodexPermissionRequestHandler,
   type MessageSeqRef,
 } from './wiring/hook-handlers-codex.js';
+import {
+  registerSessionStopHandler,
+  registerSessionStopFailureHandler,
+  registerSessionEndHandler,
+  registerSessionStartHandler,
+  registerPermissionDismissedHandler,
+  registerPermissionPromptHandler,
+} from './wiring/hook-handlers-lifecycle.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -214,35 +221,8 @@ export interface DaemonConfig {
 // AgentPocketDaemon
 // ============================================================================
 
-/** Format seconds as a compact human-readable duration: "12s", "1m23s", "1h05m". */
-function formatDuration(totalSeconds: number): string {
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}h${String(minutes).padStart(2, '0')}m`;
-  }
-  return `${minutes}m${String(seconds).padStart(2, '0')}s`;
-}
-
-/** Format a token count compactly: "923 tok", "12.3k tok", "1.2M tok". */
-function formatTokens(total: number): string {
-  if (total < 1000) return `${total} tok`;
-  if (total < 1_000_000) return `${(total / 1000).toFixed(total < 10_000 ? 1 : 0)}k tok`;
-  return `${(total / 1_000_000).toFixed(1)}M tok`;
-}
-
-/** Build the Session Completed subtitle: "3 tools · 1m23s · 12.3k tok". */
-function formatCompletionSubtitle(summary: { toolUseCount: number; totalTokens: number; durationSec: number }): string | undefined {
-  const parts: string[] = [];
-  if (summary.toolUseCount > 0) {
-    parts.push(`${summary.toolUseCount} ${summary.toolUseCount === 1 ? 'tool' : 'tools'}`);
-  }
-  if (summary.durationSec >= 1) parts.push(formatDuration(summary.durationSec));
-  if (summary.totalTokens > 0) parts.push(formatTokens(summary.totalTokens));
-  return parts.length > 0 ? parts.join(' · ') : undefined;
-}
+// formatDuration / formatTokens / formatCompletionSubtitle live in
+// ./utils/completion-subtitle.ts (used only by hook-handlers-lifecycle now).
 
 // truncateUtf8 lives in ./utils/truncate-utf8.ts; imported below alongside the
 // other utils. Removing the duplicate local copy keeps a single source of
@@ -293,6 +273,12 @@ export class AgentPocketDaemon extends EventEmitter {
   private pendingSessionRequests: Map<string, string> = new Map();
   // Sequence counter for signed messages
   private messageSeq: number = 0;
+  // Read-then-increment view onto messageSeq, shared by every wiring module
+  // that needs to sign with the current value AND emit it as the wire seq.
+  private readonly messageSeqRef: MessageSeqRef = {
+    peek: () => this.messageSeq,
+    getAndIncrement: () => this.messageSeq++,
+  };
   // Per-session monotonic seq for session_output events (for phone gap detection)
   private sessionSeqCounters: Map<string, number> = new Map();
   // Last seq the phone has acked per session (best-effort telemetry)
@@ -1070,11 +1056,6 @@ export class AgentPocketDaemon extends EventEmitter {
       clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
     });
 
-    const messageSeqRef: MessageSeqRef = {
-      peek: () => this.messageSeq,
-      getAndIncrement: () => this.messageSeq++,
-    };
-
     registerCodexSessionStartHandler(this.hookServer, {
       codexObservers: this.codexObservers,
       recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
@@ -1100,7 +1081,7 @@ export class AgentPocketDaemon extends EventEmitter {
     registerCodexPermissionRequestHandler(this.hookServer, {
       recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
       cryptoEngine: this.cryptoEngine,
-      messageSeq: messageSeqRef,
+      messageSeq: this.messageSeqRef,
       buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
       getSessionName: (id) => this.getSessionName(id),
       sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
@@ -1114,198 +1095,34 @@ export class AgentPocketDaemon extends EventEmitter {
     });
 
     // Stop hook: Claude finished a turn — update session status to ready
-    this.hookServer.on('session_stop', async (claudeSessionId: string, transcriptPath?: string) => {
-      const firedAt = Date.now();
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      const projectName = session?.customTitle ?? (session ? path.basename(session.workingDirectory) : 'Session');
-
-      logger.info('daemon', 'Stop hook fired', {
-        sessionId: externalId,
-        claudeSessionId: claudeSessionId?.substring(0, 8),
-        internalSessionId: session?.sessionId,
-        hasTranscriptPath: !!transcriptPath,
-        firedAt,
-      });
-
-      // Claude finished this turn — any pending blocking requests we were still
-      // tracking for this session are stale (resolved, expired, or interrupted).
-      // Drop them so retryPendingBlockingRequests / list refresh don't resurface
-      // them as "Need action".
-      let cleared = 0;
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, reqId);
-          cleared++;
-        }
-      }
-      if (cleared > 0) {
-        logger.info('daemon', `Stop hook cleared ${cleared} stale pending blocking request(s)`, { sessionId: externalId });
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      const event: Record<string, unknown> = {
-        type: 'session_status',
-        session_id: externalId,
-        status: 'ready',
-      };
-
-      // Read the end-of-turn summary from the JSONL transcript. This is the
-      // sole source of truth for completion text + per-turn metrics; if the
-      // transcript doesn't yield an end_turn line we send an empty body and
-      // no subtitle metrics.
-      let completionBody = '';
-      let subtitle: string | undefined;
-      if (transcriptPath) {
-        try {
-          const summary = await readLastTurnSummary(transcriptPath);
-          if (summary) {
-            completionBody = summary.text;
-            subtitle = formatCompletionSubtitle(summary);
-            logger.debug('daemon', 'readLastTurnSummary ok', {
-              sessionId: externalId,
-              textLen: summary.text.length,
-              tokens: summary.totalTokens,
-              tools: summary.toolUseCount,
-              durSec: summary.durationSec,
-            });
-          } else {
-            logger.warn('daemon', 'readLastTurnSummary returned null', {
-              sessionId: externalId,
-              transcriptPath,
-              firedAt,
-            });
-          }
-        } catch (err) {
-          logger.warn('daemon', 'readLastTurnSummary threw', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      } else {
-        logger.warn('daemon', 'Stop hook has no transcriptPath', { sessionId: externalId });
-      }
-
-      // Attach completion details so iOS can render the same body/subtitle
-      // in the local notification when the app is foreground/background but
-      // the relevant chat isn't on screen. is_completion marks this as the
-      // authoritative end-of-turn event (vs. the observer path which can fire
-      // a status=ready transition without any completion data).
-      const completionRequestId = this.nextCompletionRequestId(externalId, firedAt);
-      event.is_completion = true;
-      event.completion_request_id = completionRequestId;
-      event.completion_body = completionBody;
-      if (subtitle) event.completion_subtitle = subtitle;
-
-      this.sendNotificationEventToPhone(event as unknown as PcEvent, 'session_completed', externalId, completionRequestId, {
-        type: 'session_completed',
-        session_name: projectName,
-        body: truncateUtf8(completionBody.trim() || 'Session finished', 256),
-        subtitle,
-        sound: 'completion.caf',
-        category: 'SESSION_COMPLETED',
-        session_id: externalId,
-        request_id: completionRequestId,
-      });
-
-      // Also append a chat-side metrics chip (rendered as a system message)
-      // so the user can see this turn's cost retrospectively, even on the
-      // active session where the push notification is suppressed. We delay
-      // this slightly so the SDK-stream path has time to flush the final
-      // assistant_message to the phone first — otherwise the metrics chip
-      // appears above the message it's summarizing.
-      if (subtitle && this.phonePreferences.showCompletionMetrics) {
-        setTimeout(() => {
-          this.sendToPhone({
-            type: 'session_output',
-            session_id: externalId,
-            output_type: 'completion_metrics',
-            content: subtitle,
-            timestamp: Date.now(),
-          } as unknown as PcEvent);
-        }, 500);
-      }
+    registerSessionStopHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
+      nextCompletionRequestId: (sId, ts) => this.nextCompletionRequestId(sId, ts),
+      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+      sendToPhone: (event) => this.sendToPhone(event),
+      prefs: this.phonePreferences,
     });
 
     // StopFailure hook: Claude's turn ended via API error. Same cleanup as
     // Stop, but log the error and skip the "Session Complete" notification.
-    this.hookServer.on('session_stop_failure', (claudeSessionId: string, error: string) => {
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      logger.warn('daemon', 'StopFailure hook', { sessionId: externalId, error });
-
-      let cleared = 0;
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          cleared++;
-        }
-      }
-      if (cleared > 0) {
-        logger.info('daemon', `StopFailure cleared ${cleared} stale pending blocking request(s)`, { sessionId: externalId });
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: externalId,
-        status: SessionStatus.READY,
-      } as unknown as PcEvent);
+    registerSessionStopFailureHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendToPhone: (event) => this.sendToPhone(event),
     });
 
     // SessionEnd hook: fired when /clear runs (with the OLD session ID)
-    this.hookServer.on('session_end', (claudeSessionId: string, reason: string, cwd: string, _transcriptPath: string) => {
-      logger.info('daemon', 'SessionEnd hook', { claudeSessionId, reason });
-
-      if (reason !== 'clear') return;
-
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      if (!session) {
-        logger.debug('daemon', `SessionEnd(clear): session ${claudeSessionId} not found, ignoring`);
-        return;
-      }
-
-      const oldInternalId = session.sessionId;
-      const externalId = this.resolveExternalSessionId(oldInternalId);
-
-      // Store terminal info for the upcoming SessionStart
-      if (session.terminalPid) {
-        this.pendingClearInfo.set(cwd, {
-          pid: session.terminalPid,
-          cwd: session.workingDirectory,
-          target: session.terminalTarget,
-          entrypoint: session.entrypoint,
-        });
-        // Auto-clean after 30s in case SessionStart never arrives
-        setTimeout(() => this.pendingClearInfo.delete(cwd), 30_000);
-      }
-
-      // Notify phone that old session ended
-      const endEvent: SessionEndedEvent = {
-        type: 'session_ended',
-        session_id: externalId,
-        exit_code: 0,
-        end_reason: 'completed',
-      };
-      this.sendToPhone(endEvent);
-
-      // Clean up old session
-      this.sessionManager.markObservedSessionHistory(oldInternalId);
-      this.sessionIdMap.delete(oldInternalId);
-      this.sessionManager.removeSession(oldInternalId);
-      this.replacedSessionIds.add(claudeSessionId);
-
-      logger.debug('daemon', `SessionEnd(clear): ended old session ${externalId}, awaiting SessionStart`);
+    registerSessionEndHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      pendingClearInfo: this.pendingClearInfo,
+      sessionIdMap: this.sessionIdMap,
+      replacedSessionIds: this.replacedSessionIds,
+      sendToPhone: (event) => this.sendToPhone(event),
     });
 
     // SubagentStop hook: fired when a Task-dispatched subagent finishes.
@@ -1315,104 +1132,24 @@ export class AgentPocketDaemon extends EventEmitter {
     registerSubagentStartHandler(this.hookServer, { sessionManager: this.sessionManager });
 
     // SessionStart hook: fired after /clear with the NEW session ID
-    this.hookServer.on('session_start', (claudeSessionId: string, source: string, cwd: string, transcriptPath: string) => {
-      logger.info('daemon', 'SessionStart hook', { claudeSessionId, source });
-
-      if (source !== 'clear') return;
-
-      // Already tracked? Skip.
-      if (this.sessionManager.findByClaudeSessionId(claudeSessionId)) return;
-
-      // Look up the terminal info from the preceding SessionEnd
-      let clearInfo = this.pendingClearInfo.get(cwd);
-      if (clearInfo) {
-        this.pendingClearInfo.delete(cwd);
-      } else {
-        // SessionEnd may not have fired yet, or daemon restarted.
-        // Use session-map.json to find the PID, then look up terminal info
-        // from the currently observed session for that PID.
-        const mapped = readSessionMap();
-        const mapEntry = mapped[claudeSessionId];
-        if (mapEntry?.pid) {
-          const existing = this.sessionManager.findByTerminalPid(mapEntry.pid);
-          if (existing) {
-            clearInfo = {
-              pid: mapEntry.pid,
-              cwd: existing.workingDirectory,
-              target: existing.terminalTarget,
-              entrypoint: existing.entrypoint,
-            };
-            // Clean up the old session
-            const oldInternalId = existing.sessionId;
-            const oldClaudeId = existing.claudeSessionId;
-            const externalId = this.resolveExternalSessionId(oldInternalId);
-            const endEvent: SessionEndedEvent = {
-              type: 'session_ended',
-              session_id: externalId,
-              exit_code: 0,
-              end_reason: 'completed',
-            };
-            this.sendToPhone(endEvent);
-            this.sessionManager.markObservedSessionHistory(oldInternalId);
-            this.sessionIdMap.delete(oldInternalId);
-            this.sessionManager.removeSession(oldInternalId);
-            if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-            logger.info('daemon', 'SessionStart(clear): replaced old session via session-map PID', { oldClaudeId, newClaudeId: claudeSessionId, pid: mapEntry.pid });
-          }
-        }
-      }
-
-      if (!clearInfo) {
-        logger.debug('daemon', `SessionStart(clear): no pending clear info for cwd=${cwd}, will be picked up by polling`);
-        return;
-      }
-
-      // Derive the JSONL path from transcript_path, or use the session ID
-      const jsonlPath = transcriptPath || path.join(path.dirname(cwd), `${claudeSessionId}.jsonl`);
-
-      // Start observing the new session
-      const newInternalId = this.sessionManager.observeSession(
-        claudeSessionId,
-        jsonlPath,
-        clearInfo.cwd,
-        clearInfo.pid,
-        undefined,
-        clearInfo.target,
-        clearInfo.entrypoint,
-      );
-      this.sessionIdMap.set(newInternalId, claudeSessionId);
-
-      if (this.initialDiscoveryDone) {
-        this.sendSessionHistory(claudeSessionId);
-      }
-
-      logger.debug('daemon', `SessionStart(clear): now observing ${claudeSessionId} (PID ${clearInfo.pid})`);
+    registerSessionStartHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      pendingClearInfo: this.pendingClearInfo,
+      sessionIdMap: this.sessionIdMap,
+      replacedSessionIds: this.replacedSessionIds,
+      sendToPhone: (event) => this.sendToPhone(event),
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      sendSessionHistory: (id) => this.sendSessionHistory(id),
     });
 
     // When a PermissionRequest hook connection closes (terminal won the race),
     // tell the phone to dismiss the permission request.
-    this.hookServer.on('permission_dismissed', (toolUseId: string, toolName: string, claudeSessionId: string, toolResponse?: unknown) => {
-      logger.trace('daemon', 'permission_dismissed event', { toolName, toolUseId });
-      this.untrackBlockingRequest(toolUseId);
-
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      const event: Record<string, unknown> = {
-        type: 'permission_dismissed',
-        request_id: toolUseId,
-        tool_name: toolName,
-        session_id: externalId,
-      };
-      // For AskUserQuestion, include the answers so the phone can show what was chosen
-      if (toolName === 'AskUserQuestion' && toolResponse) {
-        const resp = toolResponse as Record<string, unknown>;
-        event.answers = resp.answers ?? resp;
-      }
-      this.sendToPhone(event as unknown as PcEvent);
-      logger.debug('daemon', `Sent permission_dismissed for ${toolName} (${toolUseId})`);
+    registerPermissionDismissedHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      untrackBlockingRequest: (id) => this.untrackBlockingRequest(id),
+      sendToPhone: (event) => this.sendToPhone(event),
     });
   }
 
@@ -1421,97 +1158,16 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wirePermissionPromptEvents(): void {
-    // PermissionRequest hook: fires only when Claude's own permission system decides
-    // it needs user approval. We forward these to the phone.
-    this.hookServer.on('permission_prompt', (request: HookPermissionPrompt) => {
-      const session = this.sessionManager.findByClaudeSessionId(request.sessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : request.sessionId;
-
-      // ExitPlanMode: send plan to phone for review (same pattern as AskUserQuestion).
-      // sendPlanForReview tracks the blocking request itself (with plan_content)
-      // so the reconnect replay carries the plan body.
-      if (request.toolName === 'ExitPlanMode') {
-        this.sendPlanForReview(externalId, request.toolUseId, request.toolInput, request.cwd);
-        logger.debug('daemon', `ExitPlanMode PermissionRequest: sent plan to phone for review (${request.toolUseId})`);
-        return; // hook stays pending until phone responds
-      }
-
-      // AskUserQuestion: forward as interactive question to the phone.
-      // The terminal also shows the question (PreToolUse passed through).
-      // Whichever answers first wins the race.
-      if (request.toolName === 'AskUserQuestion') {
-        const hookQuestions = (request.toolInput.questions as Array<{ question?: string }>) ?? [];
-        const hookQuestionPreview = hookQuestions[0]?.question ?? 'Claude has a question';
-        const flat: Record<string, unknown> = {
-          type: 'session_output',
-          session_id: externalId,
-          output_type: 'user_question',
-          request_id: request.toolUseId,
-          tool_input: request.toolInput,
-          timestamp: new Date().toISOString(),
-          ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        };
-        this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, request.toolUseId, {
-          type: 'user_question',
-          session_name: this.getSessionName(externalId),
-          body: truncateUtf8(hookQuestionPreview, 256),
-          sound: 'default',
-          category: 'USER_QUESTION',
-          session_id: externalId,
-          request_id: request.toolUseId,
-        });
-        this.trackBlockingRequest(request.toolUseId, externalId, flat as unknown as PcEvent, 'user_question');
-        logger.debug('daemon', `AskUserQuestion PermissionRequest: forwarded to phone (${request.toolUseId})`);
-        return; // hook stays pending until phone or terminal answers
-      }
-
-      // All other tools: Claude decided this needs user approval. Forward to phone.
-      const riskLevel = (RISK_CLASSIFICATION[request.toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-      const context = this.buildPermissionContext(request.toolName, request.toolInput);
-
-      const signaturePayload = JSON.stringify({
-        session_id: externalId,
-        request_id: request.toolUseId,
-        tool_name: request.toolName,
-        seq: this.messageSeq,
-        timestamp: Date.now(),
-      });
-
-      let pcSignature: string;
-      try {
-        pcSignature = this.cryptoEngine.sign(signaturePayload);
-      } catch {
-        pcSignature = '';
-      }
-
-      const event: PermissionRequestEvent = {
-        type: 'permission_request',
-        session_id: externalId,
-        request_id: request.toolUseId,
-        tool_name: request.toolName,
-        tool_input: request.toolInput,
-        risk_level: riskLevel as unknown as RiskLevel,
-        context,
-        pc_signature: pcSignature,
-        seq: this.messageSeq++,
-        timestamp: new Date().toISOString() as unknown as number,
-        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        has_always_allow: Array.isArray(request.permissionSuggestions) && request.permissionSuggestions.length > 0,
-      };
-
-      this.sendNotificationEventToPhone(event, 'permission_request', externalId, request.toolUseId, {
-        type: 'permission_request',
-        session_name: this.getSessionName(externalId),
-        body: truncateUtf8(`${request.toolName}: ${context}`, 256),
-        sound: 'default',
-        category: 'PERMISSION_REQUEST',
-        session_id: externalId,
-        request_id: request.toolUseId,
-      });
-      this.trackBlockingRequest(request.toolUseId, externalId, event, 'permission_request');
-      logger.debug('daemon', 'Forwarded PermissionRequest', { tool: request.toolName, toolUseId: request.toolUseId, sessionId: request.sessionId });
+    registerPermissionPromptHandler(this.hookServer, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      sendPlanForReview: (sId, rId, ti, cwd) => this.sendPlanForReview(sId, rId, ti, cwd),
+      buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+      getSessionName: (id) => this.getSessionName(id),
+      cryptoEngine: this.cryptoEngine,
+      messageSeq: this.messageSeqRef,
+      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+      trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
     });
   }
 
