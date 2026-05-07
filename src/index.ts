@@ -126,6 +126,18 @@ import {
   registerPermissionDismissedHandler,
   registerPermissionPromptHandler,
 } from './wiring/hook-handlers-lifecycle.js';
+import {
+  registerSessionStartedHandler,
+  registerPermissionModeChangedHandler,
+  registerSessionOutputHandler,
+  registerSessionEndedHandler,
+  registerPermissionRequestHandler,
+  registerSessionErrorHandler,
+  registerSessionStatusHandler,
+  registerPendingActionDetectedHandler,
+  registerSessionTitleHandler,
+  registerSessionInterruptedHandler,
+} from './wiring/session-manager-handlers.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -154,10 +166,8 @@ import type {
   SyncRequestCommand,
   NotificationDeliveryAckCommand,
   PcEvent,
-  SessionStartedEvent,
   SessionOutputEvent,
   SessionEndedEvent,
-  PermissionRequestEvent,
   SessionListEvent,
   FileContentEvent,
   ErrorEvent,
@@ -170,9 +180,6 @@ import type {
   WakeBlobPayload,
 } from 'agent-pocket-protocol';
 import {
-  RISK_CLASSIFICATION,
-  RiskLevel,
-  PermissionDecision,
   HOOK_HOLD_TIMEOUT_SECONDS,
   DAEMON_DEFAULT_PORT,
   SessionStatus,
@@ -501,339 +508,90 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireSessionManagerEvents(): void {
-    this.sessionManager.on('session_started', (sessionId: string, workingDirectory: string, customTitle?: string) => {
-      // During initial discovery, suppress individual session events.
-      // The phone will get the full picture from the list_sessions response.
-      if (!this.initialDiscoveryDone) return;
+    const resolveExternalSessionId = (id: string) => this.resolveExternalSessionId(id);
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
+    const sendNotificationEventToPhone = (
+      event: PcEvent,
+      eventType: NotificationDeliveryEventType,
+      sessionId: string,
+      requestId: string,
+      wakePayload: Record<string, unknown>,
+    ) => this.sendNotificationEventToPhone(event, eventType, sessionId, requestId, wakePayload as unknown as WakeBlobPayload);
+    const sendFlattenedSessionOutput = (sessionId: string, e: ClaudeEvent, agentType: AgentType) =>
+      this.sendFlattenedSessionOutput(sessionId, e, agentType);
+    const isInitialDiscoveryDone = () => this.initialDiscoveryDone;
 
-      const requestId = this.findRequestIdForSession(sessionId);
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const state = this.sessionManager.getSession(sessionId);
-
-      const event: SessionStartedEvent = {
-        type: 'session_started',
-        session_id: externalId,
-        request_id: requestId ?? externalId,
-        working_directory: workingDirectory,
-        project_name: customTitle ?? path.basename(workingDirectory),
-        agent_type: 'claude_code',
-        agent_display_name: 'Claude Code',
-        agent_version: this.claudeAgentVersion,
-        capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-        is_observed: state?.isObserved ?? true,
-        ...(state && !state.isObserved
-          ? {
-              permission_mode: state.permissionMode ?? 'default',
-              dangerously_skip_permissions: state.config?.dangerously_skip_permissions === true,
-            }
-          : {}),
-      };
-
-      this.sendToPhone(event);
+    registerSessionStartedHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      findRequestIdForSession: (id) => this.findRequestIdForSession(id),
+      getClaudeAgentVersion: () => this.claudeAgentVersion,
+      isInitialDiscoveryDone,
+      sendToPhone,
     });
 
-    this.sessionManager.on('permission_mode_changed', (sessionId: string, mode) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      this.sendToPhone({
-        type: 'session_permission_mode_changed',
-        session_id: externalId,
-        mode,
-      });
+    registerPermissionModeChangedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
     });
 
-    this.sessionManager.on('session_output', (sessionId: string, claudeEvent: ClaudeEvent) => {
-      // Skip tool_use and tool_result events when phone has disabled tool use messages.
-      // When skipping tool_use, send an empty is_complete=true assistant_message to
-      // finalize the current streaming bubble, so the next text chunk starts a new bubble.
-      if (!this.phonePreferences.showToolUse &&
-          (claudeEvent.type === 'tool_use' || claudeEvent.type === 'tool_result')) {
-        if (claudeEvent.type === 'tool_use') {
-          const externalId = this.resolveExternalSessionId(sessionId);
-          this.sendToPhone({
-            type: 'session_output',
-            session_id: externalId,
-            timestamp: Date.now(),
-            output_type: 'assistant_message',
-            content: '',
-            is_complete: true,
-          } as unknown as PcEvent);
-        }
-        return;
-      }
-
-      this.sendFlattenedSessionOutput(this.resolveExternalSessionId(sessionId), claudeEvent, 'claude_code');
+    registerSessionOutputHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
+      sendFlattenedSessionOutput,
+      prefs: this.phonePreferences,
     });
 
-    this.sessionManager.on('session_ended', (sessionId: string, exitCode: number) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const errorRequestId = exitCode !== 0 ? `session_error_${externalId}_${Date.now()}` : undefined;
-      const event: SessionEndedEvent = {
-        type: 'session_ended',
-        session_id: externalId,
-        exit_code: exitCode,
-        end_reason: exitCode === 0 ? 'completed' : 'error',
-        ...(errorRequestId ? { request_id: errorRequestId } : {}),
-      };
-
-      if (exitCode !== 0) {
-        const sessionName = this.getSessionName(externalId);
-        this.sendNotificationEventToPhone(event, 'session_error', externalId, errorRequestId!, {
-          type: 'session_error',
-          session_name: sessionName,
-          body: `Session exited with code ${exitCode}`,
-          subtitle: sessionName,
-          sound: 'default',
-          category: 'SESSION_ERROR',
-          session_id: externalId,
-          request_id: errorRequestId,
-        });
-      } else {
-        this.sendToPhone(event);
-      }
-
-      // Clean up mappings
-      this.sessionIdMap.delete(sessionId);
-
-      // Clean up any pending blocking requests for this session
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-        }
-      }
-      if (exitCode === 0) {
-        this.clearNotificationDeliveriesForSession(externalId);
-      }
+    registerSessionEndedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      getSessionName: (id) => this.getSessionName(id),
+      sendToPhone,
+      sendNotificationEventToPhone,
+      sessionIdMap: this.sessionIdMap,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      clearNotificationDeliveriesForSession: (id) => this.clearNotificationDeliveriesForSession(id),
     });
 
-    this.sessionManager.on(
-      'permission_request',
-      (sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>) => {
-        const externalId = this.resolveExternalSessionId(sessionId);
-
-        // AskUserQuestion: forward as interactive question, don't auto-approve.
-        if (toolName === 'AskUserQuestion') {
-          const questions = (toolInput.questions as Array<{ question?: string }>) ?? [];
-          const questionPreview = questions[0]?.question ?? 'Claude has a question';
-          const flat: Record<string, unknown> = {
-            type: 'session_output',
-            session_id: externalId,
-            output_type: 'user_question',
-            request_id: requestId,
-            tool_input: toolInput,
-            timestamp: new Date().toISOString(),
-            ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-          };
-          this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, requestId, {
-            type: 'user_question',
-            session_name: this.getSessionName(externalId),
-            body: truncateUtf8(questionPreview, 256),
-            sound: 'default',
-            category: 'USER_QUESTION',
-            session_id: externalId,
-            request_id: requestId,
-          });
-          this.trackBlockingRequest(requestId, externalId, flat as unknown as PcEvent, 'user_question');
-          logger.debug('daemon', `Forwarded SDK AskUserQuestion as user_question for session ${externalId}`);
-          return;
-        }
-
-        // Plan mode: auto-approve EnterPlanMode and plan file edits.
-        // ExitPlanMode: send plan for phone review.
-        if (this.isPlanModeTool(toolName, toolInput)) {
-          if (toolName === 'ExitPlanMode') {
-            const session = this.sessionManager.getSession(sessionId);
-            const cwd = session?.workingDirectory ?? '';
-            this.sendPlanForReview(externalId, requestId, toolInput, cwd);
-            logger.debug('daemon', `SDK ExitPlanMode: sent plan to phone for review (${requestId})`);
-            return;
-          }
-          this.sessionManager.respondPermission(sessionId, requestId, PermissionDecision.APPROVE);
-          logger.debug('daemon', `SDK auto-approved plan mode tool: ${toolName} (${requestId})`);
-          return;
-        }
-
-        // SDK sessions: the SDK itself decides when to fire permission_request,
-        // so forward all other tools to the phone for approval.
-        const riskLevel = (RISK_CLASSIFICATION[toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-        const context = this.buildPermissionContext(toolName, toolInput);
-
-        // Sign the permission request
-        const signaturePayload = JSON.stringify({
-          session_id: sessionId,
-          request_id: requestId,
-          tool_name: toolName,
-          seq: this.messageSeq,
-          timestamp: Date.now(),
-        });
-
-        let pcSignature: string;
-        try {
-          pcSignature = this.cryptoEngine.sign(signaturePayload);
-        } catch {
-          pcSignature = '';
-        }
-
-        const event: PermissionRequestEvent = {
-          type: 'permission_request',
-          session_id: externalId,
-          request_id: requestId,
-          tool_name: toolName,
-          tool_input: toolInput,
-          risk_level: riskLevel as unknown as RiskLevel,
-          context,
-          pc_signature: pcSignature,
-          seq: this.messageSeq++,
-          timestamp: new Date().toISOString() as unknown as number,
-          ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        };
-
-        this.sendToPhone(event);
-        this.trackBlockingRequest(requestId, externalId, event, 'permission_request');
-      },
-    );
-
-    this.sessionManager.on('error', (sessionId: string, error: Error) => {
-      const event: ErrorEvent = {
-        type: 'error',
-        message: `Session ${sessionId}: ${error.message}`,
-        code: 'SESSION_ERROR',
-      };
-
-      this.sendToPhone(event);
+    registerPermissionRequestHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      isPlanModeTool: (name, input) => this.isPlanModeTool(name, input),
+      sendPlanForReview: (sId, rId, input, cwd) => this.sendPlanForReview(sId, rId, input, cwd),
+      buildPermissionContext: (name, input) => this.buildPermissionContext(name, input),
+      getSessionName: (id) => this.getSessionName(id),
+      cryptoEngine: this.cryptoEngine,
+      messageSeq: this.messageSeqRef,
+      sendToPhone,
+      sendNotificationEventToPhone,
+      trackBlockingRequest: (rId, sId, event, type) => this.trackBlockingRequest(rId, sId, event, type),
     });
 
-    this.sessionManager.on('session_status', (sessionId: string, status: SessionStatus) => {
-      if (!this.initialDiscoveryDone) return;
+    registerSessionErrorHandler(this.sessionManager, { sendToPhone });
 
-      const externalId = this.resolveExternalSessionId(sessionId);
-
-      // If observer reports running/ready and we only have startup-synthetic pending
-      // entries for this session, clean them up — the terminal user resolved it.
-      if (status === SessionStatus.RUNNING || status === SessionStatus.READY) {
-        const syntheticId = `startup_pending_${externalId}`;
-        if (this.pendingBlockingRequests.has(syntheticId)) {
-          this.pendingBlockingRequests.delete(syntheticId);
-          // Also clear pending_actions in session-manager so handleListSessions picks it up
-          const session = this.sessionManager.getAllSessions().find(
-            s => this.resolveExternalSessionId(s.sessionId) === externalId
-              || s.claudeSessionId === externalId,
-          );
-          if (session) {
-            this.sessionManager.clearPendingActions(session.sessionId);
-          }
-          logger.debug('daemon', `Cleaned up startup synthetic pending for session ${externalId.slice(0, 8)} (observer=${status})`);
-        }
-      }
-
-      // If session has pending blocking requests, keep showing pending_actions
-      // regardless of what the observer reports (observer doesn't know about hooks).
-      const hasPending = Array.from(this.pendingBlockingRequests.values()).some(
-        e => e.sessionId === externalId,
-      );
-      const effectiveStatus = hasPending ? SessionStatus.PENDING_ACTIONS : status;
-
-      logger.debug('daemon', `session_status: observer=${status} effective=${effectiveStatus}`, { sessionId: externalId, hasPending, pendingCount: this.pendingBlockingRequests.size });
-
-      const event: Record<string, unknown> = {
-        type: 'session_status',
-        session_id: externalId,
-        status: effectiveStatus,
-      };
-
-      // Include action_type when in pending_actions state
-      if (hasPending) {
-        const pendingEntry = Array.from(this.pendingBlockingRequests.values()).find(
-          e => e.sessionId === externalId,
-        );
-        if (pendingEntry) {
-          event.action_type = pendingEntry.type;
-        }
-      }
-
-      this.sendToPhone(event as unknown as PcEvent);
+    registerSessionStatusHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      isInitialDiscoveryDone,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendToPhone,
     });
 
-    // Session detected as pending user action on startup (JSONL analysis)
-    this.sessionManager.on('pending_action_detected', (sessionId: string, toolName?: string) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const syntheticId = `startup_pending_${externalId}`;
-
-      // Map tool name to action type
-      let actionType: 'permission_request' | 'user_question' | 'plan_review' = 'permission_request';
-      if (toolName === 'AskUserQuestion') actionType = 'user_question';
-      else if (toolName === 'ExitPlanMode') actionType = 'plan_review';
-
-      // Create a synthetic blocking request so session stays in pending_actions
-      // until the user acts (observer status_change won't override it).
-      // Mark as expiredToTerminal so retryPendingBlockingRequests doesn't clean it up.
-      const entry: any = {
-        requestId: syntheticId,
-        sessionId: externalId,
-        event: { type: 'session_status', session_id: externalId, status: SessionStatus.PENDING_ACTIONS } as unknown as PcEvent,
-        sentAt: Date.now(),
-        type: actionType,
-        toolName,
-        expiredToTerminal: true,
-      };
-      this.pendingBlockingRequests.set(syntheticId, entry);
-      logger.info('daemon', `Startup pending action detected for session ${externalId.slice(0, 8)}, tool=${toolName}`);
+    registerPendingActionDetectedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      pendingBlockingRequests: this.pendingBlockingRequests,
     });
 
-    this.sessionManager.on('session_title', (sessionId: string, title: string) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const event = {
-        type: 'session_title',
-        session_id: externalId,
-        title,
-      };
-      this.sendToPhone(event as unknown as PcEvent);
+    registerSessionTitleHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
     });
 
-    // Terminal user pressed Esc/Ctrl+C — observer detected synthetic interrupt
-    // message in JSONL. Clean up any pending blocking requests for this session
-    // (the held hook HTTP connection may already be gone, but we also clear
-    // the daemon-side retry tracking) and tell the phone the session is ready.
-    this.sessionManager.on('session_interrupted', (sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer') => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const session = this.sessionManager.getAllSessions().find(s => s.sessionId === sessionId);
-
-      logger.info('daemon', `session_interrupted (${reason}, ${source}) for ${externalId.slice(0, 8)}`);
-
-      // Drop every pending blocking request targeting this session, and tell
-      // the phone to remove the corresponding card so it doesn't keep ticking.
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          const ev = entry.event as any;
-          const toolName = ev?.tool_name ?? '';
-          this.sendToPhone({
-            type: 'permission_dismissed',
-            request_id: reqId,
-            tool_name: toolName,
-            session_id: externalId,
-            cancelled: true,
-          } as unknown as PcEvent);
-        }
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      // SDK-driven interrupt has no JSONL trail, so emit a synthetic system
-      // message so the phone shows visible feedback. Observer-mode interrupts
-      // already surface via the JSONL synthetic interrupt entry.
-      if (source === 'sdk') {
-        this.sendFlattenedSessionOutput(externalId, {
-          type: 'system_message',
-          message: 'Session interrupted by user',
-        }, 'claude_code');
-      }
-
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: externalId,
-        status: SessionStatus.READY,
-      } as unknown as PcEvent);
+    registerSessionInterruptedHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendToPhone,
+      sendFlattenedSessionOutput,
     });
   }
 
