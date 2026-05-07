@@ -44,7 +44,6 @@ import {
 } from './codex/codex-handler.js';
 import {
   PeerCapabilities,
-  NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS,
   NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS,
   type NotificationDeliveryEventType,
 } from './relay/phone-transport.js';
@@ -79,7 +78,6 @@ import {
   handleSessionOutputAck as handleSessionOutputAckExternal,
   handleNotificationDeliveryAck as handleNotificationDeliveryAckExternal,
   handleVerifyHistory as handleVerifyHistoryExternal,
-  notificationDeliveryKey as buildNotificationDeliveryKey,
   type VerifyHistoryDeps,
 } from './commands/handlers/acks.js';
 import {
@@ -148,6 +146,12 @@ import {
   registerPhoneOnlineHandler,
   registerKeyVerifyHandler,
 } from './wiring/transport-handlers.js';
+import {
+  createNotificationBookkeeping,
+  type NotificationBookkeeping,
+  type PendingBlockingRequestEntry,
+  type PendingNotificationDeliveryEntry,
+} from './wiring/notification-bookkeeping.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -176,7 +180,6 @@ import type {
   SyncRequestCommand,
   NotificationDeliveryAckCommand,
   PcEvent,
-  SessionOutputEvent,
   SessionEndedEvent,
   SessionListEvent,
   FileContentEvent,
@@ -197,7 +200,6 @@ import {
   WIRE_VERSION_CURRENT,
   CURRENT_PEER_CAPABILITIES,
   PEER_CAPABILITIES,
-  BLOCKING_RETRY_INTERVAL_MS,
   BLOCKING_RETRY_CHECK_INTERVAL_MS,
 } from 'agent-pocket-protocol';
 import { VERSION } from './version.js';
@@ -331,6 +333,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
   private notificationDeliveryRetryInterval: ReturnType<typeof setInterval> | null = null;
+  private bookkeeping!: NotificationBookkeeping;
 
   constructor(config: DaemonConfig) {
     super();
@@ -387,6 +390,20 @@ export class AgentPocketDaemon extends EventEmitter {
     this.codexDiscovery = new CodexDiscovery();
     this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
+
+    this.bookkeeping = createNotificationBookkeeping({
+      sessionSeqCounters: this.sessionSeqCounters,
+      pendingBlockingRequests: this.pendingBlockingRequests as unknown as Map<string, PendingBlockingRequestEntry>,
+      pendingNotificationDeliveries: this.pendingNotificationDeliveries as unknown as Map<string, PendingNotificationDeliveryEntry>,
+      getConnectionMode: () => this.config.connectionMode,
+      getLanServer: () => this.lanServer ?? null,
+      getRelayClient: () => this.relayClient ?? null,
+      cryptoEngine: this.cryptoEngine,
+      hasPeerCapability: (name) => this.hasPeerCapability(name),
+      sessionManager: this.sessionManager,
+      hookServer: this.hookServer,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+    });
   }
 
   /**
@@ -1672,34 +1689,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private sendToPhone(event: PcEvent, wake = false, wakePayload?: WakeBlobPayload, forceWake = false): void {
-    // Stamp per-session monotonic seq on session_output events so the phone
-    // can detect gaps and request fill via get_history{since_seq}.
-    if ((event as { type?: string })?.type === 'session_output') {
-      const out = event as SessionOutputEvent;
-      if (out.session_id && out.session_seq === undefined) {
-        const next = (this.sessionSeqCounters.get(out.session_id) ?? 0) + 1;
-        this.sessionSeqCounters.set(out.session_id, next);
-        out.session_seq = next;
-      }
-    }
-
-    logger.trace('daemon', 'OUT event', { type: (event as { type?: string })?.type, requestId: (event as { request_id?: string })?.request_id, preview: JSON.stringify(event).slice(0, 100) });
-    if ((event as { type?: string })?.type === 'session_list') {
-      const sl = event as unknown as { sessions: Array<{ session_id: string; project_name?: string; status?: string }> };
-      logger.info('daemon', `[debug] session_list -> phone: ${sl.sessions.length} sessions: ${sl.sessions.map(s => `${s.session_id.slice(0,12)}(${s.project_name ?? '?'},${s.status ?? '?'})`).join(' | ')}`);
-    }
-
-    const mode = this.config.connectionMode ?? 'relay';
-
-    if (mode === 'lan' && this.lanServer) {
-      this.lanServer.send(event);
-    } else if (this.relayClient) {
-      // Check for rekey before sending
-      if (this.cryptoEngine.needsRekey()) {
-        this.cryptoEngine.resetRekeyCounters();
-      }
-      this.relayClient.send(event, wake, wakePayload, forceWake);
-    }
+    this.bookkeeping.sendToPhone(event, wake, wakePayload, forceWake);
   }
 
   private sendNotificationEventToPhone(
@@ -1709,14 +1699,7 @@ export class AgentPocketDaemon extends EventEmitter {
     requestId: string,
     wakePayload: WakeBlobPayload,
   ): void {
-    const phoneOnline = this.relayClient?.getPhonePeerOnline() === true;
-    logger.debug('daemon', 'notification emit', { eventType, sessionId, requestId, phoneOnline });
-    this.sendToPhone(event, true, wakePayload);
-    // Only track for ack-fallback when phone was online at emit time. If phone
-    // was offline, the relay already routed to APNs — no second push needed.
-    if (phoneOnline) {
-      this.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
-    }
+    this.bookkeeping.sendNotificationEventToPhone(event, eventType, sessionId, requestId, wakePayload);
   }
 
   private trackNotificationDelivery(
@@ -1726,22 +1709,11 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     wakePayload: WakeBlobPayload,
   ): void {
-    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
-    const key = this.notificationDeliveryKey(eventType, sessionId, requestId);
-    this.pendingNotificationDeliveries.set(key, {
-      requestId,
-      sessionId,
-      eventType,
-      event,
-      wakePayload,
-      sentAt: Date.now(),
-      attempts: 1,
-    });
-    logger.debug('daemon', 'Tracking notification delivery', { eventType, sessionId, requestId });
+    this.bookkeeping.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
   }
 
   private notificationDeliveryKey(eventType: string, sessionId: string, requestId: string): string {
-    return buildNotificationDeliveryKey(eventType, sessionId, requestId);
+    return this.bookkeeping.notificationDeliveryKey(eventType, sessionId, requestId);
   }
 
   private resendTrackedBlockingEvent(
@@ -1751,42 +1723,19 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     forceWake = false,
   ): void {
-    const pending = this.pendingNotificationDeliveries.get(this.notificationDeliveryKey(eventType, sessionId, requestId));
-    if (pending?.wakePayload) {
-      this.sendToPhone(event, true, pending.wakePayload, forceWake);
-    } else {
-      this.sendToPhone(event);
-    }
+    this.bookkeeping.resendTrackedBlockingEvent(eventType, sessionId, requestId, event, forceWake);
   }
 
   private clearNotificationDelivery(eventType: string, sessionId: string, requestId: string): void {
-    this.pendingNotificationDeliveries.delete(this.notificationDeliveryKey(eventType, sessionId, requestId));
+    this.bookkeeping.clearNotificationDelivery(eventType, sessionId, requestId);
   }
 
   private clearNotificationDeliveriesForSession(sessionId: string): void {
-    for (const [key, entry] of this.pendingNotificationDeliveries) {
-      if (entry.sessionId === sessionId) {
-        this.pendingNotificationDeliveries.delete(key);
-      }
-    }
+    this.bookkeeping.clearNotificationDeliveriesForSession(sessionId);
   }
 
   private retryPendingNotificationDeliveries(): void {
-    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
-    const now = Date.now();
-    for (const [key, entry] of this.pendingNotificationDeliveries) {
-      if (now - entry.sentAt < NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS) continue;
-      // Phone was online at emit but didn't ack within the window — fall back
-      // to one forceWake APNs and stop. No further retries; APNs is trusted.
-      this.pendingNotificationDeliveries.delete(key);
-      logger.warn('daemon', 'notification ack timeout — sending forceWake APNs fallback', {
-        eventType: entry.eventType,
-        sessionId: entry.sessionId,
-        requestId: entry.requestId,
-        elapsedMs: now - entry.sentAt,
-      });
-      this.sendToPhone(entry.event, true, entry.wakePayload, true);
-    }
+    this.bookkeeping.retryPendingNotificationDeliveries();
   }
 
   private sendExpiredPendingSystemMessage(
@@ -1796,23 +1745,7 @@ export class AgentPocketDaemon extends EventEmitter {
     actionType: 'permission_request' | 'user_question' | 'plan_review',
     entry?: { expiredSystemMessageSent?: boolean },
   ): void {
-    if (entry?.expiredSystemMessageSent) return;
-    const actionLabel = actionType === 'user_question'
-      ? 'question'
-      : actionType === 'plan_review'
-      ? 'plan review'
-      : 'permission request';
-    const content = "This " + actionLabel + " has expired. Handle it in the terminal, or interrupt this session from the app and continue it to trigger a new request.";
-    this.sendToPhone({
-      type: 'session_output',
-      session_id: sessionId,
-      output_type: 'system',
-      content,
-      timestamp: Date.now(),
-      request_id: requestId,
-      tool_name: toolName,
-    } as unknown as PcEvent);
-    if (entry) entry.expiredSystemMessageSent = true;
+    this.bookkeeping.sendExpiredPendingSystemMessage(sessionId, requestId, toolName, actionType, entry);
   }
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
@@ -1970,52 +1903,14 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     type: 'permission_request' | 'user_question' | 'plan_review',
   ): void {
-    this.pendingBlockingRequests.set(requestId, {
-      requestId,
-      sessionId,
-      event,
-      sentAt: Date.now(),
-      type,
-    });
-
-    logger.debug('daemon', `trackBlockingRequest: ${type} ${requestId.slice(0,8)}`, { sessionId, totalPending: this.pendingBlockingRequests.size });
-
-    // Notify phone that session is now pending action
-    this.sendToPhone({
-      type: 'session_status',
-      session_id: sessionId,
-      status: SessionStatus.PENDING_ACTIONS,
-      action_type: type,
-    } as unknown as PcEvent);
+    this.bookkeeping.trackBlockingRequest(requestId, sessionId, event, type);
   }
 
   /**
    * Stop tracking a blocking request (phone responded or it was dismissed).
    */
   private untrackBlockingRequest(requestId: string): void {
-    const entry = this.pendingBlockingRequests.get(requestId);
-    this.pendingBlockingRequests.delete(requestId);
-
-    // If no more blocking requests for this session, notify phone that
-    // session is no longer waiting. Look up current session status.
-    if (entry) {
-      const hasOtherBlocking = Array.from(this.pendingBlockingRequests.values()).some(
-        e => e.sessionId === entry.sessionId,
-      );
-      if (!hasOtherBlocking) {
-        // Find the real session status (running/ready) or fall back to ready
-        const session = this.sessionManager.getAllSessions().find(
-          s => this.resolveExternalSessionId(s.sessionId) === entry.sessionId
-            || s.claudeSessionId === entry.sessionId,
-        );
-        const status = session?.status ?? SessionStatus.READY;
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: entry.sessionId,
-          status,
-        } as unknown as PcEvent);
-      }
-    }
+    this.bookkeeping.untrackBlockingRequest(requestId);
   }
 
   /**
@@ -2023,31 +1918,7 @@ export class AgentPocketDaemon extends EventEmitter {
    * within BLOCKING_RETRY_INTERVAL_MS.
    */
   private retryPendingBlockingRequests(): void {
-    const now = Date.now();
-    for (const [requestId, entry] of this.pendingBlockingRequests) {
-      // Only retry if the request is still actually pending
-      // (hook still holding the connection, or SDK still waiting).
-      // Keep expired-to-terminal entries — they're waiting for PostToolUse.
-      if ((entry as any).expiredToTerminal) continue;
-
-      const isStillPending =
-        this.hookServer.hasPendingPermission(requestId) ||
-        this.sessionManager.getAllSessions().some(
-          s => s.pendingPermissions?.has(requestId),
-        );
-
-      if (!isStillPending) {
-        this.pendingBlockingRequests.delete(requestId);
-        this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-        continue;
-      }
-
-      if (now - entry.sentAt >= BLOCKING_RETRY_INTERVAL_MS) {
-        logger.warn('daemon', `Retrying blocking request`, { type: entry.type, requestId, waitedMs: now - entry.sentAt });
-        this.sendToPhone(entry.event);
-        entry.sentAt = now;
-      }
-    }
+    this.bookkeeping.retryPendingBlockingRequests();
   }
 
   private findRequestIdForSession(sessionId: string): string | undefined {
