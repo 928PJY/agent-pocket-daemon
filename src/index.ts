@@ -48,6 +48,15 @@ import {
   NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS,
   type NotificationDeliveryEventType,
 } from './relay/phone-transport.js';
+import type { CommandContext } from './commands/command-context.js';
+import { STATIC_MODEL_CATALOG } from './commands/handlers/model-catalog.js';
+import {
+  handleGetSupportedModels as handleGetSupportedModelsExternal,
+  handleGetContextUsage as handleGetContextUsageExternal,
+  handleGetSupportedCommands as handleGetSupportedCommandsExternal,
+  handleGetSupportedAgents as handleGetSupportedAgentsExternal,
+  handleGetMcpServerStatus as handleGetMcpServerStatusExternal,
+} from './commands/handlers/capability-info.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -138,16 +147,7 @@ export interface DaemonConfig {
 // back via getContextUsage().model. Query.supportedModels() on its own only
 // lists 4 alias entries plus the launched build, so older versions and effort
 // tiers are unreachable through the picker without this table.
-const STATIC_MODEL_CATALOG = {
-  entries: [
-    { family: 'sonnet', version: '4-5', version_label: '4.5', supports_one_m: true,  effort_levels: [] as Array<'low' | 'medium' | 'high' | 'xhigh' | 'max'> },
-    { family: 'sonnet', version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
-    { family: 'opus',   version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
-    { family: 'opus',   version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
-    { family: 'opus',   version: '4-7', version_label: '4.7', supports_one_m: true,  effort_levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
-    { family: 'haiku',  version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
-  ],
-} as const;
+// STATIC_MODEL_CATALOG moved to ./commands/handlers/model-catalog.ts
 
 // ============================================================================
 // AgentPocketDaemon
@@ -2776,157 +2776,23 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private async handleGetSupportedModels(command: GetSupportedModelsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_models is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdkModels = await this.sessionManager.getSupportedModels(internalId);
-      let currentModel: string | undefined;
-      try {
-        const usage = await this.sessionManager.getContextUsage(internalId);
-        currentModel = usage.model || undefined;
-      } catch {
-        currentModel = undefined;
-      }
-      const models = sdkModels.map(m => ({
-        value: m.value,
-        display_name: m.displayName,
-        description: m.description,
-        supports_effort: m.supportsEffort,
-        supported_effort_levels: m.supportedEffortLevels,
-        supports_adaptive_thinking: m.supportsAdaptiveThinking,
-        supports_fast_mode: m.supportsFastMode,
-        supports_auto_mode: m.supportsAutoMode,
-      }));
-      this.sendToPhone({
-        type: 'supported_models',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        models,
-        current_model: currentModel,
-        model_catalog: STATIC_MODEL_CATALOG,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_MODELS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedModelsExternal(this.commandContext(), command);
   }
 
   private async handleGetContextUsage(command: GetContextUsageCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_context_usage is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getContextUsage(internalId);
-      const usage = {
-        categories: sdk.categories.map(c => ({ name: c.name, tokens: c.tokens, color: c.color, is_deferred: c.isDeferred })),
-        total_tokens: sdk.totalTokens,
-        max_tokens: sdk.maxTokens,
-        raw_max_tokens: sdk.rawMaxTokens,
-        percentage: sdk.percentage,
-        model: sdk.model,
-        memory_files: sdk.memoryFiles?.map(f => ({ path: f.path, type: f.type, tokens: f.tokens })),
-        mcp_tools: sdk.mcpTools?.map(t => ({ name: t.name, server_name: t.serverName, tokens: t.tokens, is_loaded: t.isLoaded })),
-        deferred_builtin_tools: sdk.deferredBuiltinTools?.map(t => ({ name: t.name, tokens: t.tokens, is_loaded: t.isLoaded })),
-      };
-      this.sendToPhone({
-        type: 'context_usage',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        usage,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_CONTEXT_USAGE_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetContextUsageExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedCommands(command: GetSupportedCommandsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_commands is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getSupportedCommands(internalId);
-      const commands = sdk.map(c => ({
-        name: c.name,
-        description: c.description,
-        argument_hint: c.argumentHint,
-        aliases: c.aliases,
-      }));
-      this.sendToPhone({
-        type: 'supported_commands',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        commands,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_COMMANDS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedCommandsExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedAgents(command: GetSupportedAgentsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_agents is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getSupportedAgents(internalId);
-      const agents = sdk.map(a => ({
-        name: a.name,
-        description: a.description,
-        model: a.model,
-      }));
-      this.sendToPhone({
-        type: 'supported_agents',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        agents,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_AGENTS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedAgentsExternal(this.commandContext(), command);
   }
 
   private async handleGetMcpServerStatus(command: GetMcpServerStatusCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_mcp_server_status is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getMcpServerStatus(internalId);
-      const servers = sdk.map(s => ({
-        name: s.name,
-        status: s.status,
-        scope: s.scope,
-        error: s.error,
-        server_version: s.serverInfo?.version,
-        tools: s.tools?.map(t => ({ name: t.name, description: t.description })),
-      }));
-      this.sendToPhone({
-        type: 'mcp_server_status',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        servers,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_MCP_SERVER_STATUS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetMcpServerStatusExternal(this.commandContext(), command);
   }
 
   private async handleRewindSession(command: RewindSessionCommand): Promise<void> {
@@ -3692,6 +3558,20 @@ export class AgentPocketDaemon extends EventEmitter {
       code,
     };
     this.sendToPhone(event);
+  }
+
+  /**
+   * Build the minimum dependency surface a command handler needs from this
+   * daemon. Reused across every extracted handler module under
+   * src/commands/handlers/. Cheap to construct (just method references).
+   */
+  private commandContext(): CommandContext {
+    return {
+      sendToPhone: (event, wake) => this.sendToPhone(event, wake),
+      sendError: (requestId, message, code) => this.sendError(requestId, message, code),
+      resolveInternalSessionId: (id) => this.resolveInternalSessionId(id),
+      sessionManager: this.sessionManager,
+    };
   }
 
   /**
