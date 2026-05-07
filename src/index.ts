@@ -99,30 +99,9 @@ import {
 } from './commands/handlers/preferences-and-peer.js';
 import { DiscoveryLoop } from './discovery/discovery-orchestrator.js';
 import {
-  registerPermissionRequestPassthrough,
-  registerToolResultHandler,
-  registerErrorHandler,
-  registerSubagentStartHandler,
-  registerSubagentStopHandler,
-  registerApiSessionsHandler,
-  registerApiStatusHandler,
-} from './wiring/hook-handlers.js';
-import {
-  registerPermissionExpiredHandler,
-  registerCodexSessionStartHandler,
-  registerCodexUserPromptSubmitHandler,
-  registerCodexStopHandler,
-  registerCodexPermissionRequestHandler,
   type MessageSeqRef,
 } from './wiring/hook-handlers-codex.js';
-import {
-  registerSessionStopHandler,
-  registerSessionStopFailureHandler,
-  registerSessionEndHandler,
-  registerSessionStartHandler,
-  registerPermissionDismissedHandler,
-  registerPermissionPromptHandler,
-} from './wiring/hook-handlers-lifecycle.js';
+import { wireHookServer } from './wiring/hook-server-wiring.js';
 import {
   registerSessionStartedHandler,
   registerPermissionModeChangedHandler,
@@ -719,121 +698,113 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireHookServerEvents(): void {
-    registerPermissionRequestPassthrough(this.hookServer);
-    registerToolResultHandler(this.hookServer, {
-      prefs: this.phonePreferences,
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      sendToPhone: (event) => this.sendToPhone(event),
-    });
-    registerErrorHandler(this.hookServer, {
-      restartHookServer: () => this.restartHookServer(),
-    });
-
-    registerPermissionExpiredHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      resolveCodexExternalSessionId: (id) => this.resolveCodexExternalSessionId(id),
-      sendToPhone: (event) => this.sendToPhone(event),
-      pendingBlockingRequests: this.pendingBlockingRequests,
-      sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) => this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
-      clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
-    });
-
-    registerCodexSessionStartHandler(this.hookServer, {
-      codexObservers: this.codexObservers,
-      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
-      sendToPhone: (event) => this.sendToPhone(event),
-      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
-      getCodexCapabilities: (id) => this.getCodexCapabilities(id),
-    });
-
-    registerCodexUserPromptSubmitHandler(this.hookServer, {
-      codexObservers: this.codexObservers,
-      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
-      sendToPhone: (event) => this.sendToPhone(event),
-    });
-
-    registerCodexStopHandler(this.hookServer, {
-      codexObservers: this.codexObservers,
-      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
-      sendToPhone: (event) => this.sendToPhone(event),
-      codexStopHookDeduper: this.codexStopHookDeduper,
-      sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
-    });
-
-    registerCodexPermissionRequestHandler(this.hookServer, {
-      recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
-      cryptoEngine: this.cryptoEngine,
-      messageSeq: this.messageSeqRef,
-      buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
-      getSessionName: (id) => this.getSessionName(id),
-      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
-      trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
-    });
-
-    registerApiSessionsHandler(this.hookServer, { sessionManager: this.sessionManager });
-    registerApiStatusHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      getRelayClient: () => this.relayClient,
-    });
-
-    // Stop hook: Claude finished a turn — update session status to ready
-    registerSessionStopHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      pendingBlockingRequests: this.pendingBlockingRequests,
-      clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
-      nextCompletionRequestId: (sId, ts) => this.nextCompletionRequestId(sId, ts),
-      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
-      sendToPhone: (event) => this.sendToPhone(event),
-      prefs: this.phonePreferences,
-    });
-
-    // StopFailure hook: Claude's turn ended via API error. Same cleanup as
-    // Stop, but log the error and skip the "Session Complete" notification.
-    registerSessionStopFailureHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      pendingBlockingRequests: this.pendingBlockingRequests,
-      sendToPhone: (event) => this.sendToPhone(event),
-    });
-
-    // SessionEnd hook: fired when /clear runs (with the OLD session ID)
-    registerSessionEndHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      pendingClearInfo: this.pendingClearInfo,
-      sessionIdMap: this.sessionIdMap,
-      replacedSessionIds: this.replacedSessionIds,
-      sendToPhone: (event) => this.sendToPhone(event),
-    });
-
-    // SubagentStop hook: fired when a Task-dispatched subagent finishes.
-    // Forward to the matching SessionObserver so its SubagentObserver can
-    // mark the agent done immediately (instead of waiting for activity timeout).
-    registerSubagentStopHandler(this.hookServer, { sessionManager: this.sessionManager });
-    registerSubagentStartHandler(this.hookServer, { sessionManager: this.sessionManager });
-
-    // SessionStart hook: fired after /clear with the NEW session ID
-    registerSessionStartHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      pendingClearInfo: this.pendingClearInfo,
-      sessionIdMap: this.sessionIdMap,
-      replacedSessionIds: this.replacedSessionIds,
-      sendToPhone: (event) => this.sendToPhone(event),
-      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
-      sendSessionHistory: (id) => this.sendSessionHistory(id),
-    });
-
-    // When a PermissionRequest hook connection closes (terminal won the race),
-    // tell the phone to dismiss the permission request.
-    registerPermissionDismissedHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      untrackBlockingRequest: (id) => this.untrackBlockingRequest(id),
-      sendToPhone: (event) => this.sendToPhone(event),
+    wireHookServer(this.hookServer, {
+      toolResult: {
+        prefs: this.phonePreferences,
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      error: {
+        restartHookServer: () => this.restartHookServer(),
+      },
+      permissionExpired: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        resolveCodexExternalSessionId: (id) => this.resolveCodexExternalSessionId(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) => this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
+        clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
+      },
+      codexSessionStart: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        getCodexCapabilities: (id) => this.getCodexCapabilities(id),
+      },
+      codexUserPromptSubmit: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      codexStop: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+        codexStopHookDeduper: this.codexStopHookDeduper,
+        sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
+      },
+      codexPermissionRequest: {
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        cryptoEngine: this.cryptoEngine,
+        messageSeq: this.messageSeqRef,
+        buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
+      },
+      apiSessions: {
+        sessionManager: this.sessionManager,
+        getRelayClient: () => this.relayClient,
+      },
+      apiStatus: {
+        sessionManager: this.sessionManager,
+        getRelayClient: () => this.relayClient,
+      },
+      sessionStop: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
+        nextCompletionRequestId: (sId, ts) => this.nextCompletionRequestId(sId, ts),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        sendToPhone: (event) => this.sendToPhone(event),
+        prefs: this.phonePreferences,
+      },
+      sessionStopFailure: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      sessionEnd: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingClearInfo: this.pendingClearInfo,
+        sessionIdMap: this.sessionIdMap,
+        replacedSessionIds: this.replacedSessionIds,
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      subagent: { sessionManager: this.sessionManager },
+      sessionStart: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingClearInfo: this.pendingClearInfo,
+        sessionIdMap: this.sessionIdMap,
+        replacedSessionIds: this.replacedSessionIds,
+        sendToPhone: (event) => this.sendToPhone(event),
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        sendSessionHistory: (id) => this.sendSessionHistory(id),
+      },
+      permissionDismissed: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        untrackBlockingRequest: (id) => this.untrackBlockingRequest(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      permissionPrompt: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        sendPlanForReview: (sId, rId, ti, cwd) => this.sendPlanForReview(sId, rId, ti, cwd),
+        buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+        getSessionName: (id) => this.getSessionName(id),
+        cryptoEngine: this.cryptoEngine,
+        messageSeq: this.messageSeqRef,
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
+      },
     });
   }
 
@@ -842,17 +813,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wirePermissionPromptEvents(): void {
-    registerPermissionPromptHandler(this.hookServer, {
-      sessionManager: this.sessionManager,
-      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
-      sendPlanForReview: (sId, rId, ti, cwd) => this.sendPlanForReview(sId, rId, ti, cwd),
-      buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
-      getSessionName: (id) => this.getSessionName(id),
-      cryptoEngine: this.cryptoEngine,
-      messageSeq: this.messageSeqRef,
-      sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
-      trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
-    });
+    // Folded into wireHookServerEvents via wireHookServer().
   }
 
   private recordCodexHookActivity(request: CodexHookRequest): string {
