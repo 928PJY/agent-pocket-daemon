@@ -39,6 +39,7 @@ import {
   getCodexCapabilities,
   refreshCodexTerminalTarget,
   resolveCodexExternalSessionId as resolveCodexExternalSessionIdHelper,
+  consumeInjectedMessage,
   type CodexTerminalTargetEntry,
 } from './codex/codex-handler.js';
 import {
@@ -86,6 +87,10 @@ import {
   handleQuestionResponse as handleQuestionResponseExternal,
   type ResponseDeps,
 } from './commands/handlers/responses.js';
+import {
+  handleSendMessage as handleSendMessageExternal,
+  type SendMessageDeps,
+} from './commands/handlers/send-message.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -121,7 +126,6 @@ import type {
   SessionListEvent,
   FileContentEvent,
   ErrorEvent,
-  MessageAckEvent,
   HistoryDivergenceEvent,
   SyncCompleteEvent,
   ClaudeEvent,
@@ -222,18 +226,6 @@ function truncateUtf8(value: string, maxBytes: number): string {
     bytes += charBytes;
   }
   return result;
-}
-
-function incrementInjectedMessageCount(injected: Map<string, number>, message: string): void {
-  injected.set(message, (injected.get(message) ?? 0) + 1);
-}
-
-function consumeInjectedMessage(injected: Map<string, number> | undefined, message: string): boolean {
-  const count = injected?.get(message) ?? 0;
-  if (count <= 0) return false;
-  if (count === 1) injected?.delete(message);
-  else injected?.set(message, count - 1);
-  return true;
 }
 
 function detectClaudeVersion(): string | undefined {
@@ -2366,147 +2358,20 @@ export class AgentPocketDaemon extends EventEmitter {
     handleResumeSessionExternal(this.commandContext(), command);
   }
 
-  private async handleSendMessage(command: SendMessageCommand): Promise<void> {
-    const clientMessageId = command.client_message_id;
-    const cidShort = clientMessageId ? clientMessageId.substring(0, 8) : 'none';
-    const sidShort = command.session_id.substring(0, 8);
-    logger.debug('daemon', 'send_message received', {
-      cid: cidShort,
-      sessionId: sidShort,
-      len: command.message.length,
-    });
-
-    if (clientMessageId) {
-      this.sendMessageAck(clientMessageId, command.session_id, 'received');
-    }
-
-    if (isCodexSessionId(command.session_id)) {
-      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
-      if (!target) {
-        const msg = 'Codex remote message is not available until a terminal target is attached for this Codex session.';
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
-        return;
-      }
-      const observed = this.codexObservers.get(command.session_id);
-      if (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS) {
-        const msg = 'Codex session is busy. Wait until the current turn is ready before sending a new message.';
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_NOT_READY');
-        return;
-      }
-      try {
-        let injected = this.codexInjectedMessages.get(command.session_id);
-        if (!injected) {
-          injected = new Map<string, number>();
-          this.codexInjectedMessages.set(command.session_id, injected);
-        }
-        incrementInjectedMessageCount(injected, command.message);
-        terminalSendMessage(target, command.message);
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
-        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort });
-      } catch (err) {
-        consumeInjectedMessage(this.codexInjectedMessages.get(command.session_id), command.message);
-        const msg = (err as Error).message;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
-      }
-      return;
-    }
-
-    try {
-      // Resolve the external session ID to our internal ID
-      const internalId = this.resolveInternalSessionId(command.session_id);
-      if (internalId) {
-        const result = await this.sessionManager.sendMessage(internalId, command.message);
-        if (clientMessageId) {
-          this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
-        }
-        logger.debug('daemon', 'send_message committed (tracked)', { cid: cidShort, sessionId: sidShort, sdkUuid: result.sdkUuid });
-        return;
-      }
-
-      // Session not tracked — it's a discovered session from disk.
-      // Try to observe it and inject the message via tmux.
-      logger.debug('daemon', `Session ${command.session_id} not tracked, attempting to observe and inject`);
-
-      // Check if there's a running terminal for this session
-      const runningCli = this.sessionDiscovery.getRunningCliSessions();
-      const pidInfo = runningCli.find((s) => s.sessionId === command.session_id);
-
-      if (!pidInfo) {
-        const msg = `Session ${command.session_id} has no running terminal. Please restart Claude in the terminal.`;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_NOT_RUNNING');
-        return;
-      }
-
-      // Discover the JSONL file for this session
-      const discovered = await this.sessionDiscovery.discoverSessions();
-      const match = discovered.find((s) => s.sessionId === command.session_id);
-      if (!match) {
-        const msg = `Cannot find session file for ${command.session_id}`;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_FILE_NOT_FOUND');
-        return;
-      }
-
-      // Start observing
-      const sessionId = this.sessionManager.observeSession(
-        pidInfo.sessionId,
-        match.filePath,
-        pidInfo.cwd,
-        pidInfo.pid,
-        match.customTitle,
-        pidInfo.terminalTarget,
-        pidInfo.entrypoint,
-      );
-      this.sessionIdMap.set(sessionId, pidInfo.sessionId);
-
-      // Send session history
-      this.sendSessionHistory(command.session_id);
-
-      // Now send the message (will inject via tmux if available)
-      const result = await this.sessionManager.sendMessage(sessionId, command.message);
-      if (clientMessageId) {
-        this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
-      }
-      logger.debug('daemon', 'send_message committed (observed)', { cid: cidShort, sessionId: sidShort });
-    } catch (err) {
-      const msg = (err as Error).message;
-      if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-      logger.error('daemon', 'send_message failed', { cid: cidShort, sessionId: sidShort, error: msg });
-      this.sendError(
-        undefined,
-        `Failed to send message to session ${command.session_id}: ${msg}`,
-        'SEND_MESSAGE_ERROR',
-      );
-    }
+  private handleSendMessage(command: SendMessageCommand): Promise<void> {
+    return handleSendMessageExternal(this.commandContext(), this.sendMessageDeps(), command);
   }
 
-  private sendMessageAck(
-    clientMessageId: string,
-    sessionId: string,
-    status: 'received' | 'committed' | 'failed',
-    error?: string,
-    sdkUuid?: string,
-  ): void {
-    const ack: MessageAckEvent = {
-      type: 'message_ack',
-      client_message_id: clientMessageId,
-      session_id: sessionId,
-      status,
-      ts: Date.now(),
-      ...(error ? { error } : {}),
-      ...(sdkUuid ? { sdk_uuid: sdkUuid } : {}),
+  private sendMessageDeps(): SendMessageDeps {
+    return {
+      resolveCodexTerminalTarget: (id) => this.resolveCodexTerminalTarget(id),
+      codexObservers: this.codexObservers,
+      codexInjectedMessages: this.codexInjectedMessages,
+      sendTerminalMessage: (target, message) => terminalSendMessage(target as TerminalTarget, message),
+      getRunningCliSessions: () => this.sessionDiscovery.getRunningCliSessions(),
+      discoverSessions: () => this.sessionDiscovery.discoverSessions(),
+      sessionIdMap: this.sessionIdMap,
     };
-    logger.debug('daemon', 'message_ack send', {
-      cid: clientMessageId.substring(0, 8),
-      sessionId: sessionId.substring(0, 8),
-      status,
-      sdkUuid,
-    });
-    this.sendToPhone(ack);
   }
 
   private handlePermissionResponse(command: PermissionResponseCommand): void {

@@ -40,6 +40,31 @@ export interface CodexTerminalTargetEntry {
 export const CODEX_STOP_DEDUPE_MS = 5000;
 
 // ---------------------------------------------------------------------------
+// Injected-message bookkeeping
+// ---------------------------------------------------------------------------
+// When the daemon injects a message into a Codex tmux pane on the user's
+// behalf, the same string also surfaces in the rollout transcript a moment
+// later as a user message. We dedupe by tracking how many injections of each
+// message string are still in flight.
+
+/** Bump the in-flight injection count for `message` by one. */
+export function incrementInjectedMessageCount(injected: Map<string, number>, message: string): void {
+  injected.set(message, (injected.get(message) ?? 0) + 1);
+}
+
+/**
+ * Consume one in-flight injection of `message` if any. Returns true when this
+ * call matched (so the caller can suppress the duplicate downstream).
+ */
+export function consumeInjectedMessage(injected: Map<string, number> | undefined, message: string): boolean {
+  const count = injected?.get(message) ?? 0;
+  if (count <= 0) return false;
+  if (count === 1) injected?.delete(message);
+  else injected?.set(message, count - 1);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
 
