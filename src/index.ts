@@ -25,6 +25,15 @@ import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
 import { readLastTurnSummary } from './utils/transcript-reader.js';
+import {
+  readSessionMap,
+  getLatestSessionMapEntryForPid,
+  gcSessionMap,
+  cleanSessionMap,
+  removeSessionMapEntries,
+  mergeSyncSessionIds,
+} from './utils/session-map.js';
+export { mergeSyncSessionIds } from './utils/session-map.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -387,7 +396,7 @@ export class AgentPocketDaemon extends EventEmitter {
     // daemon started, or PIDs reused by unrelated processes). One sweep at
     // startup is enough — entries written during this daemon's lifetime are
     // cleaned up by cleanSessionMap() on PID-death detection.
-    this.gcSessionMap();
+    gcSessionMap();
 
     // Periodically check observed PIDs and discover new CLI sessions
     this.pidCheckInterval = setInterval(() => {
@@ -1451,7 +1460,7 @@ export class AgentPocketDaemon extends EventEmitter {
         // SessionEnd may not have fired yet, or daemon restarted.
         // Use session-map.json to find the PID, then look up terminal info
         // from the currently observed session for that PID.
-        const mapped = this.readSessionMap();
+        const mapped = readSessionMap();
         const mapEntry = mapped[claudeSessionId];
         if (mapEntry?.pid) {
           const existing = this.sessionManager.findByTerminalPid(mapEntry.pid);
@@ -1960,7 +1969,7 @@ export class AgentPocketDaemon extends EventEmitter {
         //   2) PID JSON's cwd is wrong (e.g. parent of the worktree the
         //      process actually runs in), causing dir-based JSONL matching
         //      to pick a JSONL from a sibling project.
-        const mapEntry = this.getLatestSessionMapEntryForPid(pidInfo.pid);
+        const mapEntry = getLatestSessionMapEntryForPid(pidInfo.pid);
         if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
           this.replacedSessionIds.add(pidInfo.sessionId);
           pidInfo.sessionId = mapEntry.sessionId;
@@ -2023,7 +2032,7 @@ export class AgentPocketDaemon extends EventEmitter {
         // If PID file still references a replaced session (stale after /clear),
         // check session-map.json for the correct new session ID
         if (this.replacedSessionIds.has(pidInfo.sessionId)) {
-          const mapped = this.readSessionMap();
+          const mapped = readSessionMap();
           // Find the most recent session-map entry for this PID
           let corrected: [string, { pid?: number; cwd: string; timestamp: number }] | undefined;
           const staleSids: string[] = [];
@@ -2040,7 +2049,7 @@ export class AgentPocketDaemon extends EventEmitter {
           }
           // Clean up stale entries for this PID
           if (staleSids.length > 0) {
-            this.removeSessionMapEntries(staleSids);
+            removeSessionMapEntries(staleSids);
           }
           if (!corrected) continue;
           const newSessionId = corrected[0];
@@ -2256,7 +2265,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     if (deadPids.length > 0) {
-      this.cleanSessionMap(deadPids);
+      cleanSessionMap(deadPids);
     }
   }
 
@@ -2413,7 +2422,7 @@ export class AgentPocketDaemon extends EventEmitter {
       if (existing) {
         logger.debug('daemon', `Stopping existing observer ${existing.sessionId} before resuming session ${command.session_id}`);
         this.sessionManager.markObservedSessionHistory(existing.sessionId);
-        this.cleanSessionMap([existing.terminalPid ?? -1]);
+        cleanSessionMap([existing.terminalPid ?? -1]);
       }
 
       const sessionId = this.sessionManager.resumeSession(command.session_id, {});
@@ -3125,7 +3134,7 @@ export class AgentPocketDaemon extends EventEmitter {
         // matching the live discovery loop. Without this, restarted daemons
         // resolve the wrong sessionId for PIDs whose JSON wasn't updated
         // after /clear or whose cwd is wrong (e.g. worktree launches).
-        const mapEntry = this.getLatestSessionMapEntryForPid(pidInfo.pid);
+        const mapEntry = getLatestSessionMapEntryForPid(pidInfo.pid);
         if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
           pidInfo.sessionId = mapEntry.sessionId;
           pidInfo.cwd = mapEntry.cwd;
@@ -3921,144 +3930,6 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   /**
-   * Find the most recent session-map.json entry for `pid` whose JSONL file
-   * still exists on disk. Returns the corrected sessionId + cwd + transcript
-   * path so callers can bypass the (potentially stale) PID JSON metadata.
-   *
-   * Why: ~/.claude/sessions/<pid>.json records `sessionId`/`cwd` from the
-   * process's first session. After /clear (and sometimes after a worktree
-   * launch where cwd is recorded incorrectly), it stops matching reality.
-   * The SessionStart hook always writes the correct values to session-map,
-   * which persists across daemon restarts.
-   */
-  private getLatestSessionMapEntryForPid(pid: number): { sessionId: string; cwd: string; transcriptPath?: string; timestamp: number } | undefined {
-    const mapped = this.readSessionMap();
-    let best: { sessionId: string; cwd: string; transcriptPath?: string; timestamp: number } | undefined;
-    for (const [sid, v] of Object.entries(mapped)) {
-      if (v.pid !== pid) continue;
-      if (v.transcript_path && !fs.existsSync(v.transcript_path)) continue;
-      if (!best || v.timestamp > best.timestamp) {
-        best = { sessionId: sid, cwd: v.cwd, transcriptPath: v.transcript_path, timestamp: v.timestamp };
-      }
-    }
-    return best;
-  }
-
-  /**
-   * Read ~/.agent-pocket/session-map.json written by the SessionStart hook script.
-   * Returns a map of sessionId → { source, cwd, transcript_path, pid, timestamp }.
-   */
-  private readSessionMap(): Record<string, { source: string; cwd: string; transcript_path?: string; pid?: number; timestamp: number }> {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return {};
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const parsed = JSON.parse(raw) as Record<string, { source: string; cwd: string; transcript_path?: string; pid?: number; timestamp: number }>;
-      // Defensive filter: subagent SessionStart events (older daemon versions
-      // wrote them) share the parent Claude PID and would clobber the real
-      // session-id mapping. Identify by transcript path under /subagents/.
-      const filtered: typeof parsed = {};
-      for (const [sid, v] of Object.entries(parsed)) {
-        if (v.transcript_path && v.transcript_path.includes('/subagents/')) continue;
-        filtered[sid] = v;
-      }
-      return filtered;
-    } catch {
-      return {};
-    }
-  }
-
-  /**
-   * Garbage-collect session-map.json: remove entries whose PID is no longer
-   * alive or whose transcript file is gone. Catches entries that were never
-   * observed by this daemon (e.g. CLIs that started+ended before launch) and
-   * stale entries left behind by PID reuse.
-   */
-  private gcSessionMap(): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number; transcript_path?: string }>;
-      const removed: string[] = [];
-      for (const [sid, entry] of Object.entries(map)) {
-        let dead = false;
-        // pid<=0 means the hook couldn't resolve a real Claude PID; the
-        // entry can never match a live process, so drop it.
-        if (!entry.pid || entry.pid <= 0) {
-          dead = true;
-        } else {
-          try { process.kill(entry.pid, 0); } catch { dead = true; }
-        }
-        if (!dead && entry.transcript_path && !fs.existsSync(entry.transcript_path)) {
-          dead = true;
-        }
-        if (dead) {
-          delete map[sid];
-          removed.push(sid);
-        }
-      }
-      if (removed.length > 0) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.debug('daemon', 'GC session-map', { removed: removed.length });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
-   * Remove session-map.json entries whose PID has died.
-   */
-  private cleanSessionMap(deadPids: number[]): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number }>;
-      const deadSet = new Set(deadPids);
-      let changed = false;
-      for (const [sid, entry] of Object.entries(map)) {
-        if (entry.pid && deadSet.has(entry.pid)) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Cleaned session-map entries for dead PIDs', { deadPids });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
-   * Remove specific session IDs from session-map.json.
-   */
-  private removeSessionMapEntries(sessionIds: string[]): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, unknown>;
-      let changed = false;
-      for (const sid of sessionIds) {
-        if (sid in map) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Removed stale session-map entries', { sessionIds });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
    * Reverse lookup: given an external session ID the phone uses,
    * find the internal session ID in the session manager.
    */
@@ -4343,23 +4214,4 @@ export class AgentPocketDaemon extends EventEmitter {
     });
     this.sendToPhone(event);
   }
-}
-
-/**
- * Build the set of session ids to replay during a sync_request: every
- * session the phone declared a cursor for plus every session the daemon
- * currently knows about. Exported for unit testing.
- */
-export function mergeSyncSessionIds(
-  cursorMap: Map<string, number>,
-  daemonKnownSessionIds: Iterable<string>,
-): Set<string> {
-  const merged = new Set<string>();
-  for (const sessionId of cursorMap.keys()) {
-    merged.add(sessionId);
-  }
-  for (const sessionId of daemonKnownSessionIds) {
-    merged.add(sessionId);
-  }
-  return merged;
 }
