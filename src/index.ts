@@ -42,6 +42,12 @@ import {
   resolveCodexExternalSessionId as resolveCodexExternalSessionIdHelper,
   type CodexTerminalTargetEntry,
 } from './codex/codex-handler.js';
+import {
+  PeerCapabilities,
+  NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS,
+  NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS,
+  type NotificationDeliveryEventType,
+} from './relay/phone-transport.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -123,16 +129,8 @@ export interface DaemonConfig {
 }
 
 // CodexTerminalTargetEntry is imported above from './codex/codex-handler.js'.
-
-type NotificationDeliveryEventType = 'permission_request' | 'user_question' | 'plan_review' | 'session_completed' | 'session_error';
-
-// Notification delivery: when phone is online at emit time, the WS push went
-// out but the phone may go to background before processing it. We give the
-// phone a short window to ack; if the ack doesn't arrive, we send exactly one
-// forceWake APNs as the fallback and stop. When phone is offline at emit time,
-// the relay already routes to APNs — no tracking, no retry.
-const NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS = 3_000;
-const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 1_000;
+// NotificationDeliveryEventType + NOTIFICATION_DELIVERY_* constants are
+// imported above from './relay/phone-transport.js'.
 
 // Static catalog of Claude model ids the SDK accepts. Verified by probing all
 // 72 family×version×effort×1m combinations on SDK 0.2.129 — the SDK accepts
@@ -242,9 +240,7 @@ export class AgentPocketDaemon extends EventEmitter {
 
   // Peer (phone) capability set learned from peer_hello. Empty until the
   // first peer_hello arrives over the E2E channel.
-  private peerCapabilities: Set<string> = new Set();
-  private peerProductVersion: string | null = null;
-  private peerWireVersion: number | null = null;
+  private peers = new PeerCapabilities();
 
   // Map internal session IDs to Claude session IDs (for resume)
   private sessionIdMap: Map<string, string> = new Map();
@@ -3724,14 +3720,12 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handlePeerHello(hello: PeerHello): void {
-    this.peerProductVersion = hello.product_version;
-    this.peerWireVersion = hello.wire_version;
-    this.peerCapabilities = new Set(Array.isArray(hello.capabilities) ? hello.capabilities : []);
+    this.peers.update(hello);
     logger.debug('daemon', 'Received peer_hello', {
       product: hello.product,
       product_version: hello.product_version,
       wire: hello.wire_version,
-      capabilities: Array.from(this.peerCapabilities),
+      capabilities: this.peers.list(),
     });
   }
 
@@ -3740,7 +3734,7 @@ export class AgentPocketDaemon extends EventEmitter {
    * Returns false if no peer_hello has been received yet.
    */
   hasPeerCapability(name: string): boolean {
-    return this.peerCapabilities.has(name);
+    return this.peers.has(name);
   }
 
   /**
