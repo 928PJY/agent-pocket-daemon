@@ -385,6 +385,10 @@ export class AgentPocketDaemon extends EventEmitter {
     this.codexDiscovery = new CodexDiscovery();
     this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
+    this.hookServer.setControllerSessionPredicate((claudeSessionId) => {
+      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
+      return session ? !this.sessionManager.isObservedSession(session.sessionId) : false;
+    });
 
     this.bookkeeping = createNotificationBookkeeping({
       sessionSeqCounters: this.sessionSeqCounters,
@@ -998,6 +1002,10 @@ export class AgentPocketDaemon extends EventEmitter {
         this.hookServer.removeAllListeners();
 
         this.hookServer = new HookServer();
+        this.hookServer.setControllerSessionPredicate((claudeSessionId) => {
+          const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
+          return session ? !this.sessionManager.isObservedSession(session.sessionId) : false;
+        });
         const newPort = await this.hookServer.start();
         this.wireHookServerEvents();
         this.wirePermissionPromptEvents();

@@ -20,7 +20,6 @@ import type {
 import {
   RISK_CLASSIFICATION,
   RiskLevel,
-  HOOK_HOLD_TIMEOUT_SECONDS,
   PermissionDecision,
   SessionStatus,
 } from 'agent-pocket-protocol';
@@ -31,6 +30,12 @@ import type { CryptoSigner, MessageSeqRef, PendingBlockingEntry } from './hook-h
 
 /** Narrowed SessionManager surface used by these registrars. */
 export type SessionManagerGateway = Pick<SessionManager, 'on'>;
+
+// Controller-mode permission events do not auto-expire on the daemon side
+// (the SDK canUseTool promise blocks until the phone responds or the session
+// is aborted). Use ttl=0 as a sentinel meaning "never expires" — iOS hides
+// the countdown UI and never marks the card as expired.
+const CONTROLLER_PERMISSION_TTL_SECONDS = 0;
 
 // ---------------------------------------------------------------------------
 // session_started
@@ -260,7 +265,7 @@ export function registerPermissionRequestHandler(
           request_id: requestId,
           tool_input: toolInput,
           timestamp: new Date().toISOString(),
-          ttl: HOOK_HOLD_TIMEOUT_SECONDS,
+          ttl: CONTROLLER_PERMISSION_TTL_SECONDS,
         };
         deps.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, requestId, {
           type: 'user_question',
@@ -318,7 +323,7 @@ export function registerPermissionRequestHandler(
         pc_signature: pcSignature,
         seq: deps.messageSeq.getAndIncrement(),
         timestamp: new Date().toISOString() as unknown as number,
-        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
+        ttl: CONTROLLER_PERMISSION_TTL_SECONDS,
       };
 
       deps.sendToPhone(event);
