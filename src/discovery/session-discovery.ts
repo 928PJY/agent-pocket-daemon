@@ -5,35 +5,20 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { execFileSync } from 'node:child_process';
-import { findTerminalForPid } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
-import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
+import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
+import { parseHistoryEntry } from './jsonl-parser.js';
+import { getSubagentHistory } from './subagent-history.js';
+import {
+  getRunningCliSessions as scanRunningCliSessions,
+  getRunningAllSessions as scanRunningAllSessions,
+  getRunningSessionEntrypoints as scanRunningSessionEntrypoints,
+} from './pid-scanner.js';
+export { isProcessSuspendedOrZombie } from './pid-scanner.js';
 
-// Cap individual tool_input string values when shipping history to the phone,
-// so a Write/Edit with a megabyte-long body doesn't bloat session_history.
-// Live streaming events still send the full input; this only affects history.
-// NOTE: shallow — only top-level string values are capped. Arrays / nested
-// objects pass through untouched. No current Claude tool ships big strings
-// inside collections; revisit if that changes.
-const HISTORY_TOOL_INPUT_VALUE_CAP = 2000;
+// Cap individual tool_output strings when shipping history to the phone.
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
-
-function truncateToolInput(
-  input: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!input) return undefined;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(input)) {
-    if (typeof v === 'string' && v.length > HISTORY_TOOL_INPUT_VALUE_CAP) {
-      out[k] = v.slice(0, HISTORY_TOOL_INPUT_VALUE_CAP) + `… [+${v.length - HISTORY_TOOL_INPUT_VALUE_CAP} chars]`;
-    } else {
-      out[k] = v;
-    }
-  }
-  return out;
-}
 
 // ============================================================================
 // Types
@@ -120,25 +105,8 @@ export interface SessionPidInfo {
 // ============================================================================
 // Process State Helpers
 // ============================================================================
-
-/**
- * Check if a process is suspended (T) or zombie (Z).
- * Uses `ps -p <pid> -o state=` via execFileSync to avoid shell injection.
- */
-export function isProcessSuspendedOrZombie(pid: number): boolean {
-  try {
-    const output = execFileSync('ps', ['-p', String(pid), '-o', 'state='], {
-      encoding: 'utf-8',
-      timeout: 2000,
-    }).trim();
-    // macOS ps state column: first char is the state code
-    const state = output.charAt(0).toUpperCase();
-    return state === 'T' || state === 'Z';
-  } catch {
-    // ps failed — process may have exited between check and ps call
-    return false;
-  }
-}
+// (isProcessSuspendedOrZombie now lives in ./pid-scanner.ts and is re-exported
+// from the top of this module to keep the public import path stable.)
 
 // ============================================================================
 // SessionDiscovery
@@ -473,124 +441,7 @@ export class SessionDiscovery {
   }
 
   private parseHistoryEntry(entry: Record<string, unknown>): HistoryMessage[] {
-    const type = entry.type as string | undefined;
-    const timestamp = entry.timestamp as string | undefined;
-
-    if (type === 'user') {
-      const message = entry.message as { role?: string; content?: unknown } | undefined;
-      if (!message?.content) return [];
-
-      // Synthetic interrupt messages are not real user input — surface them as
-      // a short system-message marker instead of silently dropping or showing
-      // the raw "[Request interrupted by user]" string.
-      const reason = this.detectInterruptReason(message.content);
-      if (reason) {
-        return [{ role: 'system', content: interruptMessageText(reason), timestamp }];
-      }
-
-      const content = typeof message.content === 'string'
-        ? message.content
-        : Array.isArray(message.content)
-          ? (message.content as Array<{ type?: string; text?: string }>)
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text ?? '')
-              .join('')
-          : '';
-      if (!content) return [];
-      // Filter out internal Claude Code protocol messages (commands, system reminders, etc.)
-      if (this.isInternalMessage(content)) return [];
-      const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
-      return [{ role: 'user', content, timestamp, sdkUuid }];
-    }
-
-    if (type === 'assistant') {
-      const message = entry.message as { content?: Array<{ type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }> } | undefined;
-      if (!message?.content || !Array.isArray(message.content)) return [];
-
-      const results: HistoryMessage[] = [];
-
-      // Extract text blocks, treating the synthetic [Tool use interrupted]
-      // placeholder as a system-message marker rather than assistant output.
-      const textParts: string[] = [];
-      let interruptedInAssistant = false;
-      for (const block of message.content) {
-        if (block.type === 'text' && block.text) {
-          if (detectInterruptText(block.text)) {
-            interruptedInAssistant = true;
-          } else {
-            textParts.push(block.text);
-          }
-        }
-      }
-      if (textParts.length > 0) {
-        results.push({ role: 'assistant', content: textParts.join('\n'), timestamp });
-      }
-      if (interruptedInAssistant) {
-        // Offset by 1ms so the interrupt marker sorts AFTER any synthesized
-        // plan_review / user_question cards that share the tool_use timestamp.
-        const bumped = timestamp ? new Date(new Date(timestamp).getTime() + 1).toISOString() : timestamp;
-        results.push({ role: 'system', content: interruptMessageText('tool_use'), timestamp: bumped });
-      }
-
-      // Extract ALL tool_use blocks
-      for (const block of message.content) {
-        if (block.type === 'tool_use') {
-          results.push({
-            role: 'tool_use',
-            content: '',
-            toolName: block.name,
-            toolId: block.id,
-            toolInput: truncateToolInput(block.input as Record<string, unknown> | undefined),
-            timestamp,
-          });
-        }
-      }
-
-      return results;
-    }
-
-    return [];
-  }
-
-  /**
-   * If a user message's content is a synthetic interrupt marker, return the
-   * reason; otherwise null. Covers plain text, text blocks, and tool_result
-   * blocks with CANCEL_MESSAGE / [Tool use interrupted].
-   */
-  private detectInterruptReason(content: unknown): 'streaming' | 'tool_use' | null {
-    if (typeof content === 'string') {
-      return detectInterruptText(content);
-    }
-    if (Array.isArray(content)) {
-      for (const block of content as Array<Record<string, unknown>>) {
-        if (block?.type === 'text' && typeof block.text === 'string') {
-          const r = detectInterruptText(block.text);
-          if (r) return r;
-        }
-        if (block?.type === 'tool_result') {
-          const inner = (block as { content?: unknown }).content;
-          if (typeof inner === 'string') {
-            const r = detectInterruptText(inner);
-            if (r) return r;
-          } else if (Array.isArray(inner)) {
-            for (const b of inner as Array<Record<string, unknown>>) {
-              if (b?.type === 'text' && typeof b.text === 'string') {
-                const r = detectInterruptText(b.text);
-                if (r) return r;
-              }
-            }
-          }
-        }
-      }
-    }
-    return null;
-  }
-
-  /** Check if a message is an internal Claude Code protocol message (not user-authored). */
-  private isInternalMessage(text: string): boolean {
-    const trimmed = text.trimStart();
-    if (!trimmed.startsWith('<')) return false;
-    return /^<(teammate-message|system-reminder|task-notification|command-name|local-command-caveat|local-command|user-prompt-submit-hook)[\s>]/.test(trimmed);
+    return parseHistoryEntry(entry) as HistoryMessage[];
   }
 
   /**
@@ -599,231 +450,7 @@ export class SessionDiscovery {
    * with companion agent-*.meta.json for metadata.
    */
   private getSubagentHistory(sessionFilePath: string): HistoryMessage[] {
-    const jsonlDir = path.dirname(sessionFilePath);
-    const jsonlBasename = path.basename(sessionFilePath, '.jsonl');
-    const subagentsDir = path.join(jsonlDir, jsonlBasename, 'subagents');
-
-    if (!fs.existsSync(subagentsDir)) return [];
-
-    let entries: string[];
-    try {
-      entries = fs.readdirSync(subagentsDir);
-    } catch {
-      return [];
-    }
-
-    const MAX_READ_BYTES = 20 * 1024 * 1024;
-    const results: HistoryMessage[] = [];
-
-    for (const entry of entries) {
-      if (!entry.endsWith('.jsonl')) continue;
-
-      const agentId = entry.replace('agent-', '').replace('.jsonl', '');
-      const agentJsonlPath = path.join(subagentsDir, entry);
-      const metaPath = path.join(subagentsDir, entry.replace('.jsonl', '.meta.json'));
-      const archivePath = path.join(subagentsDir, entry.replace('.jsonl', '.archive.json'));
-
-      // Read agent metadata
-      let agentName = 'Subagent';
-      let agentType = 'unknown';
-      try {
-        if (fs.existsSync(metaPath)) {
-          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-          agentType = meta.agentType ?? 'unknown';
-          agentName = meta.description ?? 'Subagent';
-        }
-      } catch {
-        // Use defaults
-      }
-
-      // Read archive (final lifecycle + metrics) when present. If missing,
-      // fall back to a JSONL replay below to avoid showing 0/0 metrics for
-      // subagents that finished before the daemon ever observed them.
-      let archivedStatus: string | undefined;
-      let archivedTools: number | undefined;
-      let archivedTokens: number | undefined;
-      try {
-        if (fs.existsSync(archivePath)) {
-          const a = JSON.parse(fs.readFileSync(archivePath, 'utf-8')) as {
-            status?: string; toolUseCount?: number; tokenCount?: number;
-          };
-          archivedStatus = a.status;
-          archivedTools = a.toolUseCount;
-          archivedTokens = a.tokenCount;
-        }
-      } catch {
-        // Ignore corrupt archive
-      }
-
-      // Read the JSONL file (tail-read for large files)
-      let raw: string;
-      try {
-        const stat = fs.statSync(agentJsonlPath);
-        if (stat.size > MAX_READ_BYTES) {
-          const fd = fs.openSync(agentJsonlPath, 'r');
-          const buf = Buffer.alloc(MAX_READ_BYTES);
-          fs.readSync(fd, buf, 0, MAX_READ_BYTES, stat.size - MAX_READ_BYTES);
-          fs.closeSync(fd);
-          raw = buf.toString('utf-8');
-          const firstNewline = raw.indexOf('\n');
-          if (firstNewline >= 0) raw = raw.slice(firstNewline + 1);
-        } else {
-          raw = fs.readFileSync(agentJsonlPath, 'utf-8');
-        }
-      } catch {
-        continue;
-      }
-
-      const lines = raw.split('\n').filter((l) => l.trim().length > 0);
-
-      // If no archive yet, replay the JSONL once to derive final metrics.
-      // Matches SubagentObserver.replayHistoricJsonl / terminal's token math:
-      // tokens = latest assistant usage summed; tools = dedup'd tool_use ids.
-      // When the agent is clearly finished (last assistant turn end_turn + file
-      // quiet for ≥2min), write an archive so future history requests and
-      // daemon restarts hit the fast path.
-      if (archivedTools === undefined || archivedTokens === undefined) {
-        let tools = 0;
-        let tokens = 0;
-        let firstTs: number | null = null;
-        let lastTs: number | null = null;
-        let endedWithEndTurn = false;
-        const seenTools = new Set<string>();
-        for (const line of lines) {
-          try {
-            const je = JSON.parse(line) as Record<string, unknown>;
-            const tsStr = je.timestamp as string | undefined;
-            if (tsStr) {
-              const ms = Date.parse(tsStr);
-              if (!Number.isNaN(ms)) {
-                if (firstTs === null || ms < firstTs) firstTs = ms;
-                if (lastTs === null || ms > lastTs) lastTs = ms;
-              }
-            }
-            if (je.type !== 'assistant') continue;
-            const m = je.message as {
-              usage?: { input_tokens?: number; output_tokens?: number;
-                cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
-              stop_reason?: string;
-              content?: Array<{ type: string; id?: string }>;
-            } | undefined;
-            if (m?.usage) {
-              const u = m.usage;
-              tokens =
-                (u.cache_creation_input_tokens ?? 0) +
-                (u.cache_read_input_tokens ?? 0) +
-                (u.input_tokens ?? 0) +
-                (u.output_tokens ?? 0);
-            }
-            endedWithEndTurn = m?.stop_reason === 'end_turn';
-            if (Array.isArray(m?.content)) {
-              for (const b of m!.content) {
-                if (b.type === 'tool_use') {
-                  const id = b.id ?? '';
-                  if (!seenTools.has(id)) { seenTools.add(id); tools++; }
-                }
-              }
-            }
-          } catch { /* skip */ }
-        }
-        if (archivedTools === undefined) archivedTools = tools;
-        if (archivedTokens === undefined) archivedTokens = tokens;
-
-        // If the JSONL ended with end_turn, Claude's last turn finished. The
-        // history path runs only on past subagent files (no live event stream),
-        // so we treat end_turn as terminal and stamp `done`. Persist an archive
-        // so subsequent history requests skip replay.
-        if (archivedStatus === undefined && endedWithEndTurn) {
-          archivedStatus = 'done';
-          if (!fs.existsSync(archivePath)) {
-            try {
-              fs.writeFileSync(archivePath, JSON.stringify({
-                agentId,
-                agentType,
-                agentName,
-                status: 'done',
-                toolUseCount: tools,
-                tokenCount: tokens,
-                firstEventAt: firstTs,
-                lastEventAt: lastTs,
-                archivedAt: Date.now(),
-              }, null, 2));
-            } catch {
-              // Non-fatal — next call will replay again
-            }
-          }
-        }
-      }
-
-      for (const line of lines) {
-        try {
-          const jsonEntry = JSON.parse(line) as Record<string, unknown>;
-          const type = jsonEntry.type as string | undefined;
-          const timestamp = jsonEntry.timestamp as string | undefined;
-
-          if (type !== 'assistant') continue;
-
-          const message = jsonEntry.message as {
-            content?: Array<{ type: string; text?: string; name?: string; id?: string; input?: unknown }>;
-          } | undefined;
-          if (!message?.content || !Array.isArray(message.content)) continue;
-
-          // Extract text blocks into a single assistant_message
-          const textParts: string[] = [];
-          for (const block of message.content) {
-            if (block.type === 'text' && block.text) {
-              textParts.push(block.text);
-            }
-          }
-          if (textParts.length > 0) {
-            results.push({
-              role: 'subagent',
-              content: textParts.join('\n'),
-              timestamp,
-              agentId,
-              agentName,
-              agentType,
-              innerEventType: 'assistant_message',
-              agentStatus: archivedStatus,
-              subagentToolUseCount: archivedTools,
-              subagentTokenCount: archivedTokens,
-            });
-          }
-
-          // Extract tool_use blocks
-          for (const block of message.content) {
-            if (block.type === 'tool_use') {
-              results.push({
-                role: 'subagent',
-                content: '',
-                toolName: block.name,
-                toolId: block.id,
-                toolInput: truncateToolInput(block.input as Record<string, unknown> | undefined),
-                timestamp,
-                agentId,
-                agentName,
-                agentType,
-                innerEventType: 'tool_use',
-                agentStatus: archivedStatus,
-                subagentToolUseCount: archivedTools,
-                subagentTokenCount: archivedTokens,
-              });
-            }
-          }
-        } catch {
-          // Skip unparseable lines
-        }
-      }
-    }
-
-    // Sort by timestamp
-    results.sort((a, b) => {
-      const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-      const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
-      return ta - tb;
-    });
-
-    return results;
+    return getSubagentHistory(sessionFilePath) as HistoryMessage[];
   }
 
   // --------------------------------------------------------------------------
@@ -836,49 +463,7 @@ export class SessionDiscovery {
    * Only returns sessions with entrypoint === "cli" that have a live process.
    */
   getRunningCliSessions(): RunningCliSession[] {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return [];
-
-    const results: RunningCliSession[] = [];
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const filePath = path.join(sessionsDir, entry);
-        try {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          if (data.entrypoint !== 'cli') continue;
-
-          const pid = data.pid as number;
-          if (!pid) continue;
-
-          // Check if the process is still alive
-          try {
-            process.kill(pid, 0);
-          } catch {
-            // Process not running — skip
-            continue;
-          }
-
-          // Skip suspended (Ctrl+Z) or zombie processes
-          if (isProcessSuspendedOrZombie(pid)) continue;
-
-          results.push({
-            pid,
-            sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
-            terminalTarget: findTerminalForPid(pid) ?? undefined,
-            entrypoint: 'cli',
-            name: typeof data.name === 'string' ? (data.name as string) : undefined,
-          });
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error reading sessions dir
-    }
-    return results;
+    return scanRunningCliSessions(this.claudeDir);
   }
 
   /**
@@ -886,46 +471,7 @@ export class SessionDiscovery {
    * Same as getRunningCliSessions() but without the entrypoint filter.
    */
   getRunningAllSessions(): RunningCliSession[] {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return [];
-
-    const results: RunningCliSession[] = [];
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const filePath = path.join(sessionsDir, entry);
-        try {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          const pid = data.pid as number;
-          if (!pid) continue;
-
-          try {
-            process.kill(pid, 0);
-          } catch {
-            continue;
-          }
-
-          // Skip suspended (Ctrl+Z) or zombie processes
-          if (isProcessSuspendedOrZombie(pid)) continue;
-
-          const entrypoint = (data.entrypoint as string) ?? 'unknown';
-          results.push({
-            pid,
-            sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
-            terminalTarget: entrypoint === 'cli' ? (findTerminalForPid(pid) ?? undefined) : undefined,
-            entrypoint,
-            name: typeof data.name === 'string' ? (data.name as string) : undefined,
-          });
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error reading sessions dir
-    }
-    return results;
+    return scanRunningAllSessions(this.claudeDir);
   }
 
   /**
@@ -933,31 +479,7 @@ export class SessionDiscovery {
    * by reading PID files. Returns a map of sessionId -> entrypoint.
    */
   getRunningSessionEntrypoints(): Map<string, string> {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return new Map();
-
-    const result = new Map<string, string>();
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        try {
-          const filePath = path.join(sessionsDir, entry);
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          const pid = data.pid as number;
-          if (!pid) continue;
-          try { process.kill(pid, 0); } catch { continue; }
-          const sessionId = data.sessionId as string;
-          const entrypoint = (data.entrypoint as string) ?? 'unknown';
-          if (sessionId) result.set(sessionId, entrypoint);
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error
-    }
-    return result;
+    return scanRunningSessionEntrypoints(this.claudeDir);
   }
 
   /**

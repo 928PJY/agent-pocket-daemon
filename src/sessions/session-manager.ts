@@ -6,7 +6,6 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { query, forkSession } from '@anthropic-ai/claude-agent-sdk';
 import type {
@@ -16,6 +15,15 @@ import type {
   PermissionResult,
   Options as SDKQueryOptions,
 } from '@anthropic-ai/claude-agent-sdk';
+import { StreamInputController } from './stream-input-controller.js';
+import {
+  resolveClaudeExecutable,
+  expandPath,
+  assertWorkingDirectoryExists,
+} from './path-utils.js';
+
+export { StreamInputController } from './stream-input-controller.js';
+export { resolveClaudeExecutable, expandPath } from './path-utils.js';
 
 export type QueryFactory = (args: {
   prompt: AsyncIterable<SDKUserMessage>;
@@ -132,137 +140,8 @@ export interface SessionManagerEvents {
 }
 
 // ============================================================================
-// StreamInputController
-// ============================================================================
-
-/**
- * Produces an AsyncGenerator<SDKUserMessage> for the SDK to consume.
- * The daemon calls push() to inject user messages; the SDK pulls via stream().
- */
-class StreamInputController {
-  private queue: SDKUserMessage[] = [];
-  private waiting: ((msg: SDKUserMessage) => void) | null = null;
-  private _closed = false;
-  /** Tag for log correlation — set by SessionManager.create*() right after construction. */
-  ownerSessionId?: string;
-
-  get closed(): boolean {
-    return this._closed;
-  }
-
-  push(msg: SDKUserMessage): void {
-    if (this._closed) {
-      logger.warn('stream-input', 'push() on closed controller — dropped', { sessionId: this.ownerSessionId?.substring(0, 8) });
-      return;
-    }
-    if (this.waiting) {
-      const resolve = this.waiting;
-      this.waiting = null;
-      resolve(msg);
-    } else {
-      this.queue.push(msg);
-    }
-  }
-
-  close(): void {
-    this._closed = true;
-    // Wake up any waiting consumer so the generator can exit
-    if (this.waiting) {
-      const resolve = this.waiting;
-      this.waiting = null;
-      // Resolve with a dummy message — the generator will check _closed and return
-      resolve({ type: 'user', message: { role: 'user', content: '' }, parent_tool_use_id: null } as SDKUserMessage);
-    }
-  }
-
-  async *stream(): AsyncGenerator<SDKUserMessage> {
-    while (!this._closed) {
-      if (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      } else {
-        const msg = await new Promise<SDKUserMessage>((resolve) => {
-          this.waiting = resolve;
-        });
-        if (this._closed) return;
-        yield msg;
-      }
-    }
-  }
-}
-
-// ============================================================================
-// Claude CLI resolution
-// ============================================================================
-
-/**
- * Decide which `claude` binary the SDK should spawn. Order:
- *   1. AGENT_POCKET_CLAUDE_PATH env override
- *   2. `claude` on PATH (typically the user's native installer at ~/.local/bin/claude)
- *   3. undefined — let the SDK fall back to its bundled platform binary
- *
- * PATH search walks $PATH directly (no shell exec) for safety + speed.
- */
-export function resolveClaudeExecutable(): string | undefined {
-  const override = process.env.AGENT_POCKET_CLAUDE_PATH;
-  if (override && fs.existsSync(override)) return override;
-
-  const pathEnv = process.env.PATH ?? '';
-  for (const dir of pathEnv.split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, 'claude');
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch {
-      // ENOENT — keep searching.
-    }
-  }
-
-  return undefined;
-}
-
-// ============================================================================
 // SessionManager
 // ============================================================================
-
-/**
- * Expand shell-style path tokens that the daemon (Node.js) does not handle
- * natively but users typing on the phone reasonably expect to work:
- *   - leading `~` or `~/...`  -> $HOME/...
- *   - `$VAR` and `${VAR}`     -> process.env.VAR (left as-is if unset)
- * Also normalizes the result so `..` segments collapse.
- */
-export function expandPath(input: string): string {
-  let out = input;
-  if (out === '~') {
-    out = os.homedir();
-  } else if (out.startsWith('~/')) {
-    out = path.join(os.homedir(), out.slice(2));
-  }
-  out = out.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced: string | undefined, bare: string | undefined) => {
-    const name = braced ?? bare ?? '';
-    const value = process.env[name];
-    return value ?? match;
-  });
-  return path.normalize(out);
-}
-
-/**
- * Verify a session's working directory exists and is a directory before we
- * hand it to the SDK as `cwd`. Without this check the SDK's `query()` spawn
- * fails with `ENOENT`, which the SDK reports as "Claude Code native binary
- * not found" — completely misleading. See agent-pocket#224.
- */
-function assertWorkingDirectoryExists(dir: string): void {
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(dir);
-  } catch {
-    throw new Error(`Working directory does not exist: ${dir}`);
-  }
-  if (!stat.isDirectory()) {
-    throw new Error(`Working directory is not a directory: ${dir}`);
-  }
-}
 
 export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionState> = new Map();

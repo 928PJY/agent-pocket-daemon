@@ -18,13 +18,137 @@ import { CodexDiscovery, codexExternalSessionId, findOpenCodexRollouts, isCodexS
 import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CodexObserver } from './observers/codex-observer.js';
 import { HookServer } from './hooks/hook-server.js';
-import type { CodexHookRequest, HookPermissionRequest, HookToolResult, HookPermissionPrompt, HookPermissionExpired } from './hooks/hook-server.js';
+import type { CodexHookRequest } from './hooks/hook-server.js';
 import { findTerminalForPid, sendInterrupt as terminalSendInterrupt, sendMessage as terminalSendMessage } from './pty/tmux-injector.js';
 import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
-import { readLastTurnSummary } from './utils/transcript-reader.js';
+import {
+  readSessionMap,
+  getLatestSessionMapEntryForPid,
+  gcSessionMap,
+  cleanSessionMap,
+  removeSessionMapEntries,
+} from './utils/session-map.js';
+export { mergeSyncSessionIds } from './utils/session-map.js';
+import {
+  CodexStopHookDeduper,
+  findCodexHookRolloutPath,
+  getCodexCapabilities,
+  refreshCodexTerminalTarget,
+  resolveCodexExternalSessionId as resolveCodexExternalSessionIdHelper,
+  type CodexTerminalTargetEntry,
+} from './codex/codex-handler.js';
+import {
+  PeerCapabilities,
+  NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS,
+  type NotificationDeliveryEventType,
+} from './relay/phone-transport.js';
+import type { CommandContext } from './commands/command-context.js';
+import { STATIC_MODEL_CATALOG } from './commands/handlers/model-catalog.js';
+import {
+  handleGetSupportedModels as handleGetSupportedModelsExternal,
+  handleGetContextUsage as handleGetContextUsageExternal,
+  handleGetSupportedCommands as handleGetSupportedCommandsExternal,
+  handleGetSupportedAgents as handleGetSupportedAgentsExternal,
+  handleGetMcpServerStatus as handleGetMcpServerStatusExternal,
+} from './commands/handlers/capability-info.js';
+import {
+  handleReadFile as handleReadFileExternal,
+  handleGetHistory as handleGetHistoryExternal,
+  handleSyncRequest as handleSyncRequestExternal,
+} from './commands/handlers/file-and-history.js';
+import {
+  handleNewSession as handleNewSessionExternal,
+  handleResumeSession as handleResumeSessionExternal,
+  handleKillSession as handleKillSessionExternal,
+  handleInterruptSession as handleInterruptSessionExternal,
+  handleRewindSession as handleRewindSessionExternal,
+  type CodexLifecycleDeps,
+} from './commands/handlers/session-lifecycle.js';
+import {
+  handleSetPermissionMode as handleSetPermissionModeExternal,
+  handleSetModel as handleSetModelExternal,
+} from './commands/handlers/runtime-config.js';
+import {
+  handleEmergencyAbort as handleEmergencyAbortExternal,
+  handleSessionOutputAck as handleSessionOutputAckExternal,
+  handleNotificationDeliveryAck as handleNotificationDeliveryAckExternal,
+  handleVerifyHistory as handleVerifyHistoryExternal,
+  type VerifyHistoryDeps,
+} from './commands/handlers/acks.js';
+import {
+  handlePermissionResponse as handlePermissionResponseExternal,
+  handleQuestionResponse as handleQuestionResponseExternal,
+  type ResponseDeps,
+} from './commands/handlers/responses.js';
+import {
+  handleSendMessage as handleSendMessageExternal,
+  type SendMessageDeps,
+} from './commands/handlers/send-message.js';
+import {
+  handleListSessions as handleListSessionsExternal,
+  type ListSessionsDeps,
+} from './commands/handlers/list-sessions.js';
+import {
+  handleSetPreferences as handleSetPreferencesExternal,
+  handlePeerHello as handlePeerHelloExternal,
+  type PhonePreferences,
+} from './commands/handlers/preferences-and-peer.js';
+import { DiscoveryLoop } from './discovery/discovery-orchestrator.js';
+import {
+  type MessageSeqRef,
+} from './wiring/hook-handlers-codex.js';
+import { wireHookServer } from './wiring/hook-server-wiring.js';
+import {
+  attachCodexObserverHandlers as attachCodexObserverHandlersExternal,
+  sendCodexCompletion as sendCodexCompletionExternal,
+  createCompletionRequestIdGenerator,
+  type CodexObserverTracked,
+} from './wiring/codex-event-bridge.js';
+import {
+  buildPermissionContext as buildPermissionContextExternal,
+  isPlanModeTool as isPlanModeToolExternal,
+  findWorkingDirForSession as findWorkingDirForSessionExternal,
+  sendPlanForReview as sendPlanForReviewExternal,
+} from './wiring/permission-ui.js';
+import {
+  registerSessionStartedHandler,
+  registerPermissionModeChangedHandler,
+  registerSessionOutputHandler,
+  registerSessionEndedHandler,
+  registerPermissionRequestHandler,
+  registerSessionErrorHandler,
+  registerSessionStatusHandler,
+  registerPendingActionDetectedHandler,
+  registerSessionTitleHandler,
+  registerSessionInterruptedHandler,
+} from './wiring/session-manager-handlers.js';
+import {
+  registerCommandMessageHandler,
+  registerTransportErrorHandler,
+  registerDecryptErrorHandler,
+  registerRelayConnectedHandler,
+  registerLanConnectedHandler,
+  registerDisconnectedHandler,
+  registerPhoneOnlineHandler,
+  registerKeyVerifyHandler,
+} from './wiring/transport-handlers.js';
+import {
+  createNotificationBookkeeping,
+  type NotificationBookkeeping,
+  type PendingBlockingRequestEntry,
+  type PendingNotificationDeliveryEntry,
+} from './wiring/notification-bookkeeping.js';
+import {
+  sendFlattenedSessionOutput as sendFlattenedSessionOutputExternal,
+  sendSessionHistory as sendSessionHistoryExternal,
+} from './wiring/session-output-serializer.js';
+import {
+  discoverAndObserveSessions as discoverAndObserveSessionsExternal,
+  discoverAndObserveCodexSessions as discoverAndObserveCodexSessionsExternal,
+} from './wiring/session-discovery-loop.js';
 import type {
   PhoneCommand,
   ConnectionMode,
@@ -53,14 +177,9 @@ import type {
   SyncRequestCommand,
   NotificationDeliveryAckCommand,
   PcEvent,
-  SessionStartedEvent,
-  SessionOutputEvent,
-  SessionEndedEvent,
-  PermissionRequestEvent,
   SessionListEvent,
   FileContentEvent,
   ErrorEvent,
-  MessageAckEvent,
   HistoryDivergenceEvent,
   SyncCompleteEvent,
   ClaudeEvent,
@@ -70,17 +189,12 @@ import type {
   WakeBlobPayload,
 } from 'agent-pocket-protocol';
 import {
-  RISK_CLASSIFICATION,
-  RiskLevel,
-  PermissionDecision,
-  HOOK_HOLD_TIMEOUT_SECONDS,
   DAEMON_DEFAULT_PORT,
   SessionStatus,
   HOOK_SERVER_PORT,
   WIRE_VERSION_CURRENT,
   CURRENT_PEER_CAPABILITIES,
   PEER_CAPABILITIES,
-  BLOCKING_RETRY_INTERVAL_MS,
   BLOCKING_RETRY_CHECK_INTERVAL_MS,
 } from 'agent-pocket-protocol';
 import { VERSION } from './version.js';
@@ -105,24 +219,9 @@ export interface DaemonConfig {
   sessionSasKey?: string;
 }
 
-type CodexTerminalTargetEntry = {
-  pid?: number;
-  target?: TerminalTarget;
-  cwd?: string;
-  transcriptPath?: string;
-  turnId?: string;
-  updatedAt: number;
-};
-
-type NotificationDeliveryEventType = 'permission_request' | 'user_question' | 'plan_review' | 'session_completed' | 'session_error';
-
-// Notification delivery: when phone is online at emit time, the WS push went
-// out but the phone may go to background before processing it. We give the
-// phone a short window to ack; if the ack doesn't arrive, we send exactly one
-// forceWake APNs as the fallback and stop. When phone is offline at emit time,
-// the relay already routes to APNs — no tracking, no retry.
-const NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS = 3_000;
-const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 1_000;
+// CodexTerminalTargetEntry is imported above from './codex/codex-handler.js'.
+// NotificationDeliveryEventType + NOTIFICATION_DELIVERY_* constants are
+// imported above from './relay/phone-transport.js'.
 
 // Static catalog of Claude model ids the SDK accepts. Verified by probing all
 // 72 family×version×effort×1m combinations on SDK 0.2.129 — the SDK accepts
@@ -130,74 +229,18 @@ const NOTIFICATION_DELIVERY_RETRY_CHECK_INTERVAL_MS = 1_000;
 // back via getContextUsage().model. Query.supportedModels() on its own only
 // lists 4 alias entries plus the launched build, so older versions and effort
 // tiers are unreachable through the picker without this table.
-const STATIC_MODEL_CATALOG = {
-  entries: [
-    { family: 'sonnet', version: '4-5', version_label: '4.5', supports_one_m: true,  effort_levels: [] as Array<'low' | 'medium' | 'high' | 'xhigh' | 'max'> },
-    { family: 'sonnet', version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
-    { family: 'opus',   version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
-    { family: 'opus',   version: '4-6', version_label: '4.6', supports_one_m: true,  effort_levels: [] },
-    { family: 'opus',   version: '4-7', version_label: '4.7', supports_one_m: true,  effort_levels: ['low', 'medium', 'high', 'xhigh', 'max'] },
-    { family: 'haiku',  version: '4-5', version_label: '4.5', supports_one_m: false, effort_levels: [] },
-  ],
-} as const;
+// STATIC_MODEL_CATALOG moved to ./commands/handlers/model-catalog.ts
 
 // ============================================================================
 // AgentPocketDaemon
 // ============================================================================
 
-/** Format seconds as a compact human-readable duration: "12s", "1m23s", "1h05m". */
-function formatDuration(totalSeconds: number): string {
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}h${String(minutes).padStart(2, '0')}m`;
-  }
-  return `${minutes}m${String(seconds).padStart(2, '0')}s`;
-}
+// formatDuration / formatTokens / formatCompletionSubtitle live in
+// ./utils/completion-subtitle.ts (used only by hook-handlers-lifecycle now).
 
-/** Format a token count compactly: "923 tok", "12.3k tok", "1.2M tok". */
-function formatTokens(total: number): string {
-  if (total < 1000) return `${total} tok`;
-  if (total < 1_000_000) return `${(total / 1000).toFixed(total < 10_000 ? 1 : 0)}k tok`;
-  return `${(total / 1_000_000).toFixed(1)}M tok`;
-}
-
-/** Build the Session Completed subtitle: "3 tools · 1m23s · 12.3k tok". */
-function formatCompletionSubtitle(summary: { toolUseCount: number; totalTokens: number; durationSec: number }): string | undefined {
-  const parts: string[] = [];
-  if (summary.toolUseCount > 0) {
-    parts.push(`${summary.toolUseCount} ${summary.toolUseCount === 1 ? 'tool' : 'tools'}`);
-  }
-  if (summary.durationSec >= 1) parts.push(formatDuration(summary.durationSec));
-  if (summary.totalTokens > 0) parts.push(formatTokens(summary.totalTokens));
-  return parts.length > 0 ? parts.join(' · ') : undefined;
-}
-
-function truncateUtf8(value: string, maxBytes: number): string {
-  let bytes = 0;
-  let result = '';
-  for (const char of value) {
-    const charBytes = Buffer.byteLength(char, 'utf-8');
-    if (bytes + charBytes > maxBytes) break;
-    result += char;
-    bytes += charBytes;
-  }
-  return result;
-}
-
-function incrementInjectedMessageCount(injected: Map<string, number>, message: string): void {
-  injected.set(message, (injected.get(message) ?? 0) + 1);
-}
-
-function consumeInjectedMessage(injected: Map<string, number> | undefined, message: string): boolean {
-  const count = injected?.get(message) ?? 0;
-  if (count <= 0) return false;
-  if (count === 1) injected?.delete(message);
-  else injected?.set(message, count - 1);
-  return true;
-}
+// truncateUtf8 lives in ./utils/truncate-utf8.ts; imported below alongside the
+// other utils. Removing the duplicate local copy keeps a single source of
+// truth for APNs body sizing.
 
 function detectClaudeVersion(): string | undefined {
   try {
@@ -209,8 +252,6 @@ function detectClaudeVersion(): string | undefined {
   }
 }
 
-const CODEX_STOP_DEDUPE_MS = 5000;
-
 export class AgentPocketDaemon extends EventEmitter {
   private config: DaemonConfig;
   private sessionManager: SessionManager;
@@ -220,23 +261,21 @@ export class AgentPocketDaemon extends EventEmitter {
   private codexDiscovery: CodexDiscovery;
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
   private codexInjectedMessages: Map<string, Map<string, number>> = new Map();
-  private recentCodexStopHooks: Map<string, number> = new Map();
-  private completionRequestCounter = 0;
+  private codexStopHookDeduper = new CodexStopHookDeduper();
+  private completionRequestIdGen = createCompletionRequestIdGenerator();
   private claudeAgentVersion?: string;
   private codexTerminalTargets: Map<string, CodexTerminalTargetEntry> = new Map();
   private hookServer: HookServer;
   private lanServer: LanServer | null = null;
   private bonjourAdvertiser: BonjourAdvertiser | null = null;
-  private pidCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private discoveryLoop: DiscoveryLoop | null = null;
   // Hook server restart backoff state
   private hookRestartAttempts: number = 0;
   private hookRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Peer (phone) capability set learned from peer_hello. Empty until the
   // first peer_hello arrives over the E2E channel.
-  private peerCapabilities: Set<string> = new Set();
-  private peerProductVersion: string | null = null;
-  private peerWireVersion: number | null = null;
+  private peers = new PeerCapabilities();
 
   // Map internal session IDs to Claude session IDs (for resume)
   private sessionIdMap: Map<string, string> = new Map();
@@ -248,12 +287,18 @@ export class AgentPocketDaemon extends EventEmitter {
   private pendingSessionRequests: Map<string, string> = new Map();
   // Sequence counter for signed messages
   private messageSeq: number = 0;
+  // Read-then-increment view onto messageSeq, shared by every wiring module
+  // that needs to sign with the current value AND emit it as the wire seq.
+  private readonly messageSeqRef: MessageSeqRef = {
+    peek: () => this.messageSeq,
+    getAndIncrement: () => this.messageSeq++,
+  };
   // Per-session monotonic seq for session_output events (for phone gap detection)
   private sessionSeqCounters: Map<string, number> = new Map();
   // Last seq the phone has acked per session (best-effort telemetry)
   private lastAckedSeqs: Map<string, number> = new Map();
   // Phone preferences (sent via set_preferences command)
-  private phonePreferences: { showToolUse: boolean; showCompletionMetrics: boolean } = {
+  private phonePreferences: PhonePreferences = {
     showToolUse: false,
     showCompletionMetrics: true,
   };
@@ -283,6 +328,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }> = new Map();
   private blockingRetryInterval: ReturnType<typeof setInterval> | null = null;
   private notificationDeliveryRetryInterval: ReturnType<typeof setInterval> | null = null;
+  private bookkeeping!: NotificationBookkeeping;
 
   constructor(config: DaemonConfig) {
     super();
@@ -339,6 +385,20 @@ export class AgentPocketDaemon extends EventEmitter {
     this.codexDiscovery = new CodexDiscovery();
     this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
+
+    this.bookkeeping = createNotificationBookkeeping({
+      sessionSeqCounters: this.sessionSeqCounters,
+      pendingBlockingRequests: this.pendingBlockingRequests as unknown as Map<string, PendingBlockingRequestEntry>,
+      pendingNotificationDeliveries: this.pendingNotificationDeliveries as unknown as Map<string, PendingNotificationDeliveryEntry>,
+      getConnectionMode: () => this.config.connectionMode,
+      getLanServer: () => this.lanServer ?? null,
+      getRelayClient: () => this.relayClient ?? null,
+      cryptoEngine: this.cryptoEngine,
+      hasPeerCapability: (name) => this.hasPeerCapability(name),
+      sessionManager: this.sessionManager,
+      hookServer: this.hookServer,
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+    });
   }
 
   /**
@@ -387,16 +447,15 @@ export class AgentPocketDaemon extends EventEmitter {
     // daemon started, or PIDs reused by unrelated processes). One sweep at
     // startup is enough — entries written during this daemon's lifetime are
     // cleaned up by cleanSessionMap() on PID-death detection.
-    this.gcSessionMap();
+    gcSessionMap();
 
     // Periodically check observed PIDs and discover new CLI sessions
-    this.pidCheckInterval = setInterval(() => {
-      this.checkObservedSessionPids();
-      this.discoverAndObserveSessions().catch((err) => {
-        logger.error('daemon', `Periodic discovery error: ${(err as Error).message}`);
-      });
-      this.discoverAndObserveCodexSessions();
-    }, 5000);
+    this.discoveryLoop = new DiscoveryLoop({
+      checkObservedSessionPids: () => this.checkObservedSessionPids(),
+      discoverAndObserveSessions: () => this.discoverAndObserveSessions(),
+      discoverAndObserveCodexSessions: () => this.discoverAndObserveCodexSessions(),
+    });
+    this.discoveryLoop.start();
 
     // Periodically retry blocking requests that haven't received a phone response
     this.blockingRetryInterval = setInterval(() => {
@@ -413,9 +472,9 @@ export class AgentPocketDaemon extends EventEmitter {
    * Stop the daemon gracefully.
    */
   async stop(): Promise<void> {
-    if (this.pidCheckInterval) {
-      clearInterval(this.pidCheckInterval);
-      this.pidCheckInterval = null;
+    if (this.discoveryLoop) {
+      this.discoveryLoop.stop();
+      this.discoveryLoop = null;
     }
     if (this.hookRestartTimer) {
       clearTimeout(this.hookRestartTimer);
@@ -471,339 +530,90 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireSessionManagerEvents(): void {
-    this.sessionManager.on('session_started', (sessionId: string, workingDirectory: string, customTitle?: string) => {
-      // During initial discovery, suppress individual session events.
-      // The phone will get the full picture from the list_sessions response.
-      if (!this.initialDiscoveryDone) return;
+    const resolveExternalSessionId = (id: string) => this.resolveExternalSessionId(id);
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
+    const sendNotificationEventToPhone = (
+      event: PcEvent,
+      eventType: NotificationDeliveryEventType,
+      sessionId: string,
+      requestId: string,
+      wakePayload: Record<string, unknown>,
+    ) => this.sendNotificationEventToPhone(event, eventType, sessionId, requestId, wakePayload as unknown as WakeBlobPayload);
+    const sendFlattenedSessionOutput = (sessionId: string, e: ClaudeEvent, agentType: AgentType) =>
+      this.sendFlattenedSessionOutput(sessionId, e, agentType);
+    const isInitialDiscoveryDone = () => this.initialDiscoveryDone;
 
-      const requestId = this.findRequestIdForSession(sessionId);
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const state = this.sessionManager.getSession(sessionId);
-
-      const event: SessionStartedEvent = {
-        type: 'session_started',
-        session_id: externalId,
-        request_id: requestId ?? externalId,
-        working_directory: workingDirectory,
-        project_name: customTitle ?? path.basename(workingDirectory),
-        agent_type: 'claude_code',
-        agent_display_name: 'Claude Code',
-        agent_version: this.claudeAgentVersion,
-        capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-        is_observed: state?.isObserved ?? true,
-        ...(state && !state.isObserved
-          ? {
-              permission_mode: state.permissionMode ?? 'default',
-              dangerously_skip_permissions: state.config?.dangerously_skip_permissions === true,
-            }
-          : {}),
-      };
-
-      this.sendToPhone(event);
+    registerSessionStartedHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      findRequestIdForSession: (id) => this.findRequestIdForSession(id),
+      getClaudeAgentVersion: () => this.claudeAgentVersion,
+      isInitialDiscoveryDone,
+      sendToPhone,
     });
 
-    this.sessionManager.on('permission_mode_changed', (sessionId: string, mode) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      this.sendToPhone({
-        type: 'session_permission_mode_changed',
-        session_id: externalId,
-        mode,
-      });
+    registerPermissionModeChangedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
     });
 
-    this.sessionManager.on('session_output', (sessionId: string, claudeEvent: ClaudeEvent) => {
-      // Skip tool_use and tool_result events when phone has disabled tool use messages.
-      // When skipping tool_use, send an empty is_complete=true assistant_message to
-      // finalize the current streaming bubble, so the next text chunk starts a new bubble.
-      if (!this.phonePreferences.showToolUse &&
-          (claudeEvent.type === 'tool_use' || claudeEvent.type === 'tool_result')) {
-        if (claudeEvent.type === 'tool_use') {
-          const externalId = this.resolveExternalSessionId(sessionId);
-          this.sendToPhone({
-            type: 'session_output',
-            session_id: externalId,
-            timestamp: Date.now(),
-            output_type: 'assistant_message',
-            content: '',
-            is_complete: true,
-          } as unknown as PcEvent);
-        }
-        return;
-      }
-
-      this.sendFlattenedSessionOutput(this.resolveExternalSessionId(sessionId), claudeEvent, 'claude_code');
+    registerSessionOutputHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
+      sendFlattenedSessionOutput,
+      prefs: this.phonePreferences,
     });
 
-    this.sessionManager.on('session_ended', (sessionId: string, exitCode: number) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const errorRequestId = exitCode !== 0 ? `session_error_${externalId}_${Date.now()}` : undefined;
-      const event: SessionEndedEvent = {
-        type: 'session_ended',
-        session_id: externalId,
-        exit_code: exitCode,
-        end_reason: exitCode === 0 ? 'completed' : 'error',
-        ...(errorRequestId ? { request_id: errorRequestId } : {}),
-      };
-
-      if (exitCode !== 0) {
-        const sessionName = this.getSessionName(externalId);
-        this.sendNotificationEventToPhone(event, 'session_error', externalId, errorRequestId!, {
-          type: 'session_error',
-          session_name: sessionName,
-          body: `Session exited with code ${exitCode}`,
-          subtitle: sessionName,
-          sound: 'default',
-          category: 'SESSION_ERROR',
-          session_id: externalId,
-          request_id: errorRequestId,
-        });
-      } else {
-        this.sendToPhone(event);
-      }
-
-      // Clean up mappings
-      this.sessionIdMap.delete(sessionId);
-
-      // Clean up any pending blocking requests for this session
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-        }
-      }
-      if (exitCode === 0) {
-        this.clearNotificationDeliveriesForSession(externalId);
-      }
+    registerSessionEndedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      getSessionName: (id) => this.getSessionName(id),
+      sendToPhone,
+      sendNotificationEventToPhone,
+      sessionIdMap: this.sessionIdMap,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      clearNotificationDeliveriesForSession: (id) => this.clearNotificationDeliveriesForSession(id),
     });
 
-    this.sessionManager.on(
-      'permission_request',
-      (sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>) => {
-        const externalId = this.resolveExternalSessionId(sessionId);
-
-        // AskUserQuestion: forward as interactive question, don't auto-approve.
-        if (toolName === 'AskUserQuestion') {
-          const questions = (toolInput.questions as Array<{ question?: string }>) ?? [];
-          const questionPreview = questions[0]?.question ?? 'Claude has a question';
-          const flat: Record<string, unknown> = {
-            type: 'session_output',
-            session_id: externalId,
-            output_type: 'user_question',
-            request_id: requestId,
-            tool_input: toolInput,
-            timestamp: new Date().toISOString(),
-            ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-          };
-          this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, requestId, {
-            type: 'user_question',
-            session_name: this.getSessionName(externalId),
-            body: truncateUtf8(questionPreview, 256),
-            sound: 'default',
-            category: 'USER_QUESTION',
-            session_id: externalId,
-            request_id: requestId,
-          });
-          this.trackBlockingRequest(requestId, externalId, flat as unknown as PcEvent, 'user_question');
-          logger.debug('daemon', `Forwarded SDK AskUserQuestion as user_question for session ${externalId}`);
-          return;
-        }
-
-        // Plan mode: auto-approve EnterPlanMode and plan file edits.
-        // ExitPlanMode: send plan for phone review.
-        if (this.isPlanModeTool(toolName, toolInput)) {
-          if (toolName === 'ExitPlanMode') {
-            const session = this.sessionManager.getSession(sessionId);
-            const cwd = session?.workingDirectory ?? '';
-            this.sendPlanForReview(externalId, requestId, toolInput, cwd);
-            logger.debug('daemon', `SDK ExitPlanMode: sent plan to phone for review (${requestId})`);
-            return;
-          }
-          this.sessionManager.respondPermission(sessionId, requestId, PermissionDecision.APPROVE);
-          logger.debug('daemon', `SDK auto-approved plan mode tool: ${toolName} (${requestId})`);
-          return;
-        }
-
-        // SDK sessions: the SDK itself decides when to fire permission_request,
-        // so forward all other tools to the phone for approval.
-        const riskLevel = (RISK_CLASSIFICATION[toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-        const context = this.buildPermissionContext(toolName, toolInput);
-
-        // Sign the permission request
-        const signaturePayload = JSON.stringify({
-          session_id: sessionId,
-          request_id: requestId,
-          tool_name: toolName,
-          seq: this.messageSeq,
-          timestamp: Date.now(),
-        });
-
-        let pcSignature: string;
-        try {
-          pcSignature = this.cryptoEngine.sign(signaturePayload);
-        } catch {
-          pcSignature = '';
-        }
-
-        const event: PermissionRequestEvent = {
-          type: 'permission_request',
-          session_id: externalId,
-          request_id: requestId,
-          tool_name: toolName,
-          tool_input: toolInput,
-          risk_level: riskLevel as unknown as RiskLevel,
-          context,
-          pc_signature: pcSignature,
-          seq: this.messageSeq++,
-          timestamp: new Date().toISOString() as unknown as number,
-          ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        };
-
-        this.sendToPhone(event);
-        this.trackBlockingRequest(requestId, externalId, event, 'permission_request');
-      },
-    );
-
-    this.sessionManager.on('error', (sessionId: string, error: Error) => {
-      const event: ErrorEvent = {
-        type: 'error',
-        message: `Session ${sessionId}: ${error.message}`,
-        code: 'SESSION_ERROR',
-      };
-
-      this.sendToPhone(event);
+    registerPermissionRequestHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      isPlanModeTool: (name, input) => this.isPlanModeTool(name, input),
+      sendPlanForReview: (sId, rId, input, cwd) => this.sendPlanForReview(sId, rId, input, cwd),
+      buildPermissionContext: (name, input) => this.buildPermissionContext(name, input),
+      getSessionName: (id) => this.getSessionName(id),
+      cryptoEngine: this.cryptoEngine,
+      messageSeq: this.messageSeqRef,
+      sendToPhone,
+      sendNotificationEventToPhone,
+      trackBlockingRequest: (rId, sId, event, type) => this.trackBlockingRequest(rId, sId, event, type),
     });
 
-    this.sessionManager.on('session_status', (sessionId: string, status: SessionStatus) => {
-      if (!this.initialDiscoveryDone) return;
+    registerSessionErrorHandler(this.sessionManager, { sendToPhone });
 
-      const externalId = this.resolveExternalSessionId(sessionId);
-
-      // If observer reports running/ready and we only have startup-synthetic pending
-      // entries for this session, clean them up — the terminal user resolved it.
-      if (status === SessionStatus.RUNNING || status === SessionStatus.READY) {
-        const syntheticId = `startup_pending_${externalId}`;
-        if (this.pendingBlockingRequests.has(syntheticId)) {
-          this.pendingBlockingRequests.delete(syntheticId);
-          // Also clear pending_actions in session-manager so handleListSessions picks it up
-          const session = this.sessionManager.getAllSessions().find(
-            s => this.resolveExternalSessionId(s.sessionId) === externalId
-              || s.claudeSessionId === externalId,
-          );
-          if (session) {
-            this.sessionManager.clearPendingActions(session.sessionId);
-          }
-          logger.debug('daemon', `Cleaned up startup synthetic pending for session ${externalId.slice(0, 8)} (observer=${status})`);
-        }
-      }
-
-      // If session has pending blocking requests, keep showing pending_actions
-      // regardless of what the observer reports (observer doesn't know about hooks).
-      const hasPending = Array.from(this.pendingBlockingRequests.values()).some(
-        e => e.sessionId === externalId,
-      );
-      const effectiveStatus = hasPending ? SessionStatus.PENDING_ACTIONS : status;
-
-      logger.debug('daemon', `session_status: observer=${status} effective=${effectiveStatus}`, { sessionId: externalId, hasPending, pendingCount: this.pendingBlockingRequests.size });
-
-      const event: Record<string, unknown> = {
-        type: 'session_status',
-        session_id: externalId,
-        status: effectiveStatus,
-      };
-
-      // Include action_type when in pending_actions state
-      if (hasPending) {
-        const pendingEntry = Array.from(this.pendingBlockingRequests.values()).find(
-          e => e.sessionId === externalId,
-        );
-        if (pendingEntry) {
-          event.action_type = pendingEntry.type;
-        }
-      }
-
-      this.sendToPhone(event as unknown as PcEvent);
+    registerSessionStatusHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      isInitialDiscoveryDone,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendToPhone,
     });
 
-    // Session detected as pending user action on startup (JSONL analysis)
-    this.sessionManager.on('pending_action_detected', (sessionId: string, toolName?: string) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const syntheticId = `startup_pending_${externalId}`;
-
-      // Map tool name to action type
-      let actionType: 'permission_request' | 'user_question' | 'plan_review' = 'permission_request';
-      if (toolName === 'AskUserQuestion') actionType = 'user_question';
-      else if (toolName === 'ExitPlanMode') actionType = 'plan_review';
-
-      // Create a synthetic blocking request so session stays in pending_actions
-      // until the user acts (observer status_change won't override it).
-      // Mark as expiredToTerminal so retryPendingBlockingRequests doesn't clean it up.
-      const entry: any = {
-        requestId: syntheticId,
-        sessionId: externalId,
-        event: { type: 'session_status', session_id: externalId, status: SessionStatus.PENDING_ACTIONS } as unknown as PcEvent,
-        sentAt: Date.now(),
-        type: actionType,
-        toolName,
-        expiredToTerminal: true,
-      };
-      this.pendingBlockingRequests.set(syntheticId, entry);
-      logger.info('daemon', `Startup pending action detected for session ${externalId.slice(0, 8)}, tool=${toolName}`);
+    registerPendingActionDetectedHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      pendingBlockingRequests: this.pendingBlockingRequests,
     });
 
-    this.sessionManager.on('session_title', (sessionId: string, title: string) => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const event = {
-        type: 'session_title',
-        session_id: externalId,
-        title,
-      };
-      this.sendToPhone(event as unknown as PcEvent);
+    registerSessionTitleHandler(this.sessionManager, {
+      resolveExternalSessionId,
+      sendToPhone,
     });
 
-    // Terminal user pressed Esc/Ctrl+C — observer detected synthetic interrupt
-    // message in JSONL. Clean up any pending blocking requests for this session
-    // (the held hook HTTP connection may already be gone, but we also clear
-    // the daemon-side retry tracking) and tell the phone the session is ready.
-    this.sessionManager.on('session_interrupted', (sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer') => {
-      const externalId = this.resolveExternalSessionId(sessionId);
-      const session = this.sessionManager.getAllSessions().find(s => s.sessionId === sessionId);
-
-      logger.info('daemon', `session_interrupted (${reason}, ${source}) for ${externalId.slice(0, 8)}`);
-
-      // Drop every pending blocking request targeting this session, and tell
-      // the phone to remove the corresponding card so it doesn't keep ticking.
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          const ev = entry.event as any;
-          const toolName = ev?.tool_name ?? '';
-          this.sendToPhone({
-            type: 'permission_dismissed',
-            request_id: reqId,
-            tool_name: toolName,
-            session_id: externalId,
-            cancelled: true,
-          } as unknown as PcEvent);
-        }
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      // SDK-driven interrupt has no JSONL trail, so emit a synthetic system
-      // message so the phone shows visible feedback. Observer-mode interrupts
-      // already surface via the JSONL synthetic interrupt entry.
-      if (source === 'sdk') {
-        this.sendFlattenedSessionOutput(externalId, {
-          type: 'system_message',
-          message: 'Session interrupted by user',
-        }, 'claude_code');
-      }
-
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: externalId,
-        status: SessionStatus.READY,
-      } as unknown as PcEvent);
+    registerSessionInterruptedHandler(this.sessionManager, {
+      sessionManager: this.sessionManager,
+      resolveExternalSessionId,
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      sendToPhone,
+      sendFlattenedSessionOutput,
     });
   }
 
@@ -812,134 +622,51 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireRelayClientEvents(): void {
-    this.relayClient!.on('message', (payload: unknown) => {
-      const cmdType = (payload as { type?: string; request_id?: string })?.type;
-      const reqId = (payload as { request_id?: string })?.request_id;
-      logger.trace('daemon', 'IN relay command', { type: cmdType, requestId: reqId, preview: JSON.stringify(payload).slice(0, 100) });
+    const relay = this.relayClient!;
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
 
-      if (cmdType === 'peer_hello') {
-        this.handlePeerHello(payload as PeerHello);
-        return;
-      }
-
-      const command = payload as PhoneCommand;
-      this.handleCommand(command).catch((err) => {
-        logger.error('daemon', `Command handler error: ${(err as Error).message}`, { type: cmdType, requestId: reqId });
-        const errorEvent: ErrorEvent = {
-          type: 'error',
-          request_id: (command as { request_id?: string }).request_id,
-          message: `Command handler error: ${(err as Error).message}`,
-          code: 'COMMAND_ERROR',
-        };
-        this.sendToPhone(errorEvent);
-      });
+    registerCommandMessageHandler(relay, {
+      source: 'relay',
+      handlePeerHello: (p) => this.handlePeerHello(p),
+      handleCommand: (c) => this.handleCommand(c),
+      sendToPhone,
     });
 
-    this.relayClient!.on('connected', () => {
-      logger.debug('daemon', '=== CONNECTED to relay ===');
-      logger.info('daemon', 'Connected to relay');
-      this.emit('connected');
+    registerRelayConnectedHandler(relay, {
+      emitConnected: () => this.emit('connected'),
     });
 
-    this.relayClient!.on('phone_online', () => {
-      logger.debug('daemon', 'Phone online, resending pending requests', { count: this.pendingBlockingRequests.size });
-
-      // Send peer_hello over the encrypted channel so the phone can learn
-      // our product version and capability set.
-      this.sendPeerHello();
-
-      // Send key fingerprint for E2E verification
-      const fp = this.cryptoEngine.sendKeyFingerprint();
-      if (fp) {
-        this.relayClient!.sendControlFrame({ action: 'key_verify', key_fingerprint: fp });
-      }
-
-      let resent = 0;
-      for (const [requestId, entry] of this.pendingBlockingRequests) {
-        logger.debug('daemon', 'reconnect resend candidate', {
-          requestId,
-          sessionId: entry.sessionId,
-          eventType: (entry.event as any)?.type,
-          actionType: (entry as any).type,
-          expiredToTerminal: !!(entry as any).expiredToTerminal,
-        });
-        // Expired-to-terminal entries: still resend so a freshly launched phone
-        // (no in-memory cache) can rebuild the card. Then send a
-        // permission_expired event so the card shows the timed-out banner.
-        if ((entry as any).expiredToTerminal) {
-          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
-          const expiredToolName = (entry.event as any)?.tool_name ?? (entry as any).toolName ?? entry.type;
-          this.sendToPhone({
-            type: 'permission_expired',
-            session_id: entry.sessionId,
-            request_id: requestId,
-            tool_name: expiredToolName,
-          } as unknown as PcEvent);
-          logger.info('daemon', 'Resent expired pending action to phone', {
-            sessionId: entry.sessionId,
-            requestId,
-            toolName: expiredToolName,
-            actionType: entry.type,
-          });
-          this.sendExpiredPendingSystemMessage(entry.sessionId, requestId, expiredToolName, entry.type, entry);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-          this.sendToPhone({
-            type: 'session_status',
-            session_id: entry.sessionId,
-            status: SessionStatus.PENDING_ACTIONS,
-            action_type: entry.type,
-          } as unknown as PcEvent);
-          resent++;
-          continue;
-        }
-
-        const hookPending = this.hookServer.hasPendingPermission(requestId);
-        const sdkPending = this.sessionManager.getAllSessions().some(
-          s => s.pendingPermissions?.has(requestId),
-        );
-        if (hookPending || sdkPending) {
-          this.resendTrackedBlockingEvent(entry.type, entry.sessionId, requestId, entry.event);
-          entry.sentAt = Date.now();
-          resent++;
-        } else {
-          this.pendingBlockingRequests.delete(requestId);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-        }
-      }
-      logger.debug('daemon', `Resent ${resent} pending blocking requests`);
+    registerPhoneOnlineHandler(relay, {
+      hookServer: this.hookServer,
+      sessionManager: this.sessionManager,
+      sendPeerHello: () => this.sendPeerHello(),
+      getKeyFingerprint: () => this.cryptoEngine.sendKeyFingerprint(),
+      sendControlFrame: (f) => relay.sendControlFrame(f),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      resendTrackedBlockingEvent: (type, sId, rId, event) =>
+        this.resendTrackedBlockingEvent(type, sId, rId, event),
+      sendToPhone,
+      sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) =>
+        this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
+      clearNotificationDelivery: (et, sId, rId) =>
+        this.clearNotificationDelivery(et, sId, rId),
     });
 
-    this.relayClient!.on('key_verify', (peerFingerprint: string) => {
-      const expected = this.cryptoEngine.recvKeyFingerprint();
-      if (!expected) return;
-      if (peerFingerprint === expected) {
-        logger.info('daemon', 'E2E key verification passed');
-      } else {
-        logger.error('daemon', 'E2E key mismatch — phone has stale keys', { expected, received: peerFingerprint });
-        this.relayClient!.sendControlFrame({
-          action: 'e2e_error',
-          message: 'E2E key mismatch. Please re-pair the device.',
-        });
-      }
+    registerKeyVerifyHandler(relay, {
+      getExpectedFingerprint: () => this.cryptoEngine.recvKeyFingerprint(),
+      sendControlFrame: (f) => relay.sendControlFrame(f),
     });
 
-    this.relayClient!.on('disconnected', (reason: string) => {
-      logger.warn('daemon', `Disconnected from relay: ${reason}`);
-      this.emit('disconnected', reason);
+    registerDisconnectedHandler(relay, {
+      source: 'relay',
+      emitDisconnected: (reason) => { this.emit('disconnected', reason); },
     });
 
-    this.relayClient!.on('error', (error: Error) => {
-      logger.error('daemon', `Relay error: ${error.message}`);
-    });
+    registerTransportErrorHandler(relay, 'relay');
 
-    this.relayClient!.on('decrypt_error', (count: number) => {
-      logger.warn('daemon', `E2E decrypt failed ${count} times — phone may need to re-pair`);
-      if (count === 3) {
-        this.relayClient!.sendControlFrame({
-          action: 'e2e_error',
-          message: 'Decryption failed. Please re-pair the device.',
-        });
-      }
+    registerDecryptErrorHandler(relay, {
+      source: 'relay',
+      sendE2EError: (message) => relay.sendControlFrame({ action: 'e2e_error', message }),
     });
   }
 
@@ -948,55 +675,31 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireLanServerEvents(): void {
-    this.lanServer!.on('message', (payload: unknown) => {
-      const cmdType = (payload as { type?: string })?.type;
-      const reqId = (payload as { request_id?: string })?.request_id;
-      logger.trace('daemon', 'IN lan command', { type: cmdType, requestId: reqId, preview: JSON.stringify(payload).slice(0, 100) });
+    const lan = this.lanServer!;
+    const sendToPhone = (event: PcEvent) => this.sendToPhone(event);
 
-      if (cmdType === 'peer_hello') {
-        this.handlePeerHello(payload as PeerHello);
-        return;
-      }
-
-      const command = payload as PhoneCommand;
-      this.handleCommand(command).catch((err) => {
-        logger.error('daemon', `Command handler error (lan): ${(err as Error).message}`, { type: cmdType, requestId: reqId });
-        const errorEvent: ErrorEvent = {
-          type: 'error',
-          request_id: (command as { request_id?: string }).request_id,
-          message: `Command handler error: ${(err as Error).message}`,
-          code: 'COMMAND_ERROR',
-        };
-        this.sendToPhone(errorEvent);
-      });
+    registerCommandMessageHandler(lan, {
+      source: 'lan',
+      handlePeerHello: (p) => this.handlePeerHello(p),
+      handleCommand: (c) => this.handleCommand(c),
+      sendToPhone,
     });
 
-    this.lanServer!.on('connected', () => {
-      logger.debug('daemon', '=== CONNECTED via LAN ===');
-      logger.info('daemon', 'Connected via LAN');
-      // LAN connect implies authenticated + E2E session keys ready, so we can
-      // send peer_hello immediately.
-      this.sendPeerHello();
-      this.emit('connected');
+    registerLanConnectedHandler(lan, {
+      sendPeerHello: () => this.sendPeerHello(),
+      emitConnected: () => this.emit('connected'),
     });
 
-    this.lanServer!.on('disconnected', (reason: string) => {
-      logger.warn('daemon', `Disconnected from LAN: ${reason}`);
-      this.emit('disconnected', reason);
+    registerDisconnectedHandler(lan, {
+      source: 'lan',
+      emitDisconnected: (reason) => { this.emit('disconnected', reason); },
     });
 
-    this.lanServer!.on('error', (error: Error) => {
-      logger.error('daemon', `LAN error: ${error.message}`);
-    });
+    registerTransportErrorHandler(lan, 'lan');
 
-    this.lanServer!.on('decrypt_error', (count: number) => {
-      logger.warn('daemon', `E2E decrypt failed ${count} times (LAN) — phone may need to re-pair`);
-      if (count === 3) {
-        this.lanServer!.send({
-          type: 'e2e_error',
-          message: 'Decryption failed. Please re-pair the device.',
-        });
-      }
+    registerDecryptErrorHandler(lan, {
+      source: 'lan',
+      sendE2EError: (message) => lan.send({ type: 'e2e_error', message }),
     });
   }
 
@@ -1005,534 +708,113 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wireHookServerEvents(): void {
-    // PreToolUse hook: pass through everything. The hook exists only to establish
-    // tool_use_id correlation for PermissionRequest matching and PostToolUse cleanup.
-    // All actual permission handling happens in the PermissionRequest hook.
-    this.hookServer.on('permission_request', (request: HookPermissionRequest) => {
-      this.hookServer.resolvePermissionEmpty(request.toolUseId);
-    });
-
-    this.hookServer.on('tool_result', (result: HookToolResult) => {
-      // Skip tool_result events when phone has disabled tool use messages
-      if (!this.phonePreferences.showToolUse) return;
-
-      const session = this.sessionManager.findByClaudeSessionId(result.sessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : result.sessionId;
-
-      const flat: Record<string, unknown> = {
-        type: 'session_output',
-        session_id: externalId,
-        timestamp: Date.now(),
-        output_type: 'tool_result',
-        tool_use_id: result.toolUseId,
-        output: typeof result.toolResponse === 'string'
-          ? result.toolResponse
-          : JSON.stringify(result.toolResponse ?? ''),
-        is_error: false,
-      };
-
-      this.sendToPhone(flat as unknown as PcEvent);
-    });
-
-    this.hookServer.on('error', (err: Error) => {
-      logger.error('daemon', `Hook server error: ${err.message}`);
-      this.restartHookServer();
-    });
-
-    this.hookServer.on('permission_expired', (expired: HookPermissionExpired) => {
-      const session = this.sessionManager.findByClaudeSessionId(expired.sessionId);
-      const codexExternalId = this.resolveCodexExternalSessionId(expired.sessionId);
-      const externalId = codexExternalId
-        ? codexExternalId
-        : session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : expired.sessionId;
-
-      const event = {
-        type: 'permission_expired',
-        session_id: externalId,
-        request_id: expired.toolUseId,
-        tool_name: expired.toolName,
-      };
-
-      this.sendToPhone(event as unknown as PcEvent);
-
-      // Timeout transfers the request back to the terminal. Keep the expired
-      // banner in chat, but stop treating it as an app-blocking action so a
-      // later permission can surface normally.
-      const blocking = this.pendingBlockingRequests.get(expired.toolUseId);
-      if (blocking) {
-        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, blocking.type, blocking);
-        this.pendingBlockingRequests.delete(expired.toolUseId);
-        this.clearNotificationDelivery(blocking.type, externalId, expired.toolUseId);
-      } else {
-        this.sendExpiredPendingSystemMessage(externalId, expired.toolUseId, expired.toolName, 'permission_request');
-        this.clearNotificationDelivery('permission_request', externalId, expired.toolUseId);
-      }
-      const hasOtherBlocking = Array.from(this.pendingBlockingRequests.values()).some(
-        entry => entry.sessionId === externalId,
-      );
-      if (!hasOtherBlocking) {
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: externalId,
-          status: SessionStatus.READY,
-        } as unknown as PcEvent);
-      }
-      logger.debug('daemon', `Permission expired for ${expired.toolName} (${expired.toolUseId})`);
-    });
-
-    this.hookServer.on('codex_session_start', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.READY;
-        tracked.lastActivity = Date.now();
-      }
-      if (this.initialDiscoveryDone) {
-        const cwd = request.cwd || tracked?.session.cwd || '';
-        const event: SessionStartedEvent = {
-          type: 'session_started',
-          session_id: sessionId,
-          request_id: sessionId,
-          working_directory: cwd,
-          project_name: tracked?.session.title ?? (cwd ? path.basename(cwd) : 'Codex'),
-          agent_type: 'codex',
-          agent_display_name: 'Codex',
-          agent_version: tracked?.session.cliVersion,
-          capabilities: this.getCodexCapabilities(sessionId),
-        };
-        this.sendToPhone(event);
-      }
-      logger.info('daemon', 'Codex SessionStart hook', { sessionId, source: request.source, pid: request.codexPid });
-    });
-
-    this.hookServer.on('codex_user_prompt_submit', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.RUNNING;
-        tracked.lastActivity = Date.now();
-      }
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: sessionId,
-        status: SessionStatus.RUNNING,
-      } as unknown as PcEvent);
-    });
-
-    this.hookServer.on('codex_stop', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const tracked = this.codexObservers.get(sessionId);
-      if (tracked) {
-        tracked.status = SessionStatus.READY;
-        tracked.lastActivity = Date.now();
-      }
-      this.recordCodexStopHook(sessionId);
-      this.sendCodexCompletion(sessionId, tracked?.session);
-    });
-
-    this.hookServer.on('codex_permission_request', (request: CodexHookRequest) => {
-      const sessionId = this.recordCodexHookActivity(request);
-      const requestId = request.toolUseId ?? `codex_hook_${Date.now()}`;
-      const toolName = request.toolName ?? 'unknown';
-      const toolInput = request.toolInput ?? {};
-      const riskLevel = (RISK_CLASSIFICATION[toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-      const context = this.buildPermissionContext(toolName, toolInput);
-
-      let pcSignature: string;
-      try {
-        pcSignature = this.cryptoEngine.sign(JSON.stringify({
-          session_id: sessionId,
-          request_id: requestId,
-          tool_name: toolName,
-          seq: this.messageSeq,
-          timestamp: Date.now(),
-        }));
-      } catch {
-        pcSignature = '';
-      }
-
-      const event: PermissionRequestEvent = {
-        type: 'permission_request',
-        session_id: sessionId,
-        request_id: requestId,
-        tool_name: toolName,
-        tool_input: toolInput,
-        risk_level: riskLevel as unknown as RiskLevel,
-        context,
-        pc_signature: pcSignature,
-        seq: this.messageSeq++,
-        timestamp: new Date().toISOString() as unknown as number,
-        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        // Codex PermissionRequest hook payloads do not expose always-allow suggestions yet.
-        has_always_allow: false,
-      };
-
-      this.sendNotificationEventToPhone(event, 'permission_request', sessionId, requestId, {
-        type: 'permission_request',
-        session_name: this.getSessionName(sessionId),
-        body: truncateUtf8(`${toolName}: ${context}`, 256),
-        sound: 'default',
-        category: 'PERMISSION_REQUEST',
-        session_id: sessionId,
-        request_id: requestId,
-      });
-      this.trackBlockingRequest(requestId, sessionId, event, 'permission_request');
-      logger.debug('daemon', 'Forwarded Codex PermissionRequest', { tool: toolName, requestId, sessionId });
-    });
-
-    // Local API: return tracked sessions for CLI `sessions` command
-    this.hookServer.on('api_sessions', (respond: (sessions: unknown) => void) => {
-      const sessions = this.sessionManager.getAllSessions().map(s => ({
-        sessionId: s.claudeSessionId ?? s.sessionId,
-        status: s.status,
-        pid: s.terminalPid,
-        cwd: s.workingDirectory,
-        isObserved: s.isObserved,
-        customTitle: s.customTitle,
-        entrypoint: s.entrypoint,
-        lastActivity: s.lastActivity,
-      }));
-      respond(sessions);
-    });
-
-    this.hookServer.on('api_status', (respond: (status: unknown) => void) => {
-      respond({
-        relay: this.relayClient?.getConnectionState() ?? 'not configured',
-        phone: this.relayClient?.getPhonePeerOnline() ?? false,
-        offlineQueue: this.relayClient?.getOfflineQueueSize() ?? 0,
-        sessions: this.sessionManager.getAllSessions().length,
-      });
-    });
-
-    // Stop hook: Claude finished a turn — update session status to ready
-    this.hookServer.on('session_stop', async (claudeSessionId: string, transcriptPath?: string) => {
-      const firedAt = Date.now();
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      const projectName = session?.customTitle ?? (session ? path.basename(session.workingDirectory) : 'Session');
-
-      logger.info('daemon', 'Stop hook fired', {
-        sessionId: externalId,
-        claudeSessionId: claudeSessionId?.substring(0, 8),
-        internalSessionId: session?.sessionId,
-        hasTranscriptPath: !!transcriptPath,
-        firedAt,
-      });
-
-      // Claude finished this turn — any pending blocking requests we were still
-      // tracking for this session are stale (resolved, expired, or interrupted).
-      // Drop them so retryPendingBlockingRequests / list refresh don't resurface
-      // them as "Need action".
-      let cleared = 0;
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          this.clearNotificationDelivery(entry.type, entry.sessionId, reqId);
-          cleared++;
-        }
-      }
-      if (cleared > 0) {
-        logger.info('daemon', `Stop hook cleared ${cleared} stale pending blocking request(s)`, { sessionId: externalId });
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      const event: Record<string, unknown> = {
-        type: 'session_status',
-        session_id: externalId,
-        status: 'ready',
-      };
-
-      // Read the end-of-turn summary from the JSONL transcript. This is the
-      // sole source of truth for completion text + per-turn metrics; if the
-      // transcript doesn't yield an end_turn line we send an empty body and
-      // no subtitle metrics.
-      let completionBody = '';
-      let subtitle: string | undefined;
-      if (transcriptPath) {
-        try {
-          const summary = await readLastTurnSummary(transcriptPath);
-          if (summary) {
-            completionBody = summary.text;
-            subtitle = formatCompletionSubtitle(summary);
-            logger.debug('daemon', 'readLastTurnSummary ok', {
-              sessionId: externalId,
-              textLen: summary.text.length,
-              tokens: summary.totalTokens,
-              tools: summary.toolUseCount,
-              durSec: summary.durationSec,
-            });
-          } else {
-            logger.warn('daemon', 'readLastTurnSummary returned null', {
-              sessionId: externalId,
-              transcriptPath,
-              firedAt,
-            });
-          }
-        } catch (err) {
-          logger.warn('daemon', 'readLastTurnSummary threw', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      } else {
-        logger.warn('daemon', 'Stop hook has no transcriptPath', { sessionId: externalId });
-      }
-
-      // Attach completion details so iOS can render the same body/subtitle
-      // in the local notification when the app is foreground/background but
-      // the relevant chat isn't on screen. is_completion marks this as the
-      // authoritative end-of-turn event (vs. the observer path which can fire
-      // a status=ready transition without any completion data).
-      const completionRequestId = this.nextCompletionRequestId(externalId, firedAt);
-      event.is_completion = true;
-      event.completion_request_id = completionRequestId;
-      event.completion_body = completionBody;
-      if (subtitle) event.completion_subtitle = subtitle;
-
-      this.sendNotificationEventToPhone(event as unknown as PcEvent, 'session_completed', externalId, completionRequestId, {
-        type: 'session_completed',
-        session_name: projectName,
-        body: truncateUtf8(completionBody.trim() || 'Session finished', 256),
-        subtitle,
-        sound: 'completion.caf',
-        category: 'SESSION_COMPLETED',
-        session_id: externalId,
-        request_id: completionRequestId,
-      });
-
-      // Also append a chat-side metrics chip (rendered as a system message)
-      // so the user can see this turn's cost retrospectively, even on the
-      // active session where the push notification is suppressed. We delay
-      // this slightly so the SDK-stream path has time to flush the final
-      // assistant_message to the phone first — otherwise the metrics chip
-      // appears above the message it's summarizing.
-      if (subtitle && this.phonePreferences.showCompletionMetrics) {
-        setTimeout(() => {
-          this.sendToPhone({
-            type: 'session_output',
-            session_id: externalId,
-            output_type: 'completion_metrics',
-            content: subtitle,
-            timestamp: Date.now(),
-          } as unknown as PcEvent);
-        }, 500);
-      }
-    });
-
-    // StopFailure hook: Claude's turn ended via API error. Same cleanup as
-    // Stop, but log the error and skip the "Session Complete" notification.
-    this.hookServer.on('session_stop_failure', (claudeSessionId: string, error: string) => {
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      logger.warn('daemon', 'StopFailure hook', { sessionId: externalId, error });
-
-      let cleared = 0;
-      for (const [reqId, entry] of this.pendingBlockingRequests) {
-        if (entry.sessionId === externalId) {
-          this.pendingBlockingRequests.delete(reqId);
-          cleared++;
-        }
-      }
-      if (cleared > 0) {
-        logger.info('daemon', `StopFailure cleared ${cleared} stale pending blocking request(s)`, { sessionId: externalId });
-      }
-      if (session) {
-        this.sessionManager.clearPendingActions(session.sessionId);
-      }
-
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: externalId,
-        status: SessionStatus.READY,
-      } as unknown as PcEvent);
-    });
-
-    // SessionEnd hook: fired when /clear runs (with the OLD session ID)
-    this.hookServer.on('session_end', (claudeSessionId: string, reason: string, cwd: string, _transcriptPath: string) => {
-      logger.info('daemon', 'SessionEnd hook', { claudeSessionId, reason });
-
-      if (reason !== 'clear') return;
-
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      if (!session) {
-        logger.debug('daemon', `SessionEnd(clear): session ${claudeSessionId} not found, ignoring`);
-        return;
-      }
-
-      const oldInternalId = session.sessionId;
-      const externalId = this.resolveExternalSessionId(oldInternalId);
-
-      // Store terminal info for the upcoming SessionStart
-      if (session.terminalPid) {
-        this.pendingClearInfo.set(cwd, {
-          pid: session.terminalPid,
-          cwd: session.workingDirectory,
-          target: session.terminalTarget,
-          entrypoint: session.entrypoint,
-        });
-        // Auto-clean after 30s in case SessionStart never arrives
-        setTimeout(() => this.pendingClearInfo.delete(cwd), 30_000);
-      }
-
-      // Notify phone that old session ended
-      const endEvent: SessionEndedEvent = {
-        type: 'session_ended',
-        session_id: externalId,
-        exit_code: 0,
-        end_reason: 'completed',
-      };
-      this.sendToPhone(endEvent);
-
-      // Clean up old session
-      this.sessionManager.markObservedSessionHistory(oldInternalId);
-      this.sessionIdMap.delete(oldInternalId);
-      this.sessionManager.removeSession(oldInternalId);
-      this.replacedSessionIds.add(claudeSessionId);
-
-      logger.debug('daemon', `SessionEnd(clear): ended old session ${externalId}, awaiting SessionStart`);
-    });
-
-    // SubagentStop hook: fired when a Task-dispatched subagent finishes.
-    // Forward to the matching SessionObserver so its SubagentObserver can
-    // mark the agent done immediately (instead of waiting for activity timeout).
-    this.hookServer.on('subagent_stop', (claudeSessionId: string, agentId: string, agentType: string, _transcriptPath: string) => {
-      logger.debug('daemon', `SubagentStop hook: session=${claudeSessionId}, agent=${agentId} (${agentType})`);
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      if (!session) {
-        logger.warn('daemon', `SubagentStop: no session found for ${claudeSessionId} — falling back to broadcast`);
-        // Parent session may not yet be tracked when subagent finishes very
-        // fast; fan out to every observer so whoever owns this agent picks it up.
-        for (const s of this.sessionManager.getAllSessions()) {
-          s.observer?.markSubagentDone(agentId);
-        }
-        return;
-      }
-      if (!session.observer) {
-        logger.warn('daemon', `SubagentStop: session ${claudeSessionId} has no observer`);
-        return;
-      }
-      session.observer.markSubagentDone(agentId);
-    });
-
-    // SubagentStart hook: fired when a Task-dispatched subagent is spawned.
-    // Pre-registers the agent so iOS shows the placeholder before the first
-    // jsonl message is polled (~500ms savings).
-    this.hookServer.on('subagent_start', (claudeSessionId: string, agentId: string, agentType: string, _transcriptPath: string) => {
-      logger.debug('daemon', `SubagentStart hook: session=${claudeSessionId}, agent=${agentId} (${agentType})`);
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      session?.observer?.markSubagentStart(agentId, agentType);
-    });
-
-    // SessionStart hook: fired after /clear with the NEW session ID
-    this.hookServer.on('session_start', (claudeSessionId: string, source: string, cwd: string, transcriptPath: string) => {
-      logger.info('daemon', 'SessionStart hook', { claudeSessionId, source });
-
-      if (source !== 'clear') return;
-
-      // Already tracked? Skip.
-      if (this.sessionManager.findByClaudeSessionId(claudeSessionId)) return;
-
-      // Look up the terminal info from the preceding SessionEnd
-      let clearInfo = this.pendingClearInfo.get(cwd);
-      if (clearInfo) {
-        this.pendingClearInfo.delete(cwd);
-      } else {
-        // SessionEnd may not have fired yet, or daemon restarted.
-        // Use session-map.json to find the PID, then look up terminal info
-        // from the currently observed session for that PID.
-        const mapped = this.readSessionMap();
-        const mapEntry = mapped[claudeSessionId];
-        if (mapEntry?.pid) {
-          const existing = this.sessionManager.findByTerminalPid(mapEntry.pid);
-          if (existing) {
-            clearInfo = {
-              pid: mapEntry.pid,
-              cwd: existing.workingDirectory,
-              target: existing.terminalTarget,
-              entrypoint: existing.entrypoint,
-            };
-            // Clean up the old session
-            const oldInternalId = existing.sessionId;
-            const oldClaudeId = existing.claudeSessionId;
-            const externalId = this.resolveExternalSessionId(oldInternalId);
-            const endEvent: SessionEndedEvent = {
-              type: 'session_ended',
-              session_id: externalId,
-              exit_code: 0,
-              end_reason: 'completed',
-            };
-            this.sendToPhone(endEvent);
-            this.sessionManager.markObservedSessionHistory(oldInternalId);
-            this.sessionIdMap.delete(oldInternalId);
-            this.sessionManager.removeSession(oldInternalId);
-            if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-            logger.info('daemon', 'SessionStart(clear): replaced old session via session-map PID', { oldClaudeId, newClaudeId: claudeSessionId, pid: mapEntry.pid });
-          }
-        }
-      }
-
-      if (!clearInfo) {
-        logger.debug('daemon', `SessionStart(clear): no pending clear info for cwd=${cwd}, will be picked up by polling`);
-        return;
-      }
-
-      // Derive the JSONL path from transcript_path, or use the session ID
-      const jsonlPath = transcriptPath || path.join(path.dirname(cwd), `${claudeSessionId}.jsonl`);
-
-      // Start observing the new session
-      const newInternalId = this.sessionManager.observeSession(
-        claudeSessionId,
-        jsonlPath,
-        clearInfo.cwd,
-        clearInfo.pid,
-        undefined,
-        clearInfo.target,
-        clearInfo.entrypoint,
-      );
-      this.sessionIdMap.set(newInternalId, claudeSessionId);
-
-      if (this.initialDiscoveryDone) {
-        this.sendSessionHistory(claudeSessionId);
-      }
-
-      logger.debug('daemon', `SessionStart(clear): now observing ${claudeSessionId} (PID ${clearInfo.pid})`);
-    });
-
-    // When a PermissionRequest hook connection closes (terminal won the race),
-    // tell the phone to dismiss the permission request.
-    this.hookServer.on('permission_dismissed', (toolUseId: string, toolName: string, claudeSessionId: string, toolResponse?: unknown) => {
-      logger.trace('daemon', 'permission_dismissed event', { toolName, toolUseId });
-      this.untrackBlockingRequest(toolUseId);
-
-      const session = this.sessionManager.findByClaudeSessionId(claudeSessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : claudeSessionId;
-
-      const event: Record<string, unknown> = {
-        type: 'permission_dismissed',
-        request_id: toolUseId,
-        tool_name: toolName,
-        session_id: externalId,
-      };
-      // For AskUserQuestion, include the answers so the phone can show what was chosen
-      if (toolName === 'AskUserQuestion' && toolResponse) {
-        const resp = toolResponse as Record<string, unknown>;
-        event.answers = resp.answers ?? resp;
-      }
-      this.sendToPhone(event as unknown as PcEvent);
-      logger.debug('daemon', `Sent permission_dismissed for ${toolName} (${toolUseId})`);
+    wireHookServer(this.hookServer, {
+      toolResult: {
+        prefs: this.phonePreferences,
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      error: {
+        restartHookServer: () => this.restartHookServer(),
+      },
+      permissionExpired: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        resolveCodexExternalSessionId: (id) => this.resolveCodexExternalSessionId(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        sendExpiredPendingSystemMessage: (sId, rId, tn, at, e) => this.sendExpiredPendingSystemMessage(sId, rId, tn, at, e),
+        clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
+      },
+      codexSessionStart: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        getCodexCapabilities: (id) => this.getCodexCapabilities(id),
+      },
+      codexUserPromptSubmit: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      codexStop: {
+        codexObservers: this.codexObservers,
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        sendToPhone: (event) => this.sendToPhone(event),
+        codexStopHookDeduper: this.codexStopHookDeduper,
+        sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
+      },
+      codexPermissionRequest: {
+        recordCodexHookActivity: (req) => this.recordCodexHookActivity(req),
+        cryptoEngine: this.cryptoEngine,
+        messageSeq: this.messageSeqRef,
+        buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
+      },
+      apiSessions: {
+        sessionManager: this.sessionManager,
+        getRelayClient: () => this.relayClient,
+      },
+      apiStatus: {
+        sessionManager: this.sessionManager,
+        getRelayClient: () => this.relayClient,
+      },
+      sessionStop: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
+        nextCompletionRequestId: (sId, ts) => this.nextCompletionRequestId(sId, ts),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        sendToPhone: (event) => this.sendToPhone(event),
+        prefs: this.phonePreferences,
+      },
+      sessionStopFailure: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingBlockingRequests: this.pendingBlockingRequests,
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      sessionEnd: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingClearInfo: this.pendingClearInfo,
+        sessionIdMap: this.sessionIdMap,
+        replacedSessionIds: this.replacedSessionIds,
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      subagent: { sessionManager: this.sessionManager },
+      sessionStart: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        pendingClearInfo: this.pendingClearInfo,
+        sessionIdMap: this.sessionIdMap,
+        replacedSessionIds: this.replacedSessionIds,
+        sendToPhone: (event) => this.sendToPhone(event),
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        sendSessionHistory: (id) => this.sendSessionHistory(id),
+      },
+      permissionDismissed: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        untrackBlockingRequest: (id) => this.untrackBlockingRequest(id),
+        sendToPhone: (event) => this.sendToPhone(event),
+      },
+      permissionPrompt: {
+        sessionManager: this.sessionManager,
+        resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+        sendPlanForReview: (sId, rId, ti, cwd) => this.sendPlanForReview(sId, rId, ti, cwd),
+        buildPermissionContext: (tn, ti) => this.buildPermissionContext(tn, ti),
+        getSessionName: (id) => this.getSessionName(id),
+        cryptoEngine: this.cryptoEngine,
+        messageSeq: this.messageSeqRef,
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, t) => this.trackBlockingRequest(rId, sId, e, t),
+      },
     });
   }
 
@@ -1541,98 +823,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private wirePermissionPromptEvents(): void {
-    // PermissionRequest hook: fires only when Claude's own permission system decides
-    // it needs user approval. We forward these to the phone.
-    this.hookServer.on('permission_prompt', (request: HookPermissionPrompt) => {
-      const session = this.sessionManager.findByClaudeSessionId(request.sessionId);
-      const externalId = session
-        ? this.resolveExternalSessionId(session.sessionId)
-        : request.sessionId;
-
-      // ExitPlanMode: send plan to phone for review (same pattern as AskUserQuestion).
-      // sendPlanForReview tracks the blocking request itself (with plan_content)
-      // so the reconnect replay carries the plan body.
-      if (request.toolName === 'ExitPlanMode') {
-        this.sendPlanForReview(externalId, request.toolUseId, request.toolInput, request.cwd);
-        logger.debug('daemon', `ExitPlanMode PermissionRequest: sent plan to phone for review (${request.toolUseId})`);
-        return; // hook stays pending until phone responds
-      }
-
-      // AskUserQuestion: forward as interactive question to the phone.
-      // The terminal also shows the question (PreToolUse passed through).
-      // Whichever answers first wins the race.
-      if (request.toolName === 'AskUserQuestion') {
-        const hookQuestions = (request.toolInput.questions as Array<{ question?: string }>) ?? [];
-        const hookQuestionPreview = hookQuestions[0]?.question ?? 'Claude has a question';
-        const flat: Record<string, unknown> = {
-          type: 'session_output',
-          session_id: externalId,
-          output_type: 'user_question',
-          request_id: request.toolUseId,
-          tool_input: request.toolInput,
-          timestamp: new Date().toISOString(),
-          ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        };
-        this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'user_question', externalId, request.toolUseId, {
-          type: 'user_question',
-          session_name: this.getSessionName(externalId),
-          body: truncateUtf8(hookQuestionPreview, 256),
-          sound: 'default',
-          category: 'USER_QUESTION',
-          session_id: externalId,
-          request_id: request.toolUseId,
-        });
-        this.trackBlockingRequest(request.toolUseId, externalId, flat as unknown as PcEvent, 'user_question');
-        logger.debug('daemon', `AskUserQuestion PermissionRequest: forwarded to phone (${request.toolUseId})`);
-        return; // hook stays pending until phone or terminal answers
-      }
-
-      // All other tools: Claude decided this needs user approval. Forward to phone.
-      const riskLevel = (RISK_CLASSIFICATION[request.toolName] ?? RiskLevel.MEDIUM).toLowerCase();
-      const context = this.buildPermissionContext(request.toolName, request.toolInput);
-
-      const signaturePayload = JSON.stringify({
-        session_id: externalId,
-        request_id: request.toolUseId,
-        tool_name: request.toolName,
-        seq: this.messageSeq,
-        timestamp: Date.now(),
-      });
-
-      let pcSignature: string;
-      try {
-        pcSignature = this.cryptoEngine.sign(signaturePayload);
-      } catch {
-        pcSignature = '';
-      }
-
-      const event: PermissionRequestEvent = {
-        type: 'permission_request',
-        session_id: externalId,
-        request_id: request.toolUseId,
-        tool_name: request.toolName,
-        tool_input: request.toolInput,
-        risk_level: riskLevel as unknown as RiskLevel,
-        context,
-        pc_signature: pcSignature,
-        seq: this.messageSeq++,
-        timestamp: new Date().toISOString() as unknown as number,
-        ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-        has_always_allow: Array.isArray(request.permissionSuggestions) && request.permissionSuggestions.length > 0,
-      };
-
-      this.sendNotificationEventToPhone(event, 'permission_request', externalId, request.toolUseId, {
-        type: 'permission_request',
-        session_name: this.getSessionName(externalId),
-        body: truncateUtf8(`${request.toolName}: ${context}`, 256),
-        sound: 'default',
-        category: 'PERMISSION_REQUEST',
-        session_id: externalId,
-        request_id: request.toolUseId,
-      });
-      this.trackBlockingRequest(request.toolUseId, externalId, event, 'permission_request');
-      logger.debug('daemon', 'Forwarded PermissionRequest', { tool: request.toolName, toolUseId: request.toolUseId, sessionId: request.sessionId });
-    });
+    // Folded into wireHookServerEvents via wireHookServer().
   }
 
   private recordCodexHookActivity(request: CodexHookRequest): string {
@@ -1684,80 +875,34 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private findCodexHookRolloutPath(request: CodexHookRequest, requestedSessionId: string): string | undefined {
-    if (request.transcriptPath && fs.existsSync(request.transcriptPath)) return request.transcriptPath;
-    if (!request.codexPid) return undefined;
-
-    const requestedThreadId = requestedSessionId.slice('codex:'.length);
-    const opened = findOpenCodexRollouts(request.codexPid);
-    const exact = opened.find((rolloutPath) => path.basename(rolloutPath).includes(requestedThreadId));
-    if (exact) return exact;
-
-    let newest: { rolloutPath: string; mtime: number } | undefined;
-    for (const rolloutPath of opened) {
-      try {
-        const mtime = fs.statSync(rolloutPath).mtimeMs;
-        if (!newest || mtime > newest.mtime) newest = { rolloutPath, mtime };
-      } catch {
-        // Ignore files that disappeared between lsof and stat.
-      }
-    }
-    return newest?.rolloutPath;
-  }
-
-  private recordCodexStopHook(sessionId: string): void {
-    const now = Date.now();
-    for (const [id, at] of this.recentCodexStopHooks.entries()) {
-      if (now - at > CODEX_STOP_DEDUPE_MS) this.recentCodexStopHooks.delete(id);
-    }
-    this.recentCodexStopHooks.set(sessionId, now);
-  }
-
-  private consumeRecentCodexStopHook(sessionId: string): boolean {
-    const stoppedAt = this.recentCodexStopHooks.get(sessionId);
-    if (stoppedAt === undefined) return false;
-    if (Date.now() - stoppedAt > CODEX_STOP_DEDUPE_MS) {
-      this.recentCodexStopHooks.delete(sessionId);
-      return false;
-    }
-    this.recentCodexStopHooks.delete(sessionId);
-    return true;
+    return findCodexHookRolloutPath(request, requestedSessionId);
   }
 
   private nextCompletionRequestId(sessionId: string, timestamp: number = Date.now()): string {
-    this.completionRequestCounter = (this.completionRequestCounter + 1) % Number.MAX_SAFE_INTEGER;
-    return `completion_${sessionId}_${timestamp}_${this.completionRequestCounter}`;
+    return this.completionRequestIdGen(sessionId, timestamp);
   }
 
   private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
-    if (!this.initialDiscoveryDone) return;
-    const body = summary?.trim() || this.codexDiscovery.getLastAssistantMessage(sessionId) || 'Codex turn finished';
-    const completionRequestId = this.nextCompletionRequestId(sessionId);
-    this.sendNotificationEventToPhone({
-      type: 'session_status',
-      session_id: sessionId,
-      status: SessionStatus.READY,
-      is_completion: true,
-      completion_request_id: completionRequestId,
-      completion_body: body,
-    } as unknown as PcEvent, 'session_completed', sessionId, completionRequestId, {
-      type: 'session_completed',
-      session_name: session?.title ?? (session?.cwd ? path.basename(session.cwd) : this.getSessionName(sessionId)),
-      body: truncateUtf8(body, 256),
-      sound: 'completion.caf',
-      category: 'SESSION_COMPLETED',
-      session_id: sessionId,
-      request_id: completionRequestId,
-    });
+    sendCodexCompletionExternal(
+      {
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        getLastAssistantMessage: (id) => this.codexDiscovery.getLastAssistantMessage(id),
+        nextCompletionRequestId: (id, ts) => this.nextCompletionRequestId(id, ts),
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+      },
+      sessionId,
+      session,
+      summary,
+    );
   }
 
   private resolveCodexExternalSessionId(sessionId: string): string | undefined {
-    if (isCodexSessionId(sessionId)) return sessionId;
-    if (!sessionId) return undefined;
-    const externalId = codexExternalSessionId(sessionId);
-    if (this.codexTerminalTargets.has(externalId)) return externalId;
-    if (this.codexObservers.has(externalId)) return externalId;
-    if (this.codexDiscovery.getSession(externalId)) return externalId;
-    return undefined;
+    return resolveCodexExternalSessionIdHelper(sessionId, {
+      hasTerminalTarget: (id) => this.codexTerminalTargets.has(id),
+      hasObserver: (id) => this.codexObservers.has(id),
+      hasSession: (id) => !!this.codexDiscovery.getSession(id),
+    });
   }
 
   private resolveCodexTerminalTarget(sessionId: string, knownLiveCodex?: CodexLiveSession | null): CodexTerminalTargetEntry | undefined {
@@ -1766,77 +911,34 @@ export class AgentPocketDaemon extends EventEmitter {
       logger.debug('daemon', 'resolveCodexTerminalTarget hit cached target', { sessionId, pid: existing.pid, target: existing.target });
       return existing;
     }
-
     const liveCodex = knownLiveCodex === undefined
       ? this.codexDiscovery.discoverLiveSessions().get(sessionId)
-      : knownLiveCodex;
+      : knownLiveCodex ?? undefined;
+    const next = refreshCodexTerminalTarget(existing, liveCodex, findTerminalForPid);
     if (!liveCodex) {
       logger.debug('daemon', 'resolveCodexTerminalTarget found no live session', { sessionId, existingPid: existing?.pid, hasExistingTarget: !!existing?.target });
-      return existing;
+      return next;
     }
-
-    const target = findTerminalForPid(liveCodex.pid) ?? existing?.target;
-    logger.debug('daemon', 'resolveCodexTerminalTarget resolved live session', { sessionId, pid: liveCodex.pid, target });
-    const next: CodexTerminalTargetEntry = {
-      pid: liveCodex.pid,
-      target,
-      cwd: existing?.cwd,
-      transcriptPath: existing?.transcriptPath,
-      turnId: existing?.turnId,
-      updatedAt: Date.now(),
-    };
-    this.codexTerminalTargets.set(sessionId, next);
+    logger.debug('daemon', 'resolveCodexTerminalTarget resolved live session', { sessionId, pid: liveCodex.pid, target: next?.target });
+    if (next && next !== existing) this.codexTerminalTargets.set(sessionId, next);
     return next;
   }
 
-  private attachCodexObserverHandlers(tracked: { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }): void {
-    const { observer, session } = tracked;
-    observer.on('output', (codexEvent: ClaudeEvent) => {
-      tracked.lastActivity = Date.now();
-      this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
-    });
-    observer.on('status_change', (status: 'running' | 'ready') => {
-      tracked.status = status as SessionStatus;
-      tracked.lastActivity = Date.now();
-      if (!this.initialDiscoveryDone) return;
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: session.sessionId,
-        status: tracked.status,
-      } as unknown as PcEvent);
-    });
-    observer.on('completed', (summary?: string) => {
-      tracked.status = SessionStatus.READY;
-      tracked.lastActivity = Date.now();
-      if (!this.initialDiscoveryDone) return;
-      if (this.consumeRecentCodexStopHook(session.sessionId)) return;
-      this.sendCodexCompletion(session.sessionId, session, summary);
-    });
-    observer.on('error', (err: Error) => {
-      tracked.status = SessionStatus.ERROR;
-      tracked.lastActivity = Date.now();
-      logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
-      if (!this.initialDiscoveryDone) return;
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: session.sessionId,
-        status: SessionStatus.ERROR,
-      } as unknown as PcEvent, true, {
-        type: 'session_error',
-        session_name: session.title ?? path.basename(session.cwd),
-        body: truncateUtf8(err.message || 'Codex turn failed', 256),
-        sound: 'default',
-        category: 'SESSION_ERROR',
-        session_id: session.sessionId,
-      });
-    });
+  private attachCodexObserverHandlers(tracked: CodexObserverTracked): void {
+    attachCodexObserverHandlersExternal(
+      {
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        codexStopHookDeduper: this.codexStopHookDeduper,
+        sendFlattenedSessionOutput: (sId, e, at) => this.sendFlattenedSessionOutput(sId, e, at),
+        sendToPhone: (e, wake, wp) => this.sendToPhone(e, wake, wp),
+        sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
+      },
+      tracked,
+    );
   }
 
   private getCodexCapabilities(sessionId: string): string[] {
-    const terminal = this.codexTerminalTargets.get(sessionId);
-    return terminal?.target
-      ? ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions']
-      : ['observe'];
+    return getCodexCapabilities(this.codexTerminalTargets.get(sessionId));
   }
 
   // --------------------------------------------------------------------------
@@ -1847,314 +949,28 @@ export class AgentPocketDaemon extends EventEmitter {
    * Discover running CLI Claude sessions and start observing them.
    */
   private async discoverAndObserveSessions(): Promise<void> {
-    try {
-      const runningCli = this.sessionDiscovery.getRunningAllSessions();
-      if (runningCli.length === 0) return;
-
-      // Discover JSONL files once (not per-session)
-      const discovered = await this.sessionDiscovery.discoverSessions();
-
-      // Detect /clear: when the user runs /clear, Claude Code creates a new session ID
-      // and JSONL file but does NOT update the PID file. The daemon is stuck tailing
-      // the old (frozen) JSONL. Detect this by checking if a newer JSONL file exists
-      // in the same project directory for an observed session whose PID is still alive.
-      //
-      // IMPORTANT: The newer file must not belong to a different terminal process.
-      // Multiple terminals can work in the same project directory, so finding a newer
-      // JSONL doesn't necessarily mean /clear — it could be a different terminal.
-      const observedSessions = this.sessionManager.getAllSessions().filter(s => s.isObserved && s.terminalPid);
-
-      // Build a set of session IDs that are claimed by running CLI PIDs.
-      // If a newer file is claimed by a different PID, it's a different terminal, not /clear.
-      const sessionIdsByPid = new Map<string, number>();
-      for (const cli of runningCli) {
-        sessionIdsByPid.set(cli.sessionId, cli.pid);
-      }
-
-      for (const session of observedSessions) {
-        if (!session.observer || !session.terminalPid) continue;
-
-        // Check if PID is alive
-        try { process.kill(session.terminalPid, 0); } catch { continue; }
-
-        // Only consider /clear if the current session's JSONL has gone stale.
-        // After /clear, Claude stops writing to the old file. If the file was
-        // modified recently, the session is still active — not cleared.
-        const currentJsonlPath = session.observer.getJsonlPath();
-        try {
-          const currentStat = fs.statSync(currentJsonlPath);
-          if (Date.now() - currentStat.mtimeMs < 10_000) continue; // active within 10s
-        } catch { continue; }
-
-        const projectDir = path.dirname(currentJsonlPath);
-
-        // Look for a newer JSONL file in the same directory that we're not observing
-        const observedSessionIds = new Set(
-          this.sessionManager.getAllSessions()
-            .filter(s => s.claudeSessionId)
-            .map(s => s.claudeSessionId!),
-        );
-
-        const newerFile = discovered.find(d =>
-          path.dirname(d.filePath) === projectDir &&
-          !observedSessionIds.has(d.sessionId) &&
-          d.lastModified > (session.lastActivity || 0) &&
-          d.filePath !== currentJsonlPath &&
-          // Only treat as /clear if the newer file is NOT owned by a different PID
-          (!sessionIdsByPid.has(d.sessionId) || sessionIdsByPid.get(d.sessionId) === session.terminalPid) &&
-          // Don't replace if this session is in replacedSessionIds (already identified as stale)
-          !this.replacedSessionIds.has(d.sessionId),
-        );
-
-        if (newerFile) {
-          const pid = session.terminalPid!;
-          const cwd = session.workingDirectory;
-          const target = session.terminalTarget;
-
-          logger.info('daemon', 'Detected /clear', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
-
-          // End the old observation
-          const oldInternalId = session.sessionId;
-          const oldClaudeId = session.claudeSessionId;
-
-          // Notify the phone that the old session ended (so it stops showing as "running")
-          if (oldClaudeId) {
-            const endEvent: SessionEndedEvent = {
-              type: 'session_ended',
-              session_id: oldClaudeId,
-              exit_code: 0,
-              end_reason: 'completed',
-            };
-            this.sendToPhone(endEvent);
-          }
-
-          this.sessionManager.markObservedSessionHistory(oldInternalId);
-          this.sessionIdMap.delete(oldInternalId);
-          this.sessionManager.removeSession(oldInternalId);
-          if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-
-          // Start observing the new session
-          const newInternalId = this.sessionManager.observeSession(
-            newerFile.sessionId,
-            newerFile.filePath,
-            cwd,
-            pid,
-            newerFile.customTitle,
-            target,
-            session.entrypoint,
-          );
-          this.sessionIdMap.set(newInternalId, newerFile.sessionId);
-          if (this.initialDiscoveryDone) {
-            this.sendSessionHistory(newerFile.sessionId);
-          }
-
-          const termInfo = target ? ` [${target.type}: ${target.target}]` : '';
-          logger.debug('daemon', `Now observing ${newerFile.sessionId} (PID ${pid})${termInfo}`);
-        }
-      }
-
-      for (const pidInfo of runningCli) {
-        // Prefer session-map.json over PID JSON when it has a fresher entry
-        // for this PID. This fixes two cases that survive daemon restart:
-        //   1) PID JSON's sessionId is stale after /clear.
-        //   2) PID JSON's cwd is wrong (e.g. parent of the worktree the
-        //      process actually runs in), causing dir-based JSONL matching
-        //      to pick a JSONL from a sibling project.
-        const mapEntry = this.getLatestSessionMapEntryForPid(pidInfo.pid);
-        if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
-          this.replacedSessionIds.add(pidInfo.sessionId);
-          pidInfo.sessionId = mapEntry.sessionId;
-          pidInfo.cwd = mapEntry.cwd;
-        }
-
-        // Skip sessions already being observed or controlled
-        if (this.sessionManager.findByClaudeSessionId(pidInfo.sessionId)) continue;
-
-        // Check if this PID is already being observed for a different session.
-        // This happens when the PID file was updated (e.g., after /clear) but
-        // SessionManager still has the old session ID. We need to update it.
-        // BUT: if the PID file's session ID is in replacedSessionIds, the PID file
-        // is stale (not yet updated after /clear) — trust our current observation.
-        const existingByPid = this.sessionManager.findByTerminalPid(pidInfo.pid);
-        if (existingByPid && existingByPid.claudeSessionId !== pidInfo.sessionId
-            && !this.replacedSessionIds.has(pidInfo.sessionId)) {
-          logger.warn('daemon', 'PID session ID mismatch — re-observing', { pid: pidInfo.pid, observed: existingByPid.claudeSessionId, pidFile: pidInfo.sessionId });
-
-          const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-          if (match) {
-            // End the old observation
-            const oldInternalId = existingByPid.sessionId;
-            const oldClaudeId = existingByPid.claudeSessionId;
-
-            // DON'T send session_ended for the stale session ID — this is just
-            // correcting our internal tracking, not a real session end event.
-            // The session is still running, we just had the wrong ID for it.
-
-            this.sessionManager.markObservedSessionHistory(oldInternalId);
-            this.sessionIdMap.delete(oldInternalId);
-            this.sessionManager.removeSession(oldInternalId);
-            if (oldClaudeId) this.replacedSessionIds.add(oldClaudeId);
-
-            // Create new observation with correct session ID
-            const newInternalId = this.sessionManager.observeSession(
-              pidInfo.sessionId,
-              match.filePath,
-              pidInfo.cwd,
-              pidInfo.pid,
-              match.customTitle,
-              pidInfo.terminalTarget,
-              pidInfo.entrypoint,
-            );
-            this.sessionIdMap.set(newInternalId, pidInfo.sessionId);
-
-            if (this.initialDiscoveryDone) {
-              this.sendSessionHistory(pidInfo.sessionId);
-            }
-
-            const termInfo = pidInfo.terminalTarget ? ` [${pidInfo.terminalTarget.type}: ${pidInfo.terminalTarget.target}]` : ' [no terminal injection]';
-            logger.debug('daemon', `Re-observing PID ${pidInfo.pid} with updated session ${pidInfo.sessionId}${termInfo}`);
-          }
-          continue;
-        }
-
-        // Skip if PID is already observed with the correct session ID
-        if (existingByPid) continue;
-
-        // If PID file still references a replaced session (stale after /clear),
-        // check session-map.json for the correct new session ID
-        if (this.replacedSessionIds.has(pidInfo.sessionId)) {
-          const mapped = this.readSessionMap();
-          // Find the most recent session-map entry for this PID
-          let corrected: [string, { pid?: number; cwd: string; timestamp: number }] | undefined;
-          const staleSids: string[] = [];
-          for (const [sid, v] of Object.entries(mapped)) {
-            if (v.pid !== pidInfo.pid) continue;
-            if (this.sessionManager.findByClaudeSessionId(sid)) { staleSids.push(sid); continue; }
-            if (this.replacedSessionIds.has(sid)) { staleSids.push(sid); continue; }
-            if (!corrected || v.timestamp > corrected[1].timestamp) {
-              if (corrected) staleSids.push(corrected[0]);
-              corrected = [sid, v];
-            } else {
-              staleSids.push(sid);
-            }
-          }
-          // Clean up stale entries for this PID
-          if (staleSids.length > 0) {
-            this.removeSessionMapEntries(staleSids);
-          }
-          if (!corrected) continue;
-          const newSessionId = corrected[0];
-          const mapEntry = corrected[1];
-          const match = discovered.find((s) => s.sessionId === newSessionId);
-          if (!match) continue;
-
-          logger.info('daemon', 'Recovered session from session-map.json', { pid: pidInfo.pid, staleSessionId: pidInfo.sessionId, newSessionId });
-          const newInternalId = this.sessionManager.observeSession(
-            newSessionId,
-            match.filePath,
-            mapEntry.cwd,
-            pidInfo.pid,
-            match.customTitle,
-            pidInfo.terminalTarget,
-            pidInfo.entrypoint,
-          );
-          this.sessionIdMap.set(newInternalId, newSessionId);
-          if (this.initialDiscoveryDone) {
-            this.sendSessionHistory(newSessionId);
-          }
-          continue;
-        }
-
-        const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-        if (!match) continue;
-
-        // PID JSON's sessionId may be stale (the user /clear-ed past it without
-        // the PID file being updated). Prefer the newest unclaimed JSONL in the
-        // project dir over PID JSON when it's actually newer — but never reject
-        // a session purely on age. PIDs that are alive deserve to be tracked.
-        let observeMatch = match;
-        let observeSessionId = pidInfo.sessionId;
-        const projectDir = path.dirname(match.filePath);
-        const otherPidSids = new Set(
-          runningCli.filter(c => c.pid !== pidInfo.pid).map(c => c.sessionId),
-        );
-        const newer = discovered
-          .filter(d => path.dirname(d.filePath) === projectDir)
-          .filter(d => !otherPidSids.has(d.sessionId))
-          .filter(d => !this.replacedSessionIds.has(d.sessionId))
-          .filter(d => d.lastModified > match.lastModified)
-          .sort((a, b) => b.lastModified - a.lastModified)[0];
-        if (newer) {
-          observeMatch = newer;
-          observeSessionId = newer.sessionId;
-          this.replacedSessionIds.add(pidInfo.sessionId);
-        }
-
-        const sessionId = this.sessionManager.observeSession(
-          observeSessionId,
-          observeMatch.filePath,
-          pidInfo.cwd,
-          pidInfo.pid,
-          observeMatch.customTitle,
-          pidInfo.terminalTarget,
-          pidInfo.entrypoint,
-        );
-
-        // Map internal -> external so events use the Claude session ID
-        this.sessionIdMap.set(sessionId, observeSessionId);
-
-        // Send existing conversation history so the phone sees prior messages
-        if (this.initialDiscoveryDone) {
-          this.sendSessionHistory(observeSessionId);
-        }
-
-        const termInfo = pidInfo.terminalTarget ? ` [${pidInfo.terminalTarget.type}: ${pidInfo.terminalTarget.target}]` : ' [no terminal injection]';
-        logger.info('daemon', 'Observing CLI session', { claudeSessionId: observeSessionId, pid: pidInfo.pid });
-      }
-    } catch (err) {
-      logger.error('daemon', `Error discovering sessions: ${(err as Error).message}`);
-    }
+    return discoverAndObserveSessionsExternal({
+      sessionDiscovery: this.sessionDiscovery,
+      sessionManager: this.sessionManager,
+      sessionIdMap: this.sessionIdMap,
+      replacedSessionIds: this.replacedSessionIds,
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      sendToPhone: (e) => this.sendToPhone(e),
+      sendSessionHistory: (id) => { this.sendSessionHistory(id); },
+      readSessionMap,
+      getLatestSessionMapEntryForPid,
+      removeSessionMapEntries,
+    });
   }
 
   private discoverAndObserveCodexSessions(): void {
-    try {
-      const sessions = this.codexDiscovery.discoverSessions();
-      const liveSessions = this.codexDiscovery.discoverLiveSessions(sessions);
-      for (const session of sessions) {
-        const existing = this.codexObservers.get(session.sessionId);
-        if (existing) {
-          const live = liveSessions.has(session.sessionId);
-          const nextStatus = live
-            ? (existing.status === SessionStatus.RUNNING || existing.status === SessionStatus.PENDING_ACTIONS ? existing.status : SessionStatus.READY)
-            : SessionStatus.HISTORY;
-          if (existing.status !== nextStatus) {
-            existing.status = nextStatus;
-            existing.lastActivity = Date.now();
-            if (this.initialDiscoveryDone) {
-              this.sendToPhone({
-                type: 'session_status',
-                session_id: session.sessionId,
-                status: nextStatus,
-              } as unknown as PcEvent);
-            }
-          }
-          continue;
-        }
-        const observer = new CodexObserver(session.sessionId, session.rolloutPath);
-        const initialStatus = liveSessions.has(session.sessionId) ? SessionStatus.READY : SessionStatus.HISTORY;
-        const tracked = {
-          observer,
-          session,
-          status: initialStatus,
-          lastActivity: session.updatedAtMs ?? Date.now(),
-        };
-        this.codexObservers.set(session.sessionId, tracked);
-        this.attachCodexObserverHandlers(tracked);
-        observer.start();
-      }
-    } catch (err) {
-      logger.warn('codex-discovery', `Error discovering Codex sessions: ${(err as Error).message}`);
-    }
+    discoverAndObserveCodexSessionsExternal({
+      codexDiscovery: this.codexDiscovery,
+      codexObservers: this.codexObservers,
+      isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+      sendToPhone: (e) => this.sendToPhone(e),
+      attachCodexObserverHandlers: (tracked) => this.attachCodexObserverHandlers(tracked),
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -2256,7 +1072,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     if (deadPids.length > 0) {
-      this.cleanSessionMap(deadPids);
+      cleanSessionMap(deadPids);
     }
   }
 
@@ -2377,1137 +1193,148 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private handleNewSession(command: NewSessionCommand): void {
-    try {
-      if (command.config.agent_type !== 'claude_code') {
-        throw new Error(`agent_type '${command.config.agent_type}' is not yet supported by the controller`);
-      }
-      const sessionConfig: SessionConfig = {
-        name: command.config.name,
-        agent_type: command.config.agent_type,
-        working_directory: command.config.working_directory,
-        model: command.config.model,
-        system_prompt: command.config.system_prompt,
-        allowed_tools: command.config.allowed_tools,
-        dangerously_skip_permissions: command.config.dangerously_skip_permissions,
-      };
-
-      const sessionId = this.sessionManager.createSession(sessionConfig);
-
-      // Track request_id -> session_id mapping
-      this.pendingSessionRequests.set(command.request_id, sessionId);
-
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to create session: ${(err as Error).message}`,
-        'SESSION_CREATE_ERROR',
-      );
-    }
+    handleNewSessionExternal(this.commandContext(), command);
   }
 
   private handleResumeSession(command: ResumeSessionCommand): void {
-    try {
-      // If an observer already exists for this Claude session ID, stop and remove it
-      // to prevent duplicate message emission when switching from observe to SDK control.
-      const existing = this.sessionManager.findByClaudeSessionId(command.session_id);
-      if (existing) {
-        logger.debug('daemon', `Stopping existing observer ${existing.sessionId} before resuming session ${command.session_id}`);
-        this.sessionManager.markObservedSessionHistory(existing.sessionId);
-        this.cleanSessionMap([existing.terminalPid ?? -1]);
-      }
-
-      const sessionId = this.sessionManager.resumeSession(command.session_id, {});
-
-      // Map internal session ID to Claude session ID
-      this.sessionIdMap.set(sessionId, command.session_id);
-      this.pendingSessionRequests.set(command.request_id, sessionId);
-
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to resume session: ${(err as Error).message}`,
-        'SESSION_RESUME_ERROR',
-      );
-    }
+    handleResumeSessionExternal(this.commandContext(), command);
   }
 
-  private async handleSendMessage(command: SendMessageCommand): Promise<void> {
-    const clientMessageId = command.client_message_id;
-    const cidShort = clientMessageId ? clientMessageId.substring(0, 8) : 'none';
-    const sidShort = command.session_id.substring(0, 8);
-    logger.debug('daemon', 'send_message received', {
-      cid: cidShort,
-      sessionId: sidShort,
-      len: command.message.length,
-    });
-
-    if (clientMessageId) {
-      this.sendMessageAck(clientMessageId, command.session_id, 'received');
-    }
-
-    if (isCodexSessionId(command.session_id)) {
-      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
-      if (!target) {
-        const msg = 'Codex remote message is not available until a terminal target is attached for this Codex session.';
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'CODEX_TERMINAL_NOT_ATTACHED');
-        return;
-      }
-      const observed = this.codexObservers.get(command.session_id);
-      if (observed?.status === SessionStatus.RUNNING || observed?.status === SessionStatus.PENDING_ACTIONS) {
-        const msg = 'Codex session is busy. Wait until the current turn is ready before sending a new message.';
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_NOT_READY');
-        return;
-      }
-      try {
-        let injected = this.codexInjectedMessages.get(command.session_id);
-        if (!injected) {
-          injected = new Map<string, number>();
-          this.codexInjectedMessages.set(command.session_id, injected);
-        }
-        incrementInjectedMessageCount(injected, command.message);
-        terminalSendMessage(target, command.message);
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'committed');
-        logger.debug('daemon', 'send_message committed (codex terminal)', { cid: cidShort, sessionId: sidShort });
-      } catch (err) {
-        consumeInjectedMessage(this.codexInjectedMessages.get(command.session_id), command.message);
-        const msg = (err as Error).message;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, `Failed to send message to Codex session ${command.session_id}: ${msg}`, 'SEND_MESSAGE_ERROR');
-      }
-      return;
-    }
-
-    try {
-      // Resolve the external session ID to our internal ID
-      const internalId = this.resolveInternalSessionId(command.session_id);
-      if (internalId) {
-        const result = await this.sessionManager.sendMessage(internalId, command.message);
-        if (clientMessageId) {
-          this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
-        }
-        logger.debug('daemon', 'send_message committed (tracked)', { cid: cidShort, sessionId: sidShort, sdkUuid: result.sdkUuid });
-        return;
-      }
-
-      // Session not tracked — it's a discovered session from disk.
-      // Try to observe it and inject the message via tmux.
-      logger.debug('daemon', `Session ${command.session_id} not tracked, attempting to observe and inject`);
-
-      // Check if there's a running terminal for this session
-      const runningCli = this.sessionDiscovery.getRunningCliSessions();
-      const pidInfo = runningCli.find((s) => s.sessionId === command.session_id);
-
-      if (!pidInfo) {
-        const msg = `Session ${command.session_id} has no running terminal. Please restart Claude in the terminal.`;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_NOT_RUNNING');
-        return;
-      }
-
-      // Discover the JSONL file for this session
-      const discovered = await this.sessionDiscovery.discoverSessions();
-      const match = discovered.find((s) => s.sessionId === command.session_id);
-      if (!match) {
-        const msg = `Cannot find session file for ${command.session_id}`;
-        if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-        this.sendError(undefined, msg, 'SESSION_FILE_NOT_FOUND');
-        return;
-      }
-
-      // Start observing
-      const sessionId = this.sessionManager.observeSession(
-        pidInfo.sessionId,
-        match.filePath,
-        pidInfo.cwd,
-        pidInfo.pid,
-        match.customTitle,
-        pidInfo.terminalTarget,
-        pidInfo.entrypoint,
-      );
-      this.sessionIdMap.set(sessionId, pidInfo.sessionId);
-
-      // Send session history
-      this.sendSessionHistory(command.session_id);
-
-      // Now send the message (will inject via tmux if available)
-      const result = await this.sessionManager.sendMessage(sessionId, command.message);
-      if (clientMessageId) {
-        this.sendMessageAck(clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
-      }
-      logger.debug('daemon', 'send_message committed (observed)', { cid: cidShort, sessionId: sidShort });
-    } catch (err) {
-      const msg = (err as Error).message;
-      if (clientMessageId) this.sendMessageAck(clientMessageId, command.session_id, 'failed', msg);
-      logger.error('daemon', 'send_message failed', { cid: cidShort, sessionId: sidShort, error: msg });
-      this.sendError(
-        undefined,
-        `Failed to send message to session ${command.session_id}: ${msg}`,
-        'SEND_MESSAGE_ERROR',
-      );
-    }
+  private handleSendMessage(command: SendMessageCommand): Promise<void> {
+    return handleSendMessageExternal(this.commandContext(), this.sendMessageDeps(), command);
   }
 
-  private sendMessageAck(
-    clientMessageId: string,
-    sessionId: string,
-    status: 'received' | 'committed' | 'failed',
-    error?: string,
-    sdkUuid?: string,
-  ): void {
-    const ack: MessageAckEvent = {
-      type: 'message_ack',
-      client_message_id: clientMessageId,
-      session_id: sessionId,
-      status,
-      ts: Date.now(),
-      ...(error ? { error } : {}),
-      ...(sdkUuid ? { sdk_uuid: sdkUuid } : {}),
+  private sendMessageDeps(): SendMessageDeps {
+    return {
+      resolveCodexTerminalTarget: (id) => this.resolveCodexTerminalTarget(id),
+      codexObservers: this.codexObservers,
+      codexInjectedMessages: this.codexInjectedMessages,
+      sendTerminalMessage: (target, message) => terminalSendMessage(target as TerminalTarget, message),
+      getRunningCliSessions: () => this.sessionDiscovery.getRunningCliSessions(),
+      discoverSessions: () => this.sessionDiscovery.discoverSessions(),
+      sessionIdMap: this.sessionIdMap,
     };
-    logger.debug('daemon', 'message_ack send', {
-      cid: clientMessageId.substring(0, 8),
-      sessionId: sessionId.substring(0, 8),
-      status,
-      sdkUuid,
-    });
-    this.sendToPhone(ack);
   }
 
   private handlePermissionResponse(command: PermissionResponseCommand): void {
-    logger.debug('daemon', `handlePermissionResponse: request_id=${command.request_id}, decision=${command.decision}, hasPending=${this.hookServer.hasPendingPermission(command.request_id)}`);
-    this.untrackBlockingRequest(command.request_id);
-    this.clearNotificationDelivery('permission_request', command.session_id, command.request_id);
-    this.clearNotificationDelivery('plan_review', command.session_id, command.request_id);
-    try {
-      // Verify the phone signature if we have peer identity key
-      if (command.phone_signature && this.cryptoEngine.hasSessionKeys()) {
-        const signaturePayload = JSON.stringify({
-          session_id: command.session_id,
-          request_id: command.request_id,
-          decision: command.decision,
-          seq: command.seq,
-          timestamp: command.timestamp,
-        });
-
-        const valid = this.cryptoEngine.verifyPeer(signaturePayload, command.phone_signature);
-        if (!valid) {
-          this.sendError(
-            command.request_id,
-            'Invalid permission response signature',
-            'SIGNATURE_INVALID',
-          );
-          return;
-        }
-      }
-
-      // Check if this is a hook-based permission (from observed terminal session)
-      if (this.hookServer.hasPendingPermission(command.request_id)) {
-        const isManual = command.decision === PermissionDecision.APPROVE_MANUAL;
-        const allowed = command.decision === PermissionDecision.APPROVE
-          || command.decision === PermissionDecision.ALWAYS_ALLOW
-          || isManual;
-
-        const pendingToolInput = this.hookServer.getPendingToolInput(command.request_id);
-        const pendingToolName = this.hookServer.getPendingToolName(command.request_id);
-
-        logger.debug('daemon', `Hook permission response for ${command.request_id}: tool=${pendingToolName}, decision=${command.decision}, isManual=${isManual}, allowed=${allowed}`);
-
-        if (pendingToolName === 'ExitPlanMode') {
-          // ExitPlanMode is now handled at PermissionRequest stage,
-          // so we use resolvePermissionPrompt which supports updatedPermissions.
-          if (allowed) {
-            const updatedPermissions = isManual ? undefined : [
-              { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
-            ];
-            const planInput = pendingToolInput ?? {};
-            const exitInput = isManual
-              ? { ...planInput, allowedPrompts: [] }
-              : planInput;
-
-            this.hookServer.resolvePermissionPrompt(
-              command.request_id,
-              'allow',
-              exitInput,
-              updatedPermissions,
-            );
-            logger.debug('daemon', `Resolved ExitPlanMode via PermissionRequest hook: ${isManual ? 'manual' : 'acceptEdits'}`);
-          } else {
-            this.hookServer.resolvePermissionPrompt(command.request_id, 'deny');
-            logger.debug('daemon', `Denied ExitPlanMode via PermissionRequest hook`);
-          }
-          return;
-        }
-
-        // All other tools: resolve via PermissionRequest hook format
-        if (allowed && command.decision === PermissionDecision.ALWAYS_ALLOW) {
-          // "Always Allow" — pass the permission suggestions so Claude Code adds the rule
-          const suggestions = this.hookServer.getPendingPermissionSuggestions(command.request_id);
-          const updatedPermissions = Array.isArray(suggestions) ? suggestions as Array<Record<string, unknown>> : undefined;
-          this.hookServer.resolvePermissionPrompt(
-            command.request_id,
-            'allow',
-            undefined,
-            updatedPermissions,
-          );
-          logger.debug('daemon', `Resolved PermissionRequest hook ${command.request_id} (${pendingToolName}): always_allow, updatedPermissions=${!!updatedPermissions}`);
-        } else {
-          this.hookServer.resolvePermissionPrompt(
-            command.request_id,
-            allowed ? 'allow' : 'deny',
-          );
-          logger.debug('daemon', `Resolved PermissionRequest hook ${command.request_id} (${pendingToolName}): ${allowed ? 'allow' : 'deny'}`);
-        }
-        return;
-      }
-
-      // Otherwise, it's an SDK-based permission
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-
-      // For approve_manual: approve but override allowedPrompts to empty
-      if (command.decision === PermissionDecision.APPROVE_MANUAL) {
-        this.sessionManager.respondPermission(
-          internalId,
-          command.request_id,
-          PermissionDecision.APPROVE,
-          { allowedPrompts: [] },
-        );
-      } else {
-        this.sessionManager.respondPermission(
-          internalId,
-          command.request_id,
-          command.decision,
-        );
-      }
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to respond to permission: ${(err as Error).message}`,
-        'PERMISSION_RESPONSE_ERROR',
-      );
-    }
+    handlePermissionResponseExternal(
+      this.commandContext(),
+      this.hookServer,
+      this.cryptoEngine,
+      this.responseDeps(),
+      command,
+    );
   }
 
   private handleQuestionResponse(command: QuestionResponseCommand): void {
-    this.untrackBlockingRequest(command.request_id);
-    this.clearNotificationDelivery('user_question', command.session_id, command.request_id);
-    try {
-      // AskUserQuestion answers come back through the PermissionRequest hook system
-      if (this.hookServer.hasPendingPermission(command.request_id)) {
-        const originalInput = this.hookServer.getPendingToolInput(command.request_id) ?? {};
-        // Use PermissionRequest format: allow with updatedInput containing answers
-        this.hookServer.resolvePermissionPrompt(
-          command.request_id,
-          'allow',
-          { ...originalInput, answers: command.answers },
-        );
-        logger.debug('daemon', `Resolved AskUserQuestion ${command.request_id} via PermissionRequest hook with answers: ${JSON.stringify(command.answers)}`);
-        return;
-      }
+    handleQuestionResponseExternal(this.commandContext(), this.hookServer, this.responseDeps(), command);
+  }
 
-      // For SDK-based sessions, approve with updatedInput containing answers
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const session = this.sessionManager.getSession(internalId);
-      const pending = session?.pendingPermissions.get(command.request_id);
-      const originalInput = pending?.toolInput ?? {};
-      this.sessionManager.respondPermission(
-        internalId,
-        command.request_id,
-        PermissionDecision.APPROVE,
-        { ...originalInput, answers: command.answers },
-      );
-      logger.debug('daemon', `Resolved SDK AskUserQuestion ${command.request_id}`);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to respond to question: ${(err as Error).message}`,
-        'QUESTION_RESPONSE_ERROR',
-      );
-    }
+  private responseDeps(): ResponseDeps {
+    return {
+      untrackBlockingRequest: (requestId) => this.untrackBlockingRequest(requestId),
+      clearNotificationDelivery: (eventType, sessionId, requestId) =>
+        this.clearNotificationDelivery(eventType, sessionId, requestId),
+    };
   }
 
   private async handleKillSession(command: KillSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      const observed = this.codexObservers.get(command.session_id);
-      if (observed) {
-        observed.observer.stop();
-        observed.status = SessionStatus.HISTORY;
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: command.session_id,
-          status: SessionStatus.HISTORY,
-        } as unknown as PcEvent);
-      }
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.killSession(internalId);
-    } catch (err) {
-      this.sendError(
-        undefined,
-        `Failed to kill session ${command.session_id}: ${(err as Error).message}`,
-        'KILL_SESSION_ERROR',
-      );
-    }
+    return handleKillSessionExternal(this.commandContext(), this.codexLifecycleDeps(), command);
   }
 
   private async handleInterruptSession(command: InterruptSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      const target = this.resolveCodexTerminalTarget(command.session_id)?.target;
-      if (!target) {
-        this.sendError(undefined, 'Codex interrupt is not available until a terminal target is attached for this Codex session.', 'CODEX_TERMINAL_NOT_ATTACHED');
-        return;
-      }
-      try {
-        terminalSendInterrupt(target);
-        logger.debug('daemon', `Interrupted Codex session ${command.session_id}`);
-      } catch (err) {
-        this.sendError(undefined, `Failed to interrupt Codex session ${command.session_id}: ${(err as Error).message}`, 'INTERRUPT_SESSION_ERROR');
-      }
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.interruptSession(internalId);
-      logger.debug('daemon', `Interrupted session ${command.session_id}`);
-    } catch (err) {
-      this.sendError(
-        undefined,
-        `Failed to interrupt session ${command.session_id}: ${(err as Error).message}`,
-        'INTERRUPT_SESSION_ERROR',
-      );
-    }
+    return handleInterruptSessionExternal(this.commandContext(), this.codexLifecycleDeps(), command);
   }
 
   private async handleSetPermissionMode(command: SetPermissionModeCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'set_permission_mode is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.setPermissionMode(internalId, command.mode);
-      this.sendToPhone({
-        type: 'command_ack',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        command: 'set_permission_mode',
-      });
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_PERMISSION_MODE_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleSetPermissionModeExternal(this.commandContext(), command);
   }
 
   private async handleSetModel(command: SetModelCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'set_model is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      await this.sessionManager.setModel(internalId, command.model);
-      this.sendToPhone({
-        type: 'command_ack',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        command: 'set_model',
-      });
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'SET_MODEL_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleSetModelExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedModels(command: GetSupportedModelsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_models is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdkModels = await this.sessionManager.getSupportedModels(internalId);
-      let currentModel: string | undefined;
-      try {
-        const usage = await this.sessionManager.getContextUsage(internalId);
-        currentModel = usage.model || undefined;
-      } catch {
-        currentModel = undefined;
-      }
-      const models = sdkModels.map(m => ({
-        value: m.value,
-        display_name: m.displayName,
-        description: m.description,
-        supports_effort: m.supportsEffort,
-        supported_effort_levels: m.supportedEffortLevels,
-        supports_adaptive_thinking: m.supportsAdaptiveThinking,
-        supports_fast_mode: m.supportsFastMode,
-        supports_auto_mode: m.supportsAutoMode,
-      }));
-      this.sendToPhone({
-        type: 'supported_models',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        models,
-        current_model: currentModel,
-        model_catalog: STATIC_MODEL_CATALOG,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_MODELS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedModelsExternal(this.commandContext(), command);
   }
 
   private async handleGetContextUsage(command: GetContextUsageCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_context_usage is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getContextUsage(internalId);
-      const usage = {
-        categories: sdk.categories.map(c => ({ name: c.name, tokens: c.tokens, color: c.color, is_deferred: c.isDeferred })),
-        total_tokens: sdk.totalTokens,
-        max_tokens: sdk.maxTokens,
-        raw_max_tokens: sdk.rawMaxTokens,
-        percentage: sdk.percentage,
-        model: sdk.model,
-        memory_files: sdk.memoryFiles?.map(f => ({ path: f.path, type: f.type, tokens: f.tokens })),
-        mcp_tools: sdk.mcpTools?.map(t => ({ name: t.name, server_name: t.serverName, tokens: t.tokens, is_loaded: t.isLoaded })),
-        deferred_builtin_tools: sdk.deferredBuiltinTools?.map(t => ({ name: t.name, tokens: t.tokens, is_loaded: t.isLoaded })),
-      };
-      this.sendToPhone({
-        type: 'context_usage',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        usage,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_CONTEXT_USAGE_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetContextUsageExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedCommands(command: GetSupportedCommandsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_commands is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getSupportedCommands(internalId);
-      const commands = sdk.map(c => ({
-        name: c.name,
-        description: c.description,
-        argument_hint: c.argumentHint,
-        aliases: c.aliases,
-      }));
-      this.sendToPhone({
-        type: 'supported_commands',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        commands,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_COMMANDS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedCommandsExternal(this.commandContext(), command);
   }
 
   private async handleGetSupportedAgents(command: GetSupportedAgentsCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_supported_agents is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getSupportedAgents(internalId);
-      const agents = sdk.map(a => ({
-        name: a.name,
-        description: a.description,
-        model: a.model,
-      }));
-      this.sendToPhone({
-        type: 'supported_agents',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        agents,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_SUPPORTED_AGENTS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetSupportedAgentsExternal(this.commandContext(), command);
   }
 
   private async handleGetMcpServerStatus(command: GetMcpServerStatusCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'get_mcp_server_status is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const sdk = await this.sessionManager.getMcpServerStatus(internalId);
-      const servers = sdk.map(s => ({
-        name: s.name,
-        status: s.status,
-        scope: s.scope,
-        error: s.error,
-        server_version: s.serverInfo?.version,
-        tools: s.tools?.map(t => ({ name: t.name, description: t.description })),
-      }));
-      this.sendToPhone({
-        type: 'mcp_server_status',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        servers,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      const code = message.startsWith('not_supported') ? 'NOT_SUPPORTED' : 'GET_MCP_SERVER_STATUS_ERROR';
-      this.sendError(command.request_id, message, code);
-    }
+    return handleGetMcpServerStatusExternal(this.commandContext(), command);
   }
 
   private async handleRewindSession(command: RewindSessionCommand): Promise<void> {
-    if (isCodexSessionId(command.session_id)) {
-      this.sendError(command.request_id, 'rewind_session is not supported for Codex sessions', 'NOT_SUPPORTED');
-      return;
-    }
-    const dryRun = command.dry_run ?? false;
-    try {
-      const internalId = this.resolveInternalSessionId(command.session_id) ?? command.session_id;
-      const result = await this.sessionManager.rewindSession(internalId, command.user_message_id, dryRun);
-      const externalNewId = result.newSessionId
-        ? this.resolveExternalSessionId(result.newSessionId)
-        : undefined;
-      this.sendToPhone({
-        type: 'rewind_session_response',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        can_rewind: result.canRewind,
-        dry_run: dryRun,
-        error: result.error,
-        files_changed: result.filesChanged,
-        insertions: result.insertions,
-        deletions: result.deletions,
-        new_session_id: externalNewId,
-      } as unknown as PcEvent);
-    } catch (err) {
-      const message = (err as Error).message;
-      logger.warn('daemon', 'rewind_session failed', {
-        sessionId: command.session_id,
-        userMessageId: command.user_message_id,
-        dryRun,
-        error: message,
-      });
-      // Reply on the rewind_session_response channel rather than the generic
-      // error channel so the phone's pending resolver fires instead of timing
-      // out. The phone surfaces `error` directly to the user.
-      this.sendToPhone({
-        type: 'rewind_session_response',
-        request_id: command.request_id,
-        session_id: command.session_id,
-        can_rewind: false,
-        dry_run: dryRun,
-        error: message,
-      } as unknown as PcEvent);
-    }
+    return handleRewindSessionExternal(this.commandContext(), command);
   }
 
-  private async handleListSessions(command: ListSessionsCommand): Promise<void> {
-    fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions CALLED\n`);
-    try {
-      const offset = command.offset ?? 0;
-      const limit = command.limit ?? 20;
+  private handleListSessions(command: ListSessionsCommand): Promise<void> {
+    return handleListSessionsExternal(this.commandContext(), this.listSessionsDeps(), command);
+  }
 
-      const discoveredSessions = this.sessionDiscovery.getCachedSessions()
-        ?? await this.sessionDiscovery.discoverSessions();
-
-      const allSessions: Array<{ entry: Record<string, unknown>; historyKey: string }> = [];
-
-      // ── Phase 1: Daemon-tracked sessions (SessionManager) ──
-      // These have observers attached and carry rich status.
-      const activeSessions = this.sessionManager.getAllSessions();
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Phase 1 has ${activeSessions.length} sessions: ${activeSessions.map(s => `${s.claudeSessionId?.slice(0,8)}(status=${s.status},pid=${s.terminalPid})`).join(', ')}\n`);
-      const claimedPids = new Set<number>();
-      const claimedSessionIds = new Set<string>();
-
-      // Snapshot live PID metadata once so we can use the friendly `name`
-      // (written by Claude Code 4.x into ~/.claude/sessions/<pid>.json) as a
-      // title fallback in every phase.
-      const runningAll = this.sessionDiscovery.getRunningAllSessions();
-      const pidNameByPid = new Map<number, string>();
-      for (const r of runningAll) {
-        if (r.name) pidNameByPid.set(r.pid, r.name);
-      }
-
-      for (const active of activeSessions) {
-        const externalId = this.resolveExternalSessionId(active.sessionId);
-        const claudeId = active.claudeSessionId ?? externalId;
-
-        // Check if this session has a pending permission in the hook server.
-        // Real (non-synthetic) entries always win — they're live blocking requests.
-        // Synthetic startup_pending_* entries are heuristic guesses from JSONL state
-        // at startup; if the session has been silent for a long time, the user has
-        // likely moved past it — clean up the synthetic so it doesn't keep firing,
-        // but keep trusting SessionManager's own status (it's tracked from observer
-        // events, not from the hook server).
-        let effectiveStatus = active.status as SessionStatus;
-        let actionType: string | undefined;
-        const realPending = Array.from(this.pendingBlockingRequests.entries()).find(
-          ([reqId, entry]) =>
-            entry.sessionId === externalId && !reqId.startsWith('startup_pending_'),
-        );
-        if (realPending) {
-          effectiveStatus = SessionStatus.PENDING_ACTIONS;
-          actionType = realPending[1].type;
-        } else if (effectiveStatus === SessionStatus.PENDING_ACTIONS) {
-          const idleMs = Date.now() - (active.lastActivity ?? 0);
-          if (idleMs > 10 * 60 * 1000) {
-            const syntheticId = `startup_pending_${externalId}`;
-            if (this.pendingBlockingRequests.has(syntheticId)) {
-              this.pendingBlockingRequests.delete(syntheticId);
-            }
-          }
-          // Do NOT downgrade to READY here — SessionManager set this status
-          // for a reason (real PreToolUse, observer detection, or startup
-          // JSONL analysis). The hook server can lose track of a permission
-          // that was timed out / transferred to terminal, but the session is
-          // still genuinely waiting.
-        }
-
-        allSessions.push({
-          entry: {
-            session_id: externalId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-            status: effectiveStatus,
-            action_type: actionType,
-            working_directory: active.workingDirectory,
-            project_name: active.customTitle
-              ?? (active.terminalPid ? pidNameByPid.get(active.terminalPid) : undefined)
-              ?? path.basename(active.workingDirectory),
-            last_activity: active.lastActivity,
-            entrypoint: active.entrypoint,
-            pid: active.terminalPid,
-            is_observed: active.isObserved,
-            ...(active.isObserved
-              ? {}
-              : {
-                  permission_mode: active.permissionMode ?? 'default',
-                  dangerously_skip_permissions: active.config?.dangerously_skip_permissions === true,
-                }),
-          },
-          historyKey: claudeId,
-        });
-        if (active.terminalPid) claimedPids.add(active.terminalPid);
-        claimedSessionIds.add(externalId);
-        if (active.claudeSessionId) claimedSessionIds.add(active.claudeSessionId);
-      }
-
-      // ── Phase 2: Alive PIDs not claimed by Phase 1 ──
-      // A live PID = an active session, even if the daemon hasn't attached an observer.
-      fs.appendFileSync('/tmp/daemon-debug.log', `${formatTimestamp()} handleListSessions: Phase 2 has ${runningAll.length} running PIDs: ${runningAll.map(s => `pid=${s.pid},sid=${s.sessionId.slice(0,8)}`).join(', ')}\n`);
-      for (const pidInfo of runningAll) {
-        if (claimedPids.has(pidInfo.pid)) continue;
-
-        // Override stale PID JSON metadata with the latest session-map entry,
-        // matching the live discovery loop. Without this, restarted daemons
-        // resolve the wrong sessionId for PIDs whose JSON wasn't updated
-        // after /clear or whose cwd is wrong (e.g. worktree launches).
-        const mapEntry = this.getLatestSessionMapEntryForPid(pidInfo.pid);
-        if (mapEntry && mapEntry.sessionId !== pidInfo.sessionId) {
-          pidInfo.sessionId = mapEntry.sessionId;
-          pidInfo.cwd = mapEntry.cwd;
-        }
-
-        // Phase 1 records the SDK session's externalId/claudeSessionId in
-        // claimedSessionIds even when terminalPid is undefined (controller
-        // mode). Skip here so we don't emit a second copy of the same
-        // session when its sessionId also shows up in ~/.claude/sessions/.
-        if (claimedSessionIds.has(pidInfo.sessionId)) continue;
-
-        // Best-effort JSONL match: try PID file's sessionId first.
-        // If JSONL is missing or stale, still emit the PID with its tracked
-        // sessionId — long-idle sessions are still real sessions with valid
-        // history. Mtime is not a reliable liveness signal.
-        let historyKey = pidInfo.sessionId;
-        let lastActivity: number | undefined;
-        let customTitle: string | undefined;
-
-        const exactMatch = discoveredSessions.find(d => d.sessionId === pidInfo.sessionId);
-        if (exactMatch) {
-          lastActivity = exactMatch.lastModified;
-          customTitle = exactMatch.customTitle;
-        }
-
-        allSessions.push({
-          entry: {
-            session_id: pidInfo.sessionId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe', 'terminal_remote_message', 'terminal_interrupt', 'permissions', 'plan_review', 'user_question'],
-            status: SessionStatus.READY,
-            working_directory: pidInfo.cwd,
-            project_name: customTitle ?? pidInfo.name ?? path.basename(pidInfo.cwd),
-            last_activity: lastActivity,
-            entrypoint: pidInfo.entrypoint,
-            pid: pidInfo.pid,
-            is_observed: true,
-          },
-          historyKey,
-        });
-        claimedPids.add(pidInfo.pid);
-        claimedSessionIds.add(pidInfo.sessionId);
-        claimedSessionIds.add(historyKey);
-      }
-
-      // ── Phase 3: History sessions (discovered JSONL files not tied to a live PID) ──
-      for (const discovered of discoveredSessions) {
-        if (claimedSessionIds.has(discovered.sessionId)) continue;
-        if (this.replacedSessionIds.has(discovered.sessionId)) continue;
-        allSessions.push({
-          entry: {
-            session_id: discovered.sessionId,
-            agent_type: 'claude_code',
-            agent_display_name: 'Claude Code',
-            agent_version: this.claudeAgentVersion,
-            capabilities: ['observe'],
-            status: SessionStatus.HISTORY,
-            working_directory: discovered.projectDir,
-            project_name: discovered.customTitle ?? path.basename(discovered.projectDir),
-            last_activity: discovered.lastModified,
-            is_observed: true,
-          },
-          historyKey: discovered.sessionId,
-        });
-        claimedSessionIds.add(discovered.sessionId);
-      }
-
-      // ── Phase 4: Codex history/observe sessions ──
-      const codexSessions = this.codexDiscovery.discoverSessions();
-      const liveCodexSessions = this.codexDiscovery.discoverLiveSessions(codexSessions);
-      for (const codex of codexSessions) {
-        if (claimedSessionIds.has(codex.sessionId)) continue;
-        const observed = this.codexObservers.get(codex.sessionId);
-        const liveCodex = liveCodexSessions.get(codex.sessionId);
-        const observedStatus = observed?.status;
-        const codexStatus = liveCodex
-          ? (observedStatus === SessionStatus.RUNNING || observedStatus === SessionStatus.PENDING_ACTIONS ? observedStatus : SessionStatus.READY)
-          : SessionStatus.HISTORY;
-        const terminal = liveCodex ? this.resolveCodexTerminalTarget(codex.sessionId, liveCodex) : undefined;
-        const capabilities = liveCodex ? this.getCodexCapabilities(codex.sessionId) : ['observe'];
-        allSessions.push({
-          entry: {
-            session_id: codex.sessionId,
-            agent_type: 'codex',
-            agent_display_name: 'Codex',
-            agent_version: codex.cliVersion,
-            status: codexStatus,
-            capabilities,
-            working_directory: codex.cwd,
-            project_name: codex.title ?? path.basename(codex.cwd),
-            last_activity: observed?.lastActivity ?? codex.updatedAtMs,
-            entrypoint: 'codex-cli',
-            pid: liveCodex?.pid ?? terminal?.pid,
-            is_observed: true,
-          },
-          historyKey: codex.sessionId,
-        });
-        claimedSessionIds.add(codex.sessionId);
-      }
-
-      // Overlay pending_actions from the hook server onto whatever status
-      // each phase produced. Phase 2 (alive PID without an attached observer)
-      // hardcodes READY, so a real blocking permission request would otherwise
-      // be invisible to the phone. Only real pending entries qualify —
-      // synthetic startup_pending_* are heuristic guesses, not live blocks.
-      const realPendingBySessionId = new Map<string, string>();
-      for (const [reqId, entry] of this.pendingBlockingRequests.entries()) {
-        if (reqId.startsWith('startup_pending_')) continue;
-        if (!realPendingBySessionId.has(entry.sessionId)) {
-          realPendingBySessionId.set(entry.sessionId, entry.type);
-        }
-      }
-      for (const item of allSessions) {
-        const sid = item.entry.session_id as string;
-        const pendingType = realPendingBySessionId.get(sid);
-        if (pendingType && item.entry.status !== SessionStatus.PENDING_ACTIONS) {
-          item.entry.status = SessionStatus.PENDING_ACTIONS;
-          item.entry.action_type = pendingType;
-        }
-      }
-
-      // Sort: active sessions first, then by last_activity descending
-      allSessions.sort((a, b) => {
-        const activeStatuses = new Set([SessionStatus.RUNNING, SessionStatus.PENDING_ACTIONS, SessionStatus.READY, SessionStatus.STARTING]);
-        const aActive = activeStatuses.has(a.entry.status as SessionStatus) ? 1 : 0;
-        const bActive = activeStatuses.has(b.entry.status as SessionStatus) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return ((b.entry.last_activity as number) ?? 0) - ((a.entry.last_activity as number) ?? 0);
-      });
-
-      const totalCount = allSessions.length;
-      const pageSlice = allSessions.slice(offset, offset + limit);
-
-      // Only fetch history for sessions in the current page
-      const sessions = pageSlice.map(({ entry, historyKey }) => {
-        const historyPage = isCodexSessionId(historyKey)
-          ? this.codexDiscovery.getSessionHistory(historyKey, { limit: 3 })
-          : this.sessionDiscovery.getSessionHistory(historyKey, { limit: 3 });
-        return {
-          ...entry,
-          recent_messages: historyPage.messages.map((m) => ({
-            role: m.role,
-            content: m.content.slice(0, 200),
-            tool_name: m.toolName,
-          })),
-        };
-      });
-
-      logger.debug('daemon', 'handleListSessions returning page', {
-        count: sessions.length,
-        sessions: pageSlice.map(({ entry }) => ({
-          sessionId: entry.session_id,
-          pid: entry.pid,
-          capabilities: entry.capabilities,
-        })),
-      });
-
-      const event = {
-        type: 'session_list',
-        request_id: command.request_id,
-        sessions,
-        total_count: totalCount,
-        offset,
-        has_more: offset + limit < totalCount,
-      };
-
-      this.sendToPhone(event as unknown as PcEvent);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to list sessions: ${(err as Error).message}`,
-        'LIST_SESSIONS_ERROR',
-      );
-    }
+  private listSessionsDeps(): ListSessionsDeps {
+    return {
+      getCachedSessions: () => this.sessionDiscovery.getCachedSessions(),
+      discoverSessions: () => this.sessionDiscovery.discoverSessions(),
+      getRunningAllSessions: () => this.sessionDiscovery.getRunningAllSessions(),
+      getSessionHistory: (id, options) => this.sessionDiscovery.getSessionHistory(id, options),
+      discoverCodexSessions: () => this.codexDiscovery.discoverSessions(),
+      discoverCodexLiveSessions: (sessions) => this.codexDiscovery.discoverLiveSessions(sessions),
+      getCodexHistory: (id, options) => this.codexDiscovery.getSessionHistory(id, options),
+      resolveCodexTerminalTarget: (id, liveCodex) => this.resolveCodexTerminalTarget(id, liveCodex),
+      getCodexCapabilities: (id) => this.getCodexCapabilities(id),
+      getCodexObserver: (id) => {
+        const o = this.codexObservers.get(id);
+        return o ? { status: o.status, lastActivity: o.lastActivity } : undefined;
+      },
+      getAllTrackedSessions: () => this.sessionManager.getAllSessions(),
+      pendingBlockingRequests: this.pendingBlockingRequests,
+      replacedSessionIds: this.replacedSessionIds,
+      claudeAgentVersion: this.claudeAgentVersion,
+    };
   }
 
   private async handleReadFile(command: ReadFileCommand): Promise<void> {
-    try {
-      // Security: resolve to prevent path traversal
-      const resolvedPath = path.resolve(command.path);
-
-      // Check if file exists and is readable
-      await fs.promises.access(resolvedPath, fs.constants.R_OK);
-
-      const stat = await fs.promises.stat(resolvedPath);
-
-      // Limit file size to 1MB
-      const MAX_FILE_SIZE = 1024 * 1024;
-      if (stat.size > MAX_FILE_SIZE) {
-        this.sendError(
-          command.request_id,
-          `File too large: ${stat.size} bytes (max ${MAX_FILE_SIZE})`,
-          'FILE_TOO_LARGE',
-        );
-        return;
-      }
-
-      const content = await fs.promises.readFile(resolvedPath, 'utf-8');
-
-      // Detect language from extension
-      const ext = path.extname(resolvedPath).toLowerCase();
-      const languageMap: Record<string, string> = {
-        '.ts': 'typescript',
-        '.tsx': 'typescript',
-        '.js': 'javascript',
-        '.jsx': 'javascript',
-        '.py': 'python',
-        '.rs': 'rust',
-        '.go': 'go',
-        '.java': 'java',
-        '.c': 'c',
-        '.cpp': 'cpp',
-        '.h': 'c',
-        '.hpp': 'cpp',
-        '.rb': 'ruby',
-        '.swift': 'swift',
-        '.kt': 'kotlin',
-        '.json': 'json',
-        '.yaml': 'yaml',
-        '.yml': 'yaml',
-        '.toml': 'toml',
-        '.md': 'markdown',
-        '.html': 'html',
-        '.css': 'css',
-        '.sh': 'bash',
-        '.sql': 'sql',
-      };
-
-      const event: FileContentEvent = {
-        type: 'file_content',
-        request_id: command.request_id,
-        path: resolvedPath,
-        content,
-        language: languageMap[ext],
-      };
-
-      this.sendToPhone(event);
-    } catch (err) {
-      this.sendError(
-        command.request_id,
-        `Failed to read file ${command.path}: ${(err as Error).message}`,
-        'READ_FILE_ERROR',
-      );
-    }
+    return handleReadFileExternal(this.commandContext(), command);
   }
 
   private handleEmergencyAbort(command: EmergencyAbortCommand): void {
-    // Verify signature for emergency abort if peer key is available
-    if (command.phone_signature && this.cryptoEngine.hasSessionKeys()) {
-      const signaturePayload = JSON.stringify({
-        type: 'emergency_abort',
-      });
-
-      const valid = this.cryptoEngine.verifyPeer(signaturePayload, command.phone_signature);
-      if (!valid) {
-        this.sendError(
-          undefined,
-          'Invalid emergency abort signature',
-          'SIGNATURE_INVALID',
-        );
-        return;
-      }
-    }
-
-    this.sessionManager.emergencyAbort();
-
-    // Notify the phone that abort is complete
-    const event: ErrorEvent = {
-      type: 'error',
-      message: 'Emergency abort completed -- all sessions terminated',
-      code: 'EMERGENCY_ABORT_COMPLETE',
-    };
-
-    this.sendToPhone(event);
+    handleEmergencyAbortExternal(this.commandContext(), this.cryptoEngine, command);
   }
 
   private handleGetHistory(command: GetHistoryCommand): void {
-    this.sendSessionHistory(command.session_id, {
-      since: command.since,
-      sinceSeq: command.since_seq,
-      offset: command.offset,
-      limit: command.limit,
-    });
+    handleGetHistoryExternal(this.commandContext(), command);
   }
 
   private handleSessionOutputAck(command: SessionOutputAckCommand): void {
-    const prev = this.lastAckedSeqs.get(command.session_id) ?? 0;
-    if (command.last_seq > prev) {
-      this.lastAckedSeqs.set(command.session_id, command.last_seq);
-    }
-    logger.trace('daemon', 'session_output_ack', { sessionId: command.session_id, lastSeq: command.last_seq });
+    handleSessionOutputAckExternal(this.lastAckedSeqs, command);
   }
 
   private handleNotificationDeliveryAck(command: NotificationDeliveryAckCommand): void {
-    const key = this.notificationDeliveryKey(command.event_type, command.session_id, command.request_id);
-    const pending = this.pendingNotificationDeliveries.get(key);
-    if (pending) {
-      this.pendingNotificationDeliveries.delete(key);
-      logger.debug('daemon', 'notification_delivery_ack received', {
-        eventType: command.event_type,
-        sessionId: command.session_id,
-        requestId: command.request_id,
-        attempts: pending.attempts,
-      });
-    } else {
-      logger.trace('daemon', 'notification_delivery_ack for untracked event', {
-        eventType: command.event_type,
-        sessionId: command.session_id,
-        requestId: command.request_id,
-      });
-    }
+    handleNotificationDeliveryAckExternal(this.pendingNotificationDeliveries, command);
   }
 
   private handleVerifyHistory(command: VerifyHistoryCommand): void {
-    // Read entire history (limit large enough to cover any session) to compare
-    // against the phone's claimed count/tail. Silence = match.
-    const result = isCodexSessionId(command.session_id)
-      ? this.codexDiscovery.getSessionHistory(command.session_id, {
-          offset: 0,
-          limit: 100_000,
-        })
-      : this.sessionDiscovery.getSessionHistory(command.session_id, {
-      offset: 0,
-      limit: 100_000,
-    });
-
-    // Apply the same phone-side filter (tool_use/tool_result hidden when pref is off).
-    const visible = this.phonePreferences.showToolUse
-      ? result.messages
-      : result.messages.filter(m => m.role !== 'tool_use' && m.role !== 'tool_result');
-
-    // Match phone-side parsing: skip empty user messages, blank assistant messages,
-    // and unrecognized roles (phone only handles user/assistant/tool_use/subagent).
-    const phoneVisible = visible.filter(m => {
-      if (m.role === 'user') return m.content.length > 0;
-      if (m.role === 'assistant') return m.content.trim().length > 0;
-      if (m.role === 'tool_use' || m.role === 'subagent') return true;
-      return false; // tool_result and unknown roles are skipped by phone
-    });
-
-    const expectedCount = phoneVisible.length;
-    const expectedTailSeq = result.tailSeq;
-
-    let reason: 'count_mismatch' | 'tail_seq_mismatch' | 'head_seq_mismatch' | null = null;
-    if (command.tail_seq !== undefined && expectedTailSeq !== undefined && command.tail_seq !== expectedTailSeq) {
-      reason = 'tail_seq_mismatch';
-    } else if (command.count !== expectedCount) {
-      // If the phone reports max_count and its count equals that max, it's trimming
-      // older messages — only tail_seq matters, count divergence is expected.
-      const phoneAtMax = (command as unknown as Record<string, unknown>).max_count !== undefined
-        && command.count === (command as unknown as Record<string, unknown>).max_count;
-      if (!phoneAtMax) {
-        reason = 'count_mismatch';
-      }
-    }
-
-    if (!reason) {
-      logger.trace('daemon', 'verify_history match', { sessionId: command.session_id, count: expectedCount });
-      return;
-    }
-
-    const event: HistoryDivergenceEvent = {
-      type: 'history_divergence',
-      session_id: command.session_id,
-      expected_count: expectedCount,
-      expected_tail_seq: expectedTailSeq,
-      reason,
+    const deps: VerifyHistoryDeps = {
+      getSdkHistory: (id, opts) => this.sessionDiscovery.getSessionHistory(id, opts),
+      getCodexHistory: (id, opts) => this.codexDiscovery.getSessionHistory(id, opts),
+      phonePreferences: this.phonePreferences,
     };
-    logger.info('daemon', 'history_divergence', { sessionId: command.session_id, reason, expectedCount, expectedTailSeq, phoneCount: command.count, phoneTail: command.tail_seq });
-    this.sendToPhone(event);
+    handleVerifyHistoryExternal(this.commandContext(), deps, command);
   }
 
   private handleSetPreferences(command: SetPreferencesCommand): void {
-    if (command.preferences.show_tool_use !== undefined) {
-      this.phonePreferences.showToolUse = command.preferences.show_tool_use;
-    }
-    if (command.preferences.show_completion_metrics !== undefined) {
-      this.phonePreferences.showCompletionMetrics = command.preferences.show_completion_metrics;
-    }
-    logger.debug('daemon', `Phone preferences updated: ${JSON.stringify(this.phonePreferences)}`);
+    handleSetPreferencesExternal(this.phonePreferences, command);
   }
 
   // --------------------------------------------------------------------------
@@ -3515,34 +1342,7 @@ export class AgentPocketDaemon extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private sendToPhone(event: PcEvent, wake = false, wakePayload?: WakeBlobPayload, forceWake = false): void {
-    // Stamp per-session monotonic seq on session_output events so the phone
-    // can detect gaps and request fill via get_history{since_seq}.
-    if ((event as { type?: string })?.type === 'session_output') {
-      const out = event as SessionOutputEvent;
-      if (out.session_id && out.session_seq === undefined) {
-        const next = (this.sessionSeqCounters.get(out.session_id) ?? 0) + 1;
-        this.sessionSeqCounters.set(out.session_id, next);
-        out.session_seq = next;
-      }
-    }
-
-    logger.trace('daemon', 'OUT event', { type: (event as { type?: string })?.type, requestId: (event as { request_id?: string })?.request_id, preview: JSON.stringify(event).slice(0, 100) });
-    if ((event as { type?: string })?.type === 'session_list') {
-      const sl = event as unknown as { sessions: Array<{ session_id: string; project_name?: string; status?: string }> };
-      logger.info('daemon', `[debug] session_list -> phone: ${sl.sessions.length} sessions: ${sl.sessions.map(s => `${s.session_id.slice(0,12)}(${s.project_name ?? '?'},${s.status ?? '?'})`).join(' | ')}`);
-    }
-
-    const mode = this.config.connectionMode ?? 'relay';
-
-    if (mode === 'lan' && this.lanServer) {
-      this.lanServer.send(event);
-    } else if (this.relayClient) {
-      // Check for rekey before sending
-      if (this.cryptoEngine.needsRekey()) {
-        this.cryptoEngine.resetRekeyCounters();
-      }
-      this.relayClient.send(event, wake, wakePayload, forceWake);
-    }
+    this.bookkeeping.sendToPhone(event, wake, wakePayload, forceWake);
   }
 
   private sendNotificationEventToPhone(
@@ -3552,14 +1352,7 @@ export class AgentPocketDaemon extends EventEmitter {
     requestId: string,
     wakePayload: WakeBlobPayload,
   ): void {
-    const phoneOnline = this.relayClient?.getPhonePeerOnline() === true;
-    logger.debug('daemon', 'notification emit', { eventType, sessionId, requestId, phoneOnline });
-    this.sendToPhone(event, true, wakePayload);
-    // Only track for ack-fallback when phone was online at emit time. If phone
-    // was offline, the relay already routed to APNs — no second push needed.
-    if (phoneOnline) {
-      this.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
-    }
+    this.bookkeeping.sendNotificationEventToPhone(event, eventType, sessionId, requestId, wakePayload);
   }
 
   private trackNotificationDelivery(
@@ -3569,22 +1362,11 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     wakePayload: WakeBlobPayload,
   ): void {
-    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
-    const key = this.notificationDeliveryKey(eventType, sessionId, requestId);
-    this.pendingNotificationDeliveries.set(key, {
-      requestId,
-      sessionId,
-      eventType,
-      event,
-      wakePayload,
-      sentAt: Date.now(),
-      attempts: 1,
-    });
-    logger.debug('daemon', 'Tracking notification delivery', { eventType, sessionId, requestId });
+    this.bookkeeping.trackNotificationDelivery(eventType, sessionId, requestId, event, wakePayload);
   }
 
   private notificationDeliveryKey(eventType: string, sessionId: string, requestId: string): string {
-    return `${eventType}|${sessionId}|${requestId}`;
+    return this.bookkeeping.notificationDeliveryKey(eventType, sessionId, requestId);
   }
 
   private resendTrackedBlockingEvent(
@@ -3594,42 +1376,19 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     forceWake = false,
   ): void {
-    const pending = this.pendingNotificationDeliveries.get(this.notificationDeliveryKey(eventType, sessionId, requestId));
-    if (pending?.wakePayload) {
-      this.sendToPhone(event, true, pending.wakePayload, forceWake);
-    } else {
-      this.sendToPhone(event);
-    }
+    this.bookkeeping.resendTrackedBlockingEvent(eventType, sessionId, requestId, event, forceWake);
   }
 
   private clearNotificationDelivery(eventType: string, sessionId: string, requestId: string): void {
-    this.pendingNotificationDeliveries.delete(this.notificationDeliveryKey(eventType, sessionId, requestId));
+    this.bookkeeping.clearNotificationDelivery(eventType, sessionId, requestId);
   }
 
   private clearNotificationDeliveriesForSession(sessionId: string): void {
-    for (const [key, entry] of this.pendingNotificationDeliveries) {
-      if (entry.sessionId === sessionId) {
-        this.pendingNotificationDeliveries.delete(key);
-      }
-    }
+    this.bookkeeping.clearNotificationDeliveriesForSession(sessionId);
   }
 
   private retryPendingNotificationDeliveries(): void {
-    if (!this.hasPeerCapability(PEER_CAPABILITIES.NOTIFICATION_DELIVERY_ACKS)) return;
-    const now = Date.now();
-    for (const [key, entry] of this.pendingNotificationDeliveries) {
-      if (now - entry.sentAt < NOTIFICATION_DELIVERY_ACK_TIMEOUT_MS) continue;
-      // Phone was online at emit but didn't ack within the window — fall back
-      // to one forceWake APNs and stop. No further retries; APNs is trusted.
-      this.pendingNotificationDeliveries.delete(key);
-      logger.warn('daemon', 'notification ack timeout — sending forceWake APNs fallback', {
-        eventType: entry.eventType,
-        sessionId: entry.sessionId,
-        requestId: entry.requestId,
-        elapsedMs: now - entry.sentAt,
-      });
-      this.sendToPhone(entry.event, true, entry.wakePayload, true);
-    }
+    this.bookkeeping.retryPendingNotificationDeliveries();
   }
 
   private sendExpiredPendingSystemMessage(
@@ -3639,96 +1398,16 @@ export class AgentPocketDaemon extends EventEmitter {
     actionType: 'permission_request' | 'user_question' | 'plan_review',
     entry?: { expiredSystemMessageSent?: boolean },
   ): void {
-    if (entry?.expiredSystemMessageSent) return;
-    const actionLabel = actionType === 'user_question'
-      ? 'question'
-      : actionType === 'plan_review'
-      ? 'plan review'
-      : 'permission request';
-    const content = "This " + actionLabel + " has expired. Handle it in the terminal, or interrupt this session from the app and continue it to trigger a new request.";
-    this.sendToPhone({
-      type: 'session_output',
-      session_id: sessionId,
-      output_type: 'system',
-      content,
-      timestamp: Date.now(),
-      request_id: requestId,
-      tool_name: toolName,
-    } as unknown as PcEvent);
-    if (entry) entry.expiredSystemMessageSent = true;
+    this.bookkeeping.sendExpiredPendingSystemMessage(sessionId, requestId, toolName, actionType, entry);
   }
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
-    if (agentType === 'codex' && agentEvent.type === 'user_message') {
-      const injected = this.codexInjectedMessages.get(sessionId);
-      if (consumeInjectedMessage(injected, agentEvent.message)) {
-        return;
-      }
-    }
-
-    const flat: Record<string, unknown> = {
-      type: 'session_output',
-      session_id: sessionId,
-      agent_type: agentType,
-      timestamp: Date.now(),
-    };
-
-    switch (agentEvent.type) {
-      case 'thinking':
-        flat.output_type = 'thinking';
-        flat.content = agentEvent.thinking;
-        flat.is_complete = false;
-        break;
-
-      case 'assistant_message':
-        flat.output_type = 'assistant_message';
-        flat.content = agentEvent.message;
-        flat.is_complete = false;
-        break;
-
-      case 'tool_use':
-        flat.output_type = 'tool_use';
-        flat.tool_name = agentEvent.tool_name;
-        flat.tool_input = agentEvent.tool_input;
-        flat.tool_use_id = agentEvent.tool_id;
-        break;
-
-      case 'tool_result':
-        flat.output_type = 'tool_result';
-        flat.tool_use_id = agentEvent.tool_id;
-        flat.output = agentEvent.output;
-        flat.is_error = agentEvent.status === 'error';
-        break;
-
-      case 'user_message':
-        flat.output_type = 'user_message';
-        flat.content = agentEvent.message;
-        if (agentEvent.sdkUuid) flat.sdk_uuid = agentEvent.sdkUuid;
-        break;
-
-      case 'system_message':
-        flat.output_type = 'system_message';
-        flat.content = agentEvent.message;
-        break;
-
-      case 'subagent_event':
-        flat.output_type = 'subagent_event';
-        flat.agent_id = agentEvent.agent_id;
-        flat.agent_name = agentEvent.agent_name;
-        flat.agent_type = agentEvent.agent_type;
-        flat.inner_event = agentEvent.inner_event;
-        flat.tool_use_count = agentEvent.tool_use_count;
-        flat.token_count = agentEvent.token_count;
-        flat.agent_status = agentEvent.agent_status;
-        break;
-
-      default:
-        flat.output_type = agentEvent.type;
-        flat.content = JSON.stringify(agentEvent);
-        break;
-    }
-
-    this.sendToPhone(flat as unknown as PcEvent);
+    sendFlattenedSessionOutputExternal(
+      { codexInjectedMessages: this.codexInjectedMessages, sendToPhone: (e) => this.sendToPhone(e) },
+      sessionId,
+      agentEvent,
+      agentType,
+    );
   }
 
   private sendError(requestId: string | undefined, message: string, code: string): void {
@@ -3739,6 +1418,32 @@ export class AgentPocketDaemon extends EventEmitter {
       code,
     };
     this.sendToPhone(event);
+  }
+
+  /**
+   * Build the minimum dependency surface a command handler needs from this
+   * daemon. Reused across every extracted handler module under
+   * src/commands/handlers/. Cheap to construct (just method references).
+   */
+  private commandContext(): CommandContext {
+    return {
+      sendToPhone: (event, wake) => this.sendToPhone(event, wake),
+      sendError: (requestId, message, code) => this.sendError(requestId, message, code),
+      resolveInternalSessionId: (id) => this.resolveInternalSessionId(id),
+      resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
+      sendSessionHistory: (id, options) => this.sendSessionHistory(id, options),
+      sessionManager: this.sessionManager,
+      sessionIdMap: this.sessionIdMap,
+      pendingSessionRequests: this.pendingSessionRequests,
+    };
+  }
+
+  private codexLifecycleDeps(): CodexLifecycleDeps {
+    return {
+      codexObservers: this.codexObservers,
+      resolveCodexTerminalTarget: (id) => this.resolveCodexTerminalTarget(id),
+      sendTerminalInterrupt: (target) => terminalSendInterrupt(target as TerminalTarget),
+    };
   }
 
   /**
@@ -3767,15 +1472,7 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private handlePeerHello(hello: PeerHello): void {
-    this.peerProductVersion = hello.product_version;
-    this.peerWireVersion = hello.wire_version;
-    this.peerCapabilities = new Set(Array.isArray(hello.capabilities) ? hello.capabilities : []);
-    logger.debug('daemon', 'Received peer_hello', {
-      product: hello.product,
-      product_version: hello.product_version,
-      wire: hello.wire_version,
-      capabilities: Array.from(this.peerCapabilities),
-    });
+    handlePeerHelloExternal(this.peers, hello);
   }
 
   /**
@@ -3783,7 +1480,7 @@ export class AgentPocketDaemon extends EventEmitter {
    * Returns false if no peer_hello has been received yet.
    */
   hasPeerCapability(name: string): boolean {
-    return this.peerCapabilities.has(name);
+    return this.peers.has(name);
   }
 
   /**
@@ -3795,52 +1492,14 @@ export class AgentPocketDaemon extends EventEmitter {
     event: PcEvent,
     type: 'permission_request' | 'user_question' | 'plan_review',
   ): void {
-    this.pendingBlockingRequests.set(requestId, {
-      requestId,
-      sessionId,
-      event,
-      sentAt: Date.now(),
-      type,
-    });
-
-    logger.debug('daemon', `trackBlockingRequest: ${type} ${requestId.slice(0,8)}`, { sessionId, totalPending: this.pendingBlockingRequests.size });
-
-    // Notify phone that session is now pending action
-    this.sendToPhone({
-      type: 'session_status',
-      session_id: sessionId,
-      status: SessionStatus.PENDING_ACTIONS,
-      action_type: type,
-    } as unknown as PcEvent);
+    this.bookkeeping.trackBlockingRequest(requestId, sessionId, event, type);
   }
 
   /**
    * Stop tracking a blocking request (phone responded or it was dismissed).
    */
   private untrackBlockingRequest(requestId: string): void {
-    const entry = this.pendingBlockingRequests.get(requestId);
-    this.pendingBlockingRequests.delete(requestId);
-
-    // If no more blocking requests for this session, notify phone that
-    // session is no longer waiting. Look up current session status.
-    if (entry) {
-      const hasOtherBlocking = Array.from(this.pendingBlockingRequests.values()).some(
-        e => e.sessionId === entry.sessionId,
-      );
-      if (!hasOtherBlocking) {
-        // Find the real session status (running/ready) or fall back to ready
-        const session = this.sessionManager.getAllSessions().find(
-          s => this.resolveExternalSessionId(s.sessionId) === entry.sessionId
-            || s.claudeSessionId === entry.sessionId,
-        );
-        const status = session?.status ?? SessionStatus.READY;
-        this.sendToPhone({
-          type: 'session_status',
-          session_id: entry.sessionId,
-          status,
-        } as unknown as PcEvent);
-      }
-    }
+    this.bookkeeping.untrackBlockingRequest(requestId);
   }
 
   /**
@@ -3848,31 +1507,7 @@ export class AgentPocketDaemon extends EventEmitter {
    * within BLOCKING_RETRY_INTERVAL_MS.
    */
   private retryPendingBlockingRequests(): void {
-    const now = Date.now();
-    for (const [requestId, entry] of this.pendingBlockingRequests) {
-      // Only retry if the request is still actually pending
-      // (hook still holding the connection, or SDK still waiting).
-      // Keep expired-to-terminal entries — they're waiting for PostToolUse.
-      if ((entry as any).expiredToTerminal) continue;
-
-      const isStillPending =
-        this.hookServer.hasPendingPermission(requestId) ||
-        this.sessionManager.getAllSessions().some(
-          s => s.pendingPermissions?.has(requestId),
-        );
-
-      if (!isStillPending) {
-        this.pendingBlockingRequests.delete(requestId);
-        this.clearNotificationDelivery(entry.type, entry.sessionId, requestId);
-        continue;
-      }
-
-      if (now - entry.sentAt >= BLOCKING_RETRY_INTERVAL_MS) {
-        logger.warn('daemon', `Retrying blocking request`, { type: entry.type, requestId, waitedMs: now - entry.sentAt });
-        this.sendToPhone(entry.event);
-        entry.sentAt = now;
-      }
-    }
+    this.bookkeeping.retryPendingBlockingRequests();
   }
 
   private findRequestIdForSession(sessionId: string): string | undefined {
@@ -3921,144 +1556,6 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   /**
-   * Find the most recent session-map.json entry for `pid` whose JSONL file
-   * still exists on disk. Returns the corrected sessionId + cwd + transcript
-   * path so callers can bypass the (potentially stale) PID JSON metadata.
-   *
-   * Why: ~/.claude/sessions/<pid>.json records `sessionId`/`cwd` from the
-   * process's first session. After /clear (and sometimes after a worktree
-   * launch where cwd is recorded incorrectly), it stops matching reality.
-   * The SessionStart hook always writes the correct values to session-map,
-   * which persists across daemon restarts.
-   */
-  private getLatestSessionMapEntryForPid(pid: number): { sessionId: string; cwd: string; transcriptPath?: string; timestamp: number } | undefined {
-    const mapped = this.readSessionMap();
-    let best: { sessionId: string; cwd: string; transcriptPath?: string; timestamp: number } | undefined;
-    for (const [sid, v] of Object.entries(mapped)) {
-      if (v.pid !== pid) continue;
-      if (v.transcript_path && !fs.existsSync(v.transcript_path)) continue;
-      if (!best || v.timestamp > best.timestamp) {
-        best = { sessionId: sid, cwd: v.cwd, transcriptPath: v.transcript_path, timestamp: v.timestamp };
-      }
-    }
-    return best;
-  }
-
-  /**
-   * Read ~/.agent-pocket/session-map.json written by the SessionStart hook script.
-   * Returns a map of sessionId → { source, cwd, transcript_path, pid, timestamp }.
-   */
-  private readSessionMap(): Record<string, { source: string; cwd: string; transcript_path?: string; pid?: number; timestamp: number }> {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return {};
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const parsed = JSON.parse(raw) as Record<string, { source: string; cwd: string; transcript_path?: string; pid?: number; timestamp: number }>;
-      // Defensive filter: subagent SessionStart events (older daemon versions
-      // wrote them) share the parent Claude PID and would clobber the real
-      // session-id mapping. Identify by transcript path under /subagents/.
-      const filtered: typeof parsed = {};
-      for (const [sid, v] of Object.entries(parsed)) {
-        if (v.transcript_path && v.transcript_path.includes('/subagents/')) continue;
-        filtered[sid] = v;
-      }
-      return filtered;
-    } catch {
-      return {};
-    }
-  }
-
-  /**
-   * Garbage-collect session-map.json: remove entries whose PID is no longer
-   * alive or whose transcript file is gone. Catches entries that were never
-   * observed by this daemon (e.g. CLIs that started+ended before launch) and
-   * stale entries left behind by PID reuse.
-   */
-  private gcSessionMap(): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number; transcript_path?: string }>;
-      const removed: string[] = [];
-      for (const [sid, entry] of Object.entries(map)) {
-        let dead = false;
-        // pid<=0 means the hook couldn't resolve a real Claude PID; the
-        // entry can never match a live process, so drop it.
-        if (!entry.pid || entry.pid <= 0) {
-          dead = true;
-        } else {
-          try { process.kill(entry.pid, 0); } catch { dead = true; }
-        }
-        if (!dead && entry.transcript_path && !fs.existsSync(entry.transcript_path)) {
-          dead = true;
-        }
-        if (dead) {
-          delete map[sid];
-          removed.push(sid);
-        }
-      }
-      if (removed.length > 0) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.debug('daemon', 'GC session-map', { removed: removed.length });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
-   * Remove session-map.json entries whose PID has died.
-   */
-  private cleanSessionMap(deadPids: number[]): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, { pid?: number }>;
-      const deadSet = new Set(deadPids);
-      let changed = false;
-      for (const [sid, entry] of Object.entries(map)) {
-        if (entry.pid && deadSet.has(entry.pid)) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Cleaned session-map entries for dead PIDs', { deadPids });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
-   * Remove specific session IDs from session-map.json.
-   */
-  private removeSessionMapEntries(sessionIds: string[]): void {
-    const mapFile = path.join(os.homedir(), '.agent-pocket', 'session-map.json');
-    try {
-      if (!fs.existsSync(mapFile)) return;
-      const raw = fs.readFileSync(mapFile, 'utf-8');
-      const map = JSON.parse(raw) as Record<string, unknown>;
-      let changed = false;
-      for (const sid of sessionIds) {
-        if (sid in map) {
-          delete map[sid];
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(mapFile, JSON.stringify(map), 'utf-8');
-        logger.trace('daemon', 'Removed stale session-map entries', { sessionIds });
-      }
-    } catch {
-      // Best effort
-    }
-  }
-
-  /**
    * Reverse lookup: given an external session ID the phone uses,
    * find the internal session ID in the session manager.
    */
@@ -4077,150 +1574,40 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private buildPermissionContext(toolName: string, toolInput: Record<string, unknown>): string {
-    const parts: string[] = [`Tool: ${toolName}`];
-
-    if (toolInput.command) {
-      parts.push(`Command: ${String(toolInput.command)}`);
-    }
-    if (toolInput.description && toolName === 'Bash') {
-      parts.push(`Description: ${String(toolInput.description)}`);
-    }
-    if (toolInput.file_path) {
-      parts.push(`File: ${String(toolInput.file_path)}`);
-    }
-    if (toolInput.path) {
-      parts.push(`Path: ${String(toolInput.path)}`);
-    }
-    if (toolInput.url) {
-      parts.push(`URL: ${String(toolInput.url)}`);
-    }
-    if (toolInput.pattern) {
-      parts.push(`Pattern: ${String(toolInput.pattern)}`);
-    }
-    if (toolInput.subject && (toolName === 'TaskCreate' || toolName === 'TaskUpdate')) {
-      parts.push(`Subject: ${String(toolInput.subject)}`);
-    }
-    if (toolInput.taskId) {
-      parts.push(`Task: #${String(toolInput.taskId)}`);
-    }
-    if (toolInput.status) {
-      parts.push(`Status: ${String(toolInput.status)}`);
-    }
-
-    return parts.join(' | ');
+    return buildPermissionContextExternal(toolName, toolInput);
   }
 
-  /**
-   * Try to find the working directory for a discovered session.
-   * Falls back to the daemon's default working directory.
-   */
   private findWorkingDirForSession(claudeSessionId: string): string {
-    // Check cached discovered sessions
-    const discovered = this.sessionDiscovery.getCachedSessions();
-    if (discovered) {
-      const match = discovered.find((s) => s.sessionId === claudeSessionId);
-      if (match) return match.projectDir;
-    }
-    return this.config.defaultWorkingDirectory ?? process.cwd();
+    return findWorkingDirForSessionExternal(
+      {
+        sessionDiscovery: this.sessionDiscovery,
+        defaultWorkingDirectory: this.config.defaultWorkingDirectory,
+      },
+      claudeSessionId,
+    );
   }
 
-  /**
-   * Check if a tool call is a plan-mode operation that should be auto-approved
-   * or handled specially (ExitPlanMode).
-   */
   private isPlanModeTool(toolName: string, toolInput: Record<string, unknown>): boolean {
-    if (toolName === 'EnterPlanMode' || toolName === 'ExitPlanMode') return true;
-    // Edit/Write on .claude/plans/ files
-    if (toolName === 'Edit' || toolName === 'Write') {
-      const filePath = (toolInput.file_path as string) ?? '';
-      if (filePath.includes('.claude/plans/')) return true;
-    }
-    return false;
+    return isPlanModeToolExternal(toolName, toolInput);
   }
 
-  /**
-   * Read the plan file from ExitPlanMode and send it as a plan_review event
-   * to the phone. The hook connection stays open until the phone responds.
-   */
   private sendPlanForReview(
     sessionId: string,
     requestId: string,
     toolInput: Record<string, unknown>,
     cwd: string,
   ): void {
-    let planContent = '';
-
-    // Try to find the plan file. ExitPlanMode may include allowedPrompts
-    // but the plan file path is in the session's plan file.
-    // Best approach: find the most recently modified .md in .claude/plans/ under cwd
-    const plansDir = path.join(cwd, '.claude', 'plans');
-    try {
-      if (fs.existsSync(plansDir)) {
-        const files = fs.readdirSync(plansDir)
-          .filter((f) => f.endsWith('.md'))
-          .map((f) => ({
-            name: f,
-            mtime: fs.statSync(path.join(plansDir, f)).mtimeMs,
-          }))
-          .sort((a, b) => b.mtime - a.mtime);
-
-        if (files.length > 0) {
-          const planPath = path.join(plansDir, files[0].name);
-          planContent = fs.readFileSync(planPath, 'utf-8');
-        }
-      }
-    } catch (err) {
-      logger.warn('daemon', `Error reading plan file: ${(err as Error).message}`);
-    }
-
-    // Also check the global .claude/plans/ directory
-    if (!planContent) {
-      const globalPlansDir = path.join(
-        os.homedir(),
-        '.claude',
-        'plans',
-      );
-      try {
-        if (fs.existsSync(globalPlansDir)) {
-          const files = fs.readdirSync(globalPlansDir)
-            .filter((f) => f.endsWith('.md'))
-            .map((f) => ({
-              name: f,
-              mtime: fs.statSync(path.join(globalPlansDir, f)).mtimeMs,
-            }))
-            .sort((a, b) => b.mtime - a.mtime);
-
-          if (files.length > 0) {
-            const planPath = path.join(globalPlansDir, files[0].name);
-            planContent = fs.readFileSync(planPath, 'utf-8');
-          }
-        }
-      } catch (err) {
-        logger.warn('daemon', `Error reading global plan file: ${(err as Error).message}`);
-      }
-    }
-
-    const flat: Record<string, unknown> = {
-      type: 'session_output',
-      session_id: sessionId,
-      output_type: 'plan_review',
-      plan_content: planContent || '(Could not read plan file)',
-      request_id: requestId,
-      allowed_prompts: toolInput.allowedPrompts ?? [],
-      timestamp: new Date().toISOString(),
-      ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-    };
-
-    this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'plan_review', sessionId, requestId, {
-      type: 'plan_review',
-      session_name: this.getSessionName(sessionId),
-      body: truncateUtf8(planContent || 'A plan is ready for your review', 256),
-      sound: 'default',
-      category: 'PLAN_REVIEW',
-      session_id: sessionId,
-      request_id: requestId,
-    });
-    this.trackBlockingRequest(requestId, sessionId, flat as unknown as PcEvent, 'plan_review');
+    sendPlanForReviewExternal(
+      {
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, et) => this.trackBlockingRequest(rId, sId, e, et),
+      },
+      sessionId,
+      requestId,
+      toolInput,
+      cwd,
+    );
   }
 
   /**
@@ -4233,52 +1620,16 @@ export class AgentPocketDaemon extends EventEmitter {
     claudeSessionId: string,
     options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
   ): number | undefined {
-    // If no 'since' filter and no explicit offset, send all messages (up to 2000)
-    // to ensure the phone gets complete history on first load.
-    // When 'since'/'sinceSeq' is present, use smaller default limit for incremental updates.
-    const incremental = options?.since !== undefined || options?.sinceSeq !== undefined;
-    const defaultLimit = incremental ? 200 : 2000;
-    const isFullHistory = !incremental && !options?.offset;
-
-    const result = isCodexSessionId(claudeSessionId)
-      ? this.codexDiscovery.getSessionHistory(claudeSessionId, {
-          offset: options?.offset ?? 0,
-          limit: options?.limit ?? defaultLimit,
-          since: options?.since,
-          sinceSeq: options?.sinceSeq,
-        })
-      : this.sessionDiscovery.getSessionHistory(claudeSessionId, {
-      offset: options?.offset ?? 0,
-      limit: options?.limit ?? defaultLimit,
-      since: options?.since,
-      sinceSeq: options?.sinceSeq,
-    });
-
-    // Truncate very long content to keep total message size reasonable
-    const truncated = result.messages.map((m) => ({
-      ...m,
-      content: m.content.slice(0, 5000),
-    }));
-
-    // Filter tool_use/tool_result when phone has disabled tool use display
-    const filtered = this.phonePreferences.showToolUse
-      ? truncated
-      : truncated.filter(m => m.role !== 'tool_use' && m.role !== 'tool_result');
-
-    const event = {
-      type: 'session_history',
-      session_id: claudeSessionId,
-      agent_type: isCodexSessionId(claudeSessionId) ? 'codex' : 'claude_code',
-      messages: filtered,
-      total_count: result.totalCount,
-      offset: result.offset,
-      has_more: result.hasMore,
-      is_full_history: isFullHistory,
-      tail_seq: result.tailSeq,
-    };
-
-    this.sendToPhone(event as unknown as PcEvent);
-    return result.tailSeq;
+    return sendSessionHistoryExternal(
+      {
+        sessionDiscovery: this.sessionDiscovery,
+        codexDiscovery: this.codexDiscovery,
+        phonePreferences: this.phonePreferences,
+        sendToPhone: (e) => this.sendToPhone(e),
+      },
+      claudeSessionId,
+      options,
+    );
   }
 
   /**
@@ -4296,70 +1647,6 @@ export class AgentPocketDaemon extends EventEmitter {
    * the protocol package's CURRENT_PEER_CAPABILITIES is updated).
    */
   private handleSyncRequest(command: SyncRequestCommand): void {
-    const t0 = Date.now();
-    const cursorMap = new Map<string, number>();
-    for (const cursor of command.cursors ?? []) {
-      cursorMap.set(cursor.session_id, cursor.last_seq);
-    }
-
-    const known = mergeSyncSessionIds(
-      cursorMap,
-      this.sessionManager
-        .getAllSessions()
-        .map((s) => s.claudeSessionId)
-        .filter((id): id is string => typeof id === 'string'),
-    );
-
-    logger.info('daemon', 'sync_request received', {
-      requestId: command.request_id,
-      cursors: cursorMap.size,
-      knownSessions: known.size,
-    });
-
-    const delivered: SyncCompleteEvent['delivered'] = [];
-    const perSessionMs: Record<string, number> = {};
-    for (const sessionId of known) {
-      const sessionStart = Date.now();
-      const lastSeq = cursorMap.get(sessionId);
-      const tail = this.sendSessionHistory(sessionId, {
-        sinceSeq: lastSeq !== undefined && lastSeq >= 0 ? lastSeq : undefined,
-      });
-      perSessionMs[sessionId.slice(0, 8)] = Date.now() - sessionStart;
-      if (tail !== undefined) {
-        delivered.push({ session_id: sessionId, last_seq: tail });
-      }
-    }
-
-    const event: SyncCompleteEvent = {
-      type: 'sync_complete',
-      request_id: command.request_id,
-      delivered,
-    };
-    logger.info('daemon', 'sync_complete', {
-      requestId: command.request_id,
-      sessions: delivered.length,
-      totalMs: Date.now() - t0,
-      perSessionMs,
-    });
-    this.sendToPhone(event);
+    handleSyncRequestExternal(this.commandContext(), command);
   }
-}
-
-/**
- * Build the set of session ids to replay during a sync_request: every
- * session the phone declared a cursor for plus every session the daemon
- * currently knows about. Exported for unit testing.
- */
-export function mergeSyncSessionIds(
-  cursorMap: Map<string, number>,
-  daemonKnownSessionIds: Iterable<string>,
-): Set<string> {
-  const merged = new Set<string>();
-  for (const sessionId of cursorMap.keys()) {
-    merged.add(sessionId);
-  }
-  for (const sessionId of daemonKnownSessionIds) {
-    merged.add(sessionId);
-  }
-  return merged;
 }

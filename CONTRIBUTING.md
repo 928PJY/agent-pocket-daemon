@@ -9,6 +9,7 @@ This is a small project run by one maintainer outside of work hours, so please o
 - [Code of Conduct](#code-of-conduct)
 - [Development setup](#development-setup)
 - [Project layout](#project-layout)
+- [Keeping modules small](#keeping-modules-small)
 - [Running the tests](#running-the-tests)
 - [Working on the daemon locally](#working-on-the-daemon-locally)
 - [Wire-protocol / capability changes](#wire-protocol--capability-changes)
@@ -70,6 +71,18 @@ test/                      # node:test suites — run with `npm test`
 
 There's a deeper walkthrough in [ARCHITECTURE.md](ARCHITECTURE.md) if you want the why behind the layout.
 
+## Keeping modules small
+
+A handful of files in `src/` (`cli.ts`, `sessions/session-manager.ts`, `discovery/session-discovery.ts`, `hooks/hook-server.ts`) have grown past the point where a new contributor can hold them in their head. They got that way by accumulating logic that *could* have been extracted but never was. When you're adding to one of these — or any file that already feels large — please apply the same shape we've been using to claw them back down:
+
+- **Extract clusters of pure logic into their own module.** A "cluster" is a small set of functions that share state or types but have no host-class dependencies — parsers, scanners, queue/buffer helpers, path/format utilities, JSON normalizers. These are the easiest to lift and the easiest to test.
+- **Inject side-effecting dependencies through a small `Deps` object** rather than importing them directly (e.g. `fsImpl?: Pick<typeof fs, 'existsSync' | 'readFileSync'>`, `nowFn?: () => number`, `killFn?: …`). Default to the real implementation when the caller passes nothing. This is what makes the new module unit-testable without touching the disk, the clock, or the process table.
+- **Keep the host file's public API stable.** Wire the host class's existing methods as thin delegators to the new module, and re-export any public free functions from the host so external imports keep compiling. The refactor commit should be a no-behavior-change move.
+- **Land the move and the tests as separate commits**, so reviewers can see the diff is mechanical. Aim for ≥90% line coverage on the extracted module — these clusters are the parts of the codebase where a focused unit test pays off the most. Anything you discover during extraction (latent bugs, dead branches) goes in its own commit too, never bundled with the move.
+- **Don't extract for its own sake.** A 300-line file with one concept doesn't need splitting. Extract when you can name the cluster, when its dependencies fit on one line, and when you can write tests against it without standing up the host class.
+
+If you find yourself wanting to split something but the cluster doesn't come out cleanly — for instance, the candidate code mutates the host's state and emits events on it — that's a signal to leave it in place rather than reshape it just to fit a module boundary. Note it in the PR description so the next person knows it was considered.
+
 ## Running the tests
 
 ```bash
@@ -116,6 +129,7 @@ Before opening a PR:
 - [ ] `npm test` passes
 - [ ] New behavior has a test (where reasonable — UX flows are hard to test)
 - [ ] If you changed protocol/capabilities, the PR description says so explicitly
+- [ ] If you grew an already-large file substantially, you considered an extraction (see [Keeping modules small](#keeping-modules-small))
 - [ ] No secrets, tokens, or relay URLs other than the public default in any new code or fixtures
 
 PRs that don't pass CI won't be reviewed until the build is green. The CI workflow is the same `build + test` that you run locally, on Node 20 and 22.
