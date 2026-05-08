@@ -37,7 +37,7 @@ import type {
   ToolResultEvent,
   PermissionMode,
 } from 'agent-pocket-protocol';
-import { PermissionDecision, PERMISSION_TIMEOUT_MS, SessionStatus } from 'agent-pocket-protocol';
+import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
 import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
@@ -65,7 +65,7 @@ export interface PendingPermission {
   requestId: string;
   toolName: string;
   toolInput: Record<string, unknown>;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
   createdAt: number;
 }
 
@@ -428,8 +428,8 @@ export class SessionManager extends EventEmitter {
       throw new Error(`No pending permission with request ID: ${requestId}`);
     }
 
-    // Clear the auto-deny timer
-    clearTimeout(pending.timer);
+    // Clear the auto-deny timer (no-op for controller-mode entries)
+    if (pending.timer) clearTimeout(pending.timer);
     session.pendingPermissions.delete(requestId);
 
     // Resolve the canUseTool promise
@@ -1038,7 +1038,12 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Register a permission request, set up auto-deny timeout.
+   * Register a permission request from the SDK canUseTool channel.
+   *
+   * No auto-deny timer: controller-mode permissions block the SDK query
+   * indefinitely until the phone responds, the user aborts the session, or
+   * cleanupSession() resolves the pending promise. This lets users leave
+   * their phone for arbitrarily long without losing in-flight questions.
    */
   private registerPermissionRequest(
     sessionId: string,
@@ -1052,29 +1057,10 @@ export class SessionManager extends EventEmitter {
     session.status = SessionStatus.PENDING_ACTIONS;
     this.emit('session_status', sessionId, SessionStatus.PENDING_ACTIONS);
 
-    const timer = setTimeout(() => {
-      // Auto-deny after PERMISSION_TIMEOUT_MS
-      const pending = session.pendingPermissions.get(requestId);
-      if (pending) {
-        session.pendingPermissions.delete(requestId);
-
-        const resolver = session.pendingPermissionResolvers.get(requestId);
-        if (resolver) {
-          session.pendingPermissionResolvers.delete(requestId);
-          resolver({ behavior: 'deny', message: 'Permission timed out' });
-        }
-
-        if (session.pendingPermissions.size === 0) {
-          session.status = SessionStatus.RUNNING;
-        }
-      }
-    }, PERMISSION_TIMEOUT_MS);
-
     session.pendingPermissions.set(requestId, {
       requestId,
       toolName,
       toolInput,
-      timer,
       createdAt: Date.now(),
     });
 
@@ -1305,7 +1291,7 @@ export class SessionManager extends EventEmitter {
 
     // Clear all pending permission timeouts
     for (const pending of session.pendingPermissions.values()) {
-      clearTimeout(pending.timer);
+      if (pending.timer) clearTimeout(pending.timer);
     }
     session.pendingPermissions.clear();
 

@@ -100,10 +100,24 @@ export class HookServer extends EventEmitter {
   private preToolUseCorrelator = new PreToolUseCorrelator({ ttlMs: HOOK_HOLD_TIMEOUT_MS });
   private hookCounter: number = 0;
   private readonly DEFAULT_TIMEOUT_MS = HOOK_HOLD_TIMEOUT_MS;
+  // When set, returns true if the given Claude session id is daemon-controlled
+  // (SDK canUseTool is the authoritative permission path). Hook-driven
+  // PreToolUse/PermissionRequest must short-circuit for these sessions —
+  // otherwise the same AskUserQuestion / permission shows up twice on the
+  // phone (once from SDK, once from the hook) under different request_ids.
+  private isControllerSession?: (claudeSessionId: string) => boolean;
 
   constructor(port: number = 0) {
     super();
     this.port = port;
+  }
+
+  /**
+   * Inject a predicate that identifies controller-mode (SDK-driven) sessions.
+   * Hook-channel permission events are dropped for matching sessions.
+   */
+  setControllerSessionPredicate(fn: (claudeSessionId: string) => boolean): void {
+    this.isControllerSession = fn;
   }
 
   /**
@@ -407,6 +421,17 @@ export class HookServer extends EventEmitter {
     const sessionId = json.session_id as string ?? '';
     const toolName = json.tool_name as string ?? 'unknown';
 
+    // Controller-mode (SDK-driven) sessions handle permissions through the
+    // SDK canUseTool channel. The hook still fires because Claude loads user
+    // settings.local.json regardless — drop it here so we don't double-forward
+    // the same request to the phone under a different request_id.
+    if (sessionId && this.isControllerSession?.(sessionId)) {
+      debugLog(`PreToolUse hook dropped (controller-mode session ${sessionId}, tool ${toolName})`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+      return;
+    }
+
     // Store correlation: PreToolUse tool_use_id for later PermissionRequest matching
     if (json.tool_use_id) {
       const key = `${sessionId}:${toolName}`;
@@ -531,6 +556,16 @@ export class HookServer extends EventEmitter {
     const hookId = `hook_${Date.now()}_${++this.hookCounter}`;
     const sessionId = json.session_id as string ?? '';
     const toolName = json.tool_name as string ?? 'unknown';
+
+    // Controller-mode (SDK-driven) sessions: SDK canUseTool already routed
+    // this same permission to the phone. Drop the hook copy so iOS doesn't
+    // see the question/permission card twice under different request_ids.
+    if (sessionId && this.isControllerSession?.(sessionId)) {
+      debugLog(`PermissionRequest hook dropped (controller-mode session ${sessionId}, tool ${toolName})`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+      return;
+    }
 
     // Correlate with the PreToolUse tool_use_id that fired just before this
     const preToolKey = `${sessionId}:${toolName}`;
