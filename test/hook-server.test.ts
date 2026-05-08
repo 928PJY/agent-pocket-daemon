@@ -564,3 +564,65 @@ test('HookServer keeps phone request visible when PermissionRequest connection c
   await waitFor(() => dismissed.includes(promptId));
   await promptRequest;
 });
+
+test('HookServer drops PreToolUse for controller-mode sessions (passthrough 200, no emit)', async (t) => {
+  const server = new HookServer(0);
+  const port = await server.start();
+  t.after(() => server.stop());
+
+  server.setControllerSessionPredicate((sid) => sid === 'controller-session');
+
+  const requests: HookPermissionRequest[] = [];
+  server.on('permission_request', (request) => { requests.push(request); });
+
+  // Controller-mode session → must short-circuit with 200 {} immediately
+  // and not emit. (The observed-session path of /hooks/permission-request
+  // blocks until PostToolUse — covered by other tests in this file; we
+  // don't re-exercise it here to keep this case fast and isolated.)
+  const dropped = await postHookResponse(port, '/hooks/permission-request', {
+    session_id: 'controller-session',
+    tool_name: 'Bash',
+    tool_use_id: 'toolu_controller_1',
+    tool_input: { command: 'ls' },
+  });
+  assert.equal(dropped.status, 200);
+  assert.deepEqual(await dropped.json(), {});
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(requests.length, 0);
+});
+
+test('HookServer drops PermissionRequest for controller-mode sessions (passthrough 200, no emit)', async (t) => {
+  const server = new HookServer(0);
+  const port = await server.start();
+  t.after(() => server.stop());
+
+  server.setControllerSessionPredicate((sid) => sid === 'controller-session');
+
+  const prompts: HookPermissionPrompt[] = [];
+  server.on('permission_prompt', (request) => { prompts.push(request); });
+
+  // Controller-mode: must short-circuit with 200 {} and emit nothing.
+  const dropped = await postHookResponse(port, '/hooks/permission-prompt', {
+    session_id: 'controller-session',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo controller' },
+  });
+  assert.equal(dropped.status, 200);
+  assert.deepEqual(await dropped.json(), {});
+  // Give the event loop a tick to flush any (incorrectly) queued emissions.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(prompts.length, 0);
+
+  // Observed-mode: predicate returns false → normal blocking flow runs and
+  // emits permission_prompt as usual.
+  const observedResponse = postHook(port, '/hooks/permission-prompt', {
+    session_id: 'observed-session',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo observed' },
+  });
+  await waitFor(() => prompts.length === 1);
+  const promptId = prompts[0].toolUseId;
+  assert.equal(server.resolvePermissionPrompt(promptId, 'allow'), true);
+  await observedResponse;
+});
