@@ -714,8 +714,12 @@ export class SessionManager extends EventEmitter {
    * if it ignores SIGINT. Without this the terminal Claude keeps running and
    * the user's "Stop" tap is a lie (issue #48).
    *
-   * Controller mode: abort the SDK Query and emit HISTORY immediately so the
-   * app reflects the stop without waiting for the SDK's finally to run.
+   * Controller mode: abort the SDK Query.
+   *
+   * Either way, the session entry is removed from the map *before* signaling.
+   * Otherwise sendMessage would still find the entry, see queryHandle === null,
+   * and silently auto-resume a brand-new Claude process via resumeWithMessage —
+   * making "Stop" look like it never happened.
    */
   async killSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -725,9 +729,10 @@ export class SessionManager extends EventEmitter {
 
     const wasObserved = session.isObserved;
     const terminalPid = session.terminalPid;
+    const abortController = session.abortController;
 
     this.cleanupSession(session);
-    session.status = SessionStatus.HISTORY;
+    this.sessions.delete(sessionId);
     this.emit('session_ended', sessionId, 0);
 
     if (wasObserved) {
@@ -740,7 +745,7 @@ export class SessionManager extends EventEmitter {
         logger.warn('session-manager', 'Observed session has no terminalPid to kill', { sessionId });
       }
     } else {
-      session.abortController.abort();
+      abortController.abort();
     }
   }
 
