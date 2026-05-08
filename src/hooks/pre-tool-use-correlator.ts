@@ -92,9 +92,9 @@ export class PreToolUseCorrelator {
       this.queues.delete(key);
       return undefined;
     }
-    if (fresh.length !== queue.length) {
-      this.queues.set(key, fresh);
-    }
+    // Always re-store so later splice/shift/push by callers mutates the
+    // same array reference held in the map.
+    this.queues.set(key, fresh);
     return fresh;
   }
 }
