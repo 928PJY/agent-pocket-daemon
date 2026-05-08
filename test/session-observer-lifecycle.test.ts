@@ -478,7 +478,7 @@ test('SessionManager kill, interrupt, and emergency paths clean up session state
 
     await manager.killSession(observedId);
 
-    assert.equal(observed.status, SessionStatus.HISTORY);
+    assert.equal(manager.getSession(observedId), undefined);
     assert.equal(observed.observer?.isActive(), false);
     assert.deepEqual(ended, [[observedId, 0]]);
 

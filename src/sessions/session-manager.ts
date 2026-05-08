@@ -39,8 +39,9 @@ import type {
 } from 'agent-pocket-protocol';
 import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
-import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt } from '../pty/tmux-injector.js';
+import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt, sendQuit as terminalSendQuit } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
+import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
 
 // ============================================================================
@@ -707,6 +708,23 @@ export class SessionManager extends EventEmitter {
 
   /**
    * Kill a specific session.
+   *
+   * Observer mode: prefer injecting Ctrl-C×2 into the user's terminal so the
+   * Claude REPL exits the way it does for an interactive Ctrl-C — printing
+   * `claude --resume <id>` so the user can resume in-place. Falls back to
+   * SIGINT (escalating to SIGTERM/SIGKILL) if no terminal target is attached
+   * or if the REPL doesn't exit within a few seconds. Note: on the fallback
+   * path, an external SIGINT alone usually does NOT exit the REPL (Claude
+   * treats it the same as one Ctrl-C — cancel the current turn, stay alive),
+   * so the helper will typically escalate to SIGTERM or SIGKILL before the
+   * process actually goes away.
+   *
+   * Controller mode: abort the SDK Query.
+   *
+   * Either way, the session entry is removed from the map *before* signaling.
+   * Otherwise sendMessage would still find the entry, see queryHandle === null,
+   * and silently auto-resume a brand-new Claude process via resumeWithMessage —
+   * making "Stop" look like it never happened.
    */
   async killSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -714,13 +732,64 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Session not found: ${sessionId}`);
     }
 
+    const wasObserved = session.isObserved;
+    const terminalPid = session.terminalPid;
+    const terminalTarget = session.terminalTarget;
+    const abortController = session.abortController;
+
     this.cleanupSession(session);
-    if (session.isObserved) {
-      session.status = SessionStatus.HISTORY;
-      this.emit('session_ended', sessionId, 0);
+    this.sessions.delete(sessionId);
+    this.emit('session_ended', sessionId, 0);
+
+    if (wasObserved) {
+      await this.killObservedTerminal(sessionId, terminalPid, terminalTarget);
     } else {
-      session.abortController.abort();
+      abortController.abort();
     }
+  }
+
+  /**
+   * Try Ctrl-C×2 injection first (so the user sees the resume hint), fall back
+   * to SIGINT/SIGTERM/SIGKILL if injection isn't available or doesn't take.
+   */
+  private async killObservedTerminal(
+    sessionId: string,
+    terminalPid: number | undefined,
+    terminalTarget: TerminalTarget | undefined,
+  ): Promise<void> {
+    if (terminalTarget && terminalPid) {
+      try {
+        terminalSendQuit(terminalTarget);
+        // 2.5s is short enough that PID reuse on macOS is effectively
+        // impossible (default PID space is ~99k and reuse is sequential).
+        // If this window ever grows much larger, revisit — a reused PID
+        // would mean the SIGINT escalation below targets a stranger.
+        const exited = await waitForPidExit(terminalPid, 2500, 100);
+        if (exited) {
+          logger.info('session-manager', 'Terminal Claude exited after Ctrl-C injection', {
+            sessionId, pid: terminalPid,
+          });
+          return;
+        }
+        logger.warn('session-manager', 'Terminal Claude ignored Ctrl-C, falling back to SIGINT/SIGTERM/SIGKILL escalation', {
+          sessionId, pid: terminalPid,
+        });
+      } catch (err) {
+        logger.warn('session-manager', `Ctrl-C injection failed, falling back to SIGINT/SIGTERM/SIGKILL escalation: ${(err as Error).message}`, {
+          sessionId, pid: terminalPid,
+        });
+      }
+    }
+
+    if (!terminalPid) {
+      logger.warn('session-manager', 'Observed session has no terminalPid to kill', { sessionId });
+      return;
+    }
+
+    const outcome = await killProcessGraceful(terminalPid);
+    logger.info('session-manager', 'Killed terminal process for observed session', {
+      sessionId, pid: terminalPid, outcome,
+    });
   }
 
   /**

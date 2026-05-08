@@ -6,6 +6,7 @@
 import { spawnSync, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { logger } from '../logger.js';
 
 interface TmuxInjectorDeps {
   spawnSync: typeof spawnSync;
@@ -33,13 +34,21 @@ export function __setTmuxInjectorDepsForTest(overrides: Partial<TmuxInjectorDeps
 // Types
 // ============================================================================
 
-export interface TerminalTarget {
-  type: 'iterm2' | 'tmux';
-  /** iTerm2: the TTY path (e.g., "/dev/ttys037"). tmux: the pane target (e.g., "main:0.1"). */
+export interface ITerm2Target {
+  type: 'iterm2';
+  /** TTY path (e.g., "/dev/ttys037"). */
   target: string;
-  /** tmux only: the socket path */
-  socket?: string;
 }
+
+export interface TmuxTarget {
+  type: 'tmux';
+  /** Pane target (e.g., "main:0.1"). */
+  target: string;
+  /** Path to the tmux socket this pane lives under. */
+  socket: string;
+}
+
+export type TerminalTarget = ITerm2Target | TmuxTarget;
 
 // ============================================================================
 // Public API
@@ -81,7 +90,7 @@ export function sendMessage(target: TerminalTarget, text: string): void {
       iTerm2ClearAndWriteText(target.target, text);
       break;
     case 'tmux':
-      tmuxClearAndSendKeys(target.socket!, target.target, text);
+      tmuxClearAndSendKeys(target.socket, target.target, text);
       break;
   }
 }
@@ -96,8 +105,48 @@ export function sendInterrupt(target: TerminalTarget): void {
       iTerm2SendEscape(target.target);
       break;
     case 'tmux':
-      tmuxSendEscape(target.socket!, target.target);
+      tmuxSendEscape(target.socket, target.target);
       break;
+  }
+}
+
+/**
+ * Send two Ctrl-C presses ~150ms apart to a terminal session running Claude
+ * Code's REPL. The first cancels the current input/turn; the second confirms
+ * exit and prints `claude --resume <id>` so the user can pick up where they
+ * left off. Sending only one Ctrl-C does not exit.
+ */
+export function sendQuit(target: TerminalTarget): void {
+  switch (target.type) {
+    case 'iterm2':
+      iTerm2SendCtrlC(target.target);
+      // Tiny delay so Claude's REPL processes the first Ctrl-C as "cancel"
+      // before the second one is read as "confirm exit".
+      sleepBlocking(150);
+      iTerm2SendCtrlC(target.target);
+      break;
+    case 'tmux':
+      tmuxSendCtrlC(target.socket, target.target);
+      sleepBlocking(150);
+      tmuxSendCtrlC(target.socket, target.target);
+      break;
+  }
+}
+
+function sleepBlocking(ms: number): void {
+  // execFileSync blocks the event loop, which is what we want here — the next
+  // injection must observe the REPL's reaction to the first Ctrl-C.
+  // Note: relies on BSD sleep accepting a fractional argument (e.g. "0.15").
+  // macOS-only daemon today, so this is fine; GNU coreutils sleep also
+  // accepts fractions, but minimal busybox builds do not — revisit if we
+  // ever ship for non-macOS hosts.
+  try {
+    deps.execFileSync('sleep', [String(ms / 1000)], { timeout: ms + 500 });
+  } catch (err) {
+    // Best-effort: if `sleep` is missing or times out we just skip the gap.
+    // Logged at debug because a missing /usr/bin/sleep is the only realistic
+    // root cause and would be noisy at warn.
+    logger.debug('tmux-injector', `sleepBlocking failed: ${(err as Error).message}`);
   }
 }
 
@@ -208,6 +257,37 @@ end tell`;
   }
 }
 
+/**
+ * Send an ETX (Ctrl-C, ASCII 3) character to an iTerm2 session.
+ */
+function iTerm2SendCtrlC(ttyPath: string): void {
+  const script = `
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s contains "${ttyPath}" then
+          write s text (ASCII character 3) newline no
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "not found"
+end tell`;
+
+  try {
+    const result = deps.execFileSync('osascript', ['-e', script], { timeout: 5000 });
+    const output = result.toString().trim();
+    if (output === 'not found') {
+      throw new Error(`iTerm2 session with TTY ${ttyPath} not found`);
+    }
+  } catch (err) {
+    if ((err as Error).message.includes('not found')) throw err;
+    throw new Error(`iTerm2 AppleScript failed: ${(err as Error).message}`);
+  }
+}
+
 // ============================================================================
 // tmux
 // ============================================================================
@@ -280,6 +360,15 @@ function tmuxSendEscape(socket: string, target: string): void {
   ]);
   if (result.status !== 0) {
     throw new Error(`tmux send Escape failed: ${result.stderr?.toString() ?? 'unknown error'}`);
+  }
+}
+
+function tmuxSendCtrlC(socket: string, target: string): void {
+  const result = deps.spawnSync('tmux', [
+    '-S', socket, 'send-keys', '-t', target, 'C-c',
+  ]);
+  if (result.status !== 0) {
+    throw new Error(`tmux send C-c failed: ${result.stderr?.toString() ?? 'unknown error'}`);
   }
 }
 
