@@ -41,6 +41,7 @@ import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
 import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
+import { killProcessGraceful } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
 
 // ============================================================================
@@ -707,6 +708,14 @@ export class SessionManager extends EventEmitter {
 
   /**
    * Kill a specific session.
+   *
+   * Observer mode: send SIGINT to the terminal Claude process so it unwinds
+   * cleanly (closes MCP, writes SessionEnd hook), escalating to SIGTERM/SIGKILL
+   * if it ignores SIGINT. Without this the terminal Claude keeps running and
+   * the user's "Stop" tap is a lie (issue #48).
+   *
+   * Controller mode: abort the SDK Query and emit HISTORY immediately so the
+   * app reflects the stop without waiting for the SDK's finally to run.
    */
   async killSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -714,10 +723,22 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Session not found: ${sessionId}`);
     }
 
+    const wasObserved = session.isObserved;
+    const terminalPid = session.terminalPid;
+
     this.cleanupSession(session);
-    if (session.isObserved) {
-      session.status = SessionStatus.HISTORY;
-      this.emit('session_ended', sessionId, 0);
+    session.status = SessionStatus.HISTORY;
+    this.emit('session_ended', sessionId, 0);
+
+    if (wasObserved) {
+      if (terminalPid) {
+        const outcome = await killProcessGraceful(terminalPid);
+        logger.info('session-manager', 'Killed terminal process for observed session', {
+          sessionId, pid: terminalPid, outcome,
+        });
+      } else {
+        logger.warn('session-manager', 'Observed session has no terminalPid to kill', { sessionId });
+      }
     } else {
       session.abortController.abort();
     }
