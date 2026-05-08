@@ -8,32 +8,16 @@ import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { findTerminalForPid } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
-import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
+import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
+import {
+  truncateToolInput,
+  parseHistoryEntry,
+} from './jsonl-parser.js';
 
-// Cap individual tool_input string values when shipping history to the phone,
-// so a Write/Edit with a megabyte-long body doesn't bloat session_history.
-// Live streaming events still send the full input; this only affects history.
-// NOTE: shallow — only top-level string values are capped. Arrays / nested
-// objects pass through untouched. No current Claude tool ships big strings
-// inside collections; revisit if that changes.
-const HISTORY_TOOL_INPUT_VALUE_CAP = 2000;
+// Cap individual tool_output strings when shipping history to the phone.
+// (HISTORY_TOOL_INPUT_VALUE_CAP lives in jsonl-parser.ts alongside truncateToolInput.)
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
-
-function truncateToolInput(
-  input: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!input) return undefined;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(input)) {
-    if (typeof v === 'string' && v.length > HISTORY_TOOL_INPUT_VALUE_CAP) {
-      out[k] = v.slice(0, HISTORY_TOOL_INPUT_VALUE_CAP) + `… [+${v.length - HISTORY_TOOL_INPUT_VALUE_CAP} chars]`;
-    } else {
-      out[k] = v;
-    }
-  }
-  return out;
-}
 
 // ============================================================================
 // Types
@@ -473,124 +457,7 @@ export class SessionDiscovery {
   }
 
   private parseHistoryEntry(entry: Record<string, unknown>): HistoryMessage[] {
-    const type = entry.type as string | undefined;
-    const timestamp = entry.timestamp as string | undefined;
-
-    if (type === 'user') {
-      const message = entry.message as { role?: string; content?: unknown } | undefined;
-      if (!message?.content) return [];
-
-      // Synthetic interrupt messages are not real user input — surface them as
-      // a short system-message marker instead of silently dropping or showing
-      // the raw "[Request interrupted by user]" string.
-      const reason = this.detectInterruptReason(message.content);
-      if (reason) {
-        return [{ role: 'system', content: interruptMessageText(reason), timestamp }];
-      }
-
-      const content = typeof message.content === 'string'
-        ? message.content
-        : Array.isArray(message.content)
-          ? (message.content as Array<{ type?: string; text?: string }>)
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text ?? '')
-              .join('')
-          : '';
-      if (!content) return [];
-      // Filter out internal Claude Code protocol messages (commands, system reminders, etc.)
-      if (this.isInternalMessage(content)) return [];
-      const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
-      return [{ role: 'user', content, timestamp, sdkUuid }];
-    }
-
-    if (type === 'assistant') {
-      const message = entry.message as { content?: Array<{ type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }> } | undefined;
-      if (!message?.content || !Array.isArray(message.content)) return [];
-
-      const results: HistoryMessage[] = [];
-
-      // Extract text blocks, treating the synthetic [Tool use interrupted]
-      // placeholder as a system-message marker rather than assistant output.
-      const textParts: string[] = [];
-      let interruptedInAssistant = false;
-      for (const block of message.content) {
-        if (block.type === 'text' && block.text) {
-          if (detectInterruptText(block.text)) {
-            interruptedInAssistant = true;
-          } else {
-            textParts.push(block.text);
-          }
-        }
-      }
-      if (textParts.length > 0) {
-        results.push({ role: 'assistant', content: textParts.join('\n'), timestamp });
-      }
-      if (interruptedInAssistant) {
-        // Offset by 1ms so the interrupt marker sorts AFTER any synthesized
-        // plan_review / user_question cards that share the tool_use timestamp.
-        const bumped = timestamp ? new Date(new Date(timestamp).getTime() + 1).toISOString() : timestamp;
-        results.push({ role: 'system', content: interruptMessageText('tool_use'), timestamp: bumped });
-      }
-
-      // Extract ALL tool_use blocks
-      for (const block of message.content) {
-        if (block.type === 'tool_use') {
-          results.push({
-            role: 'tool_use',
-            content: '',
-            toolName: block.name,
-            toolId: block.id,
-            toolInput: truncateToolInput(block.input as Record<string, unknown> | undefined),
-            timestamp,
-          });
-        }
-      }
-
-      return results;
-    }
-
-    return [];
-  }
-
-  /**
-   * If a user message's content is a synthetic interrupt marker, return the
-   * reason; otherwise null. Covers plain text, text blocks, and tool_result
-   * blocks with CANCEL_MESSAGE / [Tool use interrupted].
-   */
-  private detectInterruptReason(content: unknown): 'streaming' | 'tool_use' | null {
-    if (typeof content === 'string') {
-      return detectInterruptText(content);
-    }
-    if (Array.isArray(content)) {
-      for (const block of content as Array<Record<string, unknown>>) {
-        if (block?.type === 'text' && typeof block.text === 'string') {
-          const r = detectInterruptText(block.text);
-          if (r) return r;
-        }
-        if (block?.type === 'tool_result') {
-          const inner = (block as { content?: unknown }).content;
-          if (typeof inner === 'string') {
-            const r = detectInterruptText(inner);
-            if (r) return r;
-          } else if (Array.isArray(inner)) {
-            for (const b of inner as Array<Record<string, unknown>>) {
-              if (b?.type === 'text' && typeof b.text === 'string') {
-                const r = detectInterruptText(b.text);
-                if (r) return r;
-              }
-            }
-          }
-        }
-      }
-    }
-    return null;
-  }
-
-  /** Check if a message is an internal Claude Code protocol message (not user-authored). */
-  private isInternalMessage(text: string): boolean {
-    const trimmed = text.trimStart();
-    if (!trimmed.startsWith('<')) return false;
-    return /^<(teammate-message|system-reminder|task-notification|command-name|local-command-caveat|local-command|user-prompt-submit-hook)[\s>]/.test(trimmed);
+    return parseHistoryEntry(entry) as HistoryMessage[];
   }
 
   /**
