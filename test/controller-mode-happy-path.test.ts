@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -683,6 +683,61 @@ test('rewindSession propagates SDK errors', async () => {
     await assert.rejects(
       () => manager.rewindSession(sessionId, 'm', true),
       (err: Error) => err.message.includes('boom rewind'),
+    );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('createSession is not blocked by observed sessions when at the cap (issue #223)', async () => {
+  const fake = createFakeQuery();
+  // Pin the cap low so the test is unambiguous: 5 observed entries should
+  // NOT be enough to trip "Maximum concurrent sessions" against a fresh
+  // controller-mode createSession.
+  const manager = new SessionManager({ queryFactory: makeFactory(fake), max_concurrent_sessions: 5 });
+
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-cap-observed-'));
+  try {
+    for (let i = 0; i < 5; i++) {
+      const jsonl = join(cwd, `obs-${i}.jsonl`);
+      writeFileSync(jsonl, '');
+      manager.observeSession(`claude-obs-${i}`, jsonl, cwd, 2000 + i);
+    }
+
+    // The pre-fix behavior would throw "Maximum concurrent sessions (5) reached"
+    // here because observed sessions counted against the cap. After the fix,
+    // controller createSession proceeds because no SDK queries are running.
+    const sessionId = manager.createSession({
+      name: 'c-after-5-observed',
+      agent_type: 'claude_code',
+      working_directory: cwd,
+    });
+
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+    assert.equal(manager.getControllerSessionCount(), 1);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('createSession still throws when controller cap itself is reached', async () => {
+  const fakes = [createFakeQuery(), createFakeQuery()];
+  let i = 0;
+  const manager = new SessionManager({
+    queryFactory: () => fakes[i++].query,
+    max_concurrent_sessions: 2,
+  });
+
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-cap-controller-'));
+  try {
+    manager.createSession({ name: 'a', agent_type: 'claude_code', working_directory: cwd });
+    manager.createSession({ name: 'b', agent_type: 'claude_code', working_directory: cwd });
+
+    assert.throws(
+      () => manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd }),
+      /Maximum concurrent sessions \(2\) reached/,
     );
   } finally {
     manager.shutdown();

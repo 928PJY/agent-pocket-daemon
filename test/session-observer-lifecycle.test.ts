@@ -562,6 +562,29 @@ test('SessionManager active session count excludes history and error sessions', 
   }
 });
 
+test('SessionManager controller session count excludes observed sessions entirely (issue #223)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
+  const paths = [1, 2, 3, 4, 5].map((n) => {
+    const p = join(dir, `obs-${n}.jsonl`);
+    writeFileSync(p, '');
+    return p;
+  });
+
+  const manager = new SessionManager();
+
+  try {
+    paths.forEach((p, i) => manager.observeSession(`claude-obs-${i}`, p, dir, 1000 + i));
+
+    assert.equal(manager.getActiveSessionCount(), 5);
+    // The cap exists to bound concurrent SDK queries; observed sessions own
+    // none, so they must not count toward it.
+    assert.equal(manager.getControllerSessionCount(), 0);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('SessionManager.respondPermission rejects unknown pending request', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-manager-'));
   const jsonlPath = join(dir, 'session.jsonl');
