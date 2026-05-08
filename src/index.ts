@@ -103,6 +103,12 @@ import {
 } from './wiring/hook-handlers-codex.js';
 import { wireHookServer } from './wiring/hook-server-wiring.js';
 import {
+  attachCodexObserverHandlers as attachCodexObserverHandlersExternal,
+  sendCodexCompletion as sendCodexCompletionExternal,
+  createCompletionRequestIdGenerator,
+  type CodexObserverTracked,
+} from './wiring/codex-event-bridge.js';
+import {
   registerSessionStartedHandler,
   registerPermissionModeChangedHandler,
   registerSessionOutputHandler,
@@ -252,7 +258,7 @@ export class AgentPocketDaemon extends EventEmitter {
   private codexObservers: Map<string, { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }> = new Map();
   private codexInjectedMessages: Map<string, Map<string, number>> = new Map();
   private codexStopHookDeduper = new CodexStopHookDeduper();
-  private completionRequestCounter = 0;
+  private completionRequestIdGen = createCompletionRequestIdGenerator();
   private claudeAgentVersion?: string;
   private codexTerminalTargets: Map<string, CodexTerminalTargetEntry> = new Map();
   private hookServer: HookServer;
@@ -869,30 +875,22 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private nextCompletionRequestId(sessionId: string, timestamp: number = Date.now()): string {
-    this.completionRequestCounter = (this.completionRequestCounter + 1) % Number.MAX_SAFE_INTEGER;
-    return `completion_${sessionId}_${timestamp}_${this.completionRequestCounter}`;
+    return this.completionRequestIdGen(sessionId, timestamp);
   }
 
   private sendCodexCompletion(sessionId: string, session?: CodexSession, summary?: string): void {
-    if (!this.initialDiscoveryDone) return;
-    const body = summary?.trim() || this.codexDiscovery.getLastAssistantMessage(sessionId) || 'Codex turn finished';
-    const completionRequestId = this.nextCompletionRequestId(sessionId);
-    this.sendNotificationEventToPhone({
-      type: 'session_status',
-      session_id: sessionId,
-      status: SessionStatus.READY,
-      is_completion: true,
-      completion_request_id: completionRequestId,
-      completion_body: body,
-    } as unknown as PcEvent, 'session_completed', sessionId, completionRequestId, {
-      type: 'session_completed',
-      session_name: session?.title ?? (session?.cwd ? path.basename(session.cwd) : this.getSessionName(sessionId)),
-      body: truncateUtf8(body, 256),
-      sound: 'completion.caf',
-      category: 'SESSION_COMPLETED',
-      session_id: sessionId,
-      request_id: completionRequestId,
-    });
+    sendCodexCompletionExternal(
+      {
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        getLastAssistantMessage: (id) => this.codexDiscovery.getLastAssistantMessage(id),
+        nextCompletionRequestId: (id, ts) => this.nextCompletionRequestId(id, ts),
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+      },
+      sessionId,
+      session,
+      summary,
+    );
   }
 
   private resolveCodexExternalSessionId(sessionId: string): string | undefined {
@@ -922,47 +920,17 @@ export class AgentPocketDaemon extends EventEmitter {
     return next;
   }
 
-  private attachCodexObserverHandlers(tracked: { observer: CodexObserver; session: CodexSession; status: SessionStatus; lastActivity: number }): void {
-    const { observer, session } = tracked;
-    observer.on('output', (codexEvent: ClaudeEvent) => {
-      tracked.lastActivity = Date.now();
-      this.sendFlattenedSessionOutput(session.sessionId, codexEvent, 'codex');
-    });
-    observer.on('status_change', (status: 'running' | 'ready') => {
-      tracked.status = status as SessionStatus;
-      tracked.lastActivity = Date.now();
-      if (!this.initialDiscoveryDone) return;
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: session.sessionId,
-        status: tracked.status,
-      } as unknown as PcEvent);
-    });
-    observer.on('completed', (summary?: string) => {
-      tracked.status = SessionStatus.READY;
-      tracked.lastActivity = Date.now();
-      if (!this.initialDiscoveryDone) return;
-      if (this.codexStopHookDeduper.consume(session.sessionId)) return;
-      this.sendCodexCompletion(session.sessionId, session, summary);
-    });
-    observer.on('error', (err: Error) => {
-      tracked.status = SessionStatus.ERROR;
-      tracked.lastActivity = Date.now();
-      logger.warn('codex-observer', `Observer error: ${err.message}`, { sessionId: session.sessionId });
-      if (!this.initialDiscoveryDone) return;
-      this.sendToPhone({
-        type: 'session_status',
-        session_id: session.sessionId,
-        status: SessionStatus.ERROR,
-      } as unknown as PcEvent, true, {
-        type: 'session_error',
-        session_name: session.title ?? path.basename(session.cwd),
-        body: truncateUtf8(err.message || 'Codex turn failed', 256),
-        sound: 'default',
-        category: 'SESSION_ERROR',
-        session_id: session.sessionId,
-      });
-    });
+  private attachCodexObserverHandlers(tracked: CodexObserverTracked): void {
+    attachCodexObserverHandlersExternal(
+      {
+        isInitialDiscoveryDone: () => this.initialDiscoveryDone,
+        codexStopHookDeduper: this.codexStopHookDeduper,
+        sendFlattenedSessionOutput: (sId, e, at) => this.sendFlattenedSessionOutput(sId, e, at),
+        sendToPhone: (e, wake, wp) => this.sendToPhone(e, wake, wp),
+        sendCodexCompletion: (sId, sess, summary) => this.sendCodexCompletion(sId, sess, summary),
+      },
+      tracked,
+    );
   }
 
   private getCodexCapabilities(sessionId: string): string[] {
