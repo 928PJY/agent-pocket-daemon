@@ -24,7 +24,6 @@ import type { TerminalTarget } from './pty/tmux-injector.js';
 import { LanServer } from './lan/lan-server.js';
 import { BonjourAdvertiser } from './lan/bonjour-advertiser.js';
 import { formatTimestamp, logger } from './logger.js';
-import { truncateUtf8 } from './utils/truncate-utf8.js';
 import {
   readSessionMap,
   getLatestSessionMapEntryForPid,
@@ -109,6 +108,12 @@ import {
   type CodexObserverTracked,
 } from './wiring/codex-event-bridge.js';
 import {
+  buildPermissionContext as buildPermissionContextExternal,
+  isPlanModeTool as isPlanModeToolExternal,
+  findWorkingDirForSession as findWorkingDirForSessionExternal,
+  sendPlanForReview as sendPlanForReviewExternal,
+} from './wiring/permission-ui.js';
+import {
   registerSessionStartedHandler,
   registerPermissionModeChangedHandler,
   registerSessionOutputHandler,
@@ -184,7 +189,6 @@ import type {
   WakeBlobPayload,
 } from 'agent-pocket-protocol';
 import {
-  HOOK_HOLD_TIMEOUT_SECONDS,
   DAEMON_DEFAULT_PORT,
   SessionStatus,
   HOOK_SERVER_PORT,
@@ -1570,150 +1574,40 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   private buildPermissionContext(toolName: string, toolInput: Record<string, unknown>): string {
-    const parts: string[] = [`Tool: ${toolName}`];
-
-    if (toolInput.command) {
-      parts.push(`Command: ${String(toolInput.command)}`);
-    }
-    if (toolInput.description && toolName === 'Bash') {
-      parts.push(`Description: ${String(toolInput.description)}`);
-    }
-    if (toolInput.file_path) {
-      parts.push(`File: ${String(toolInput.file_path)}`);
-    }
-    if (toolInput.path) {
-      parts.push(`Path: ${String(toolInput.path)}`);
-    }
-    if (toolInput.url) {
-      parts.push(`URL: ${String(toolInput.url)}`);
-    }
-    if (toolInput.pattern) {
-      parts.push(`Pattern: ${String(toolInput.pattern)}`);
-    }
-    if (toolInput.subject && (toolName === 'TaskCreate' || toolName === 'TaskUpdate')) {
-      parts.push(`Subject: ${String(toolInput.subject)}`);
-    }
-    if (toolInput.taskId) {
-      parts.push(`Task: #${String(toolInput.taskId)}`);
-    }
-    if (toolInput.status) {
-      parts.push(`Status: ${String(toolInput.status)}`);
-    }
-
-    return parts.join(' | ');
+    return buildPermissionContextExternal(toolName, toolInput);
   }
 
-  /**
-   * Try to find the working directory for a discovered session.
-   * Falls back to the daemon's default working directory.
-   */
   private findWorkingDirForSession(claudeSessionId: string): string {
-    // Check cached discovered sessions
-    const discovered = this.sessionDiscovery.getCachedSessions();
-    if (discovered) {
-      const match = discovered.find((s) => s.sessionId === claudeSessionId);
-      if (match) return match.projectDir;
-    }
-    return this.config.defaultWorkingDirectory ?? process.cwd();
+    return findWorkingDirForSessionExternal(
+      {
+        sessionDiscovery: this.sessionDiscovery,
+        defaultWorkingDirectory: this.config.defaultWorkingDirectory,
+      },
+      claudeSessionId,
+    );
   }
 
-  /**
-   * Check if a tool call is a plan-mode operation that should be auto-approved
-   * or handled specially (ExitPlanMode).
-   */
   private isPlanModeTool(toolName: string, toolInput: Record<string, unknown>): boolean {
-    if (toolName === 'EnterPlanMode' || toolName === 'ExitPlanMode') return true;
-    // Edit/Write on .claude/plans/ files
-    if (toolName === 'Edit' || toolName === 'Write') {
-      const filePath = (toolInput.file_path as string) ?? '';
-      if (filePath.includes('.claude/plans/')) return true;
-    }
-    return false;
+    return isPlanModeToolExternal(toolName, toolInput);
   }
 
-  /**
-   * Read the plan file from ExitPlanMode and send it as a plan_review event
-   * to the phone. The hook connection stays open until the phone responds.
-   */
   private sendPlanForReview(
     sessionId: string,
     requestId: string,
     toolInput: Record<string, unknown>,
     cwd: string,
   ): void {
-    let planContent = '';
-
-    // Try to find the plan file. ExitPlanMode may include allowedPrompts
-    // but the plan file path is in the session's plan file.
-    // Best approach: find the most recently modified .md in .claude/plans/ under cwd
-    const plansDir = path.join(cwd, '.claude', 'plans');
-    try {
-      if (fs.existsSync(plansDir)) {
-        const files = fs.readdirSync(plansDir)
-          .filter((f) => f.endsWith('.md'))
-          .map((f) => ({
-            name: f,
-            mtime: fs.statSync(path.join(plansDir, f)).mtimeMs,
-          }))
-          .sort((a, b) => b.mtime - a.mtime);
-
-        if (files.length > 0) {
-          const planPath = path.join(plansDir, files[0].name);
-          planContent = fs.readFileSync(planPath, 'utf-8');
-        }
-      }
-    } catch (err) {
-      logger.warn('daemon', `Error reading plan file: ${(err as Error).message}`);
-    }
-
-    // Also check the global .claude/plans/ directory
-    if (!planContent) {
-      const globalPlansDir = path.join(
-        os.homedir(),
-        '.claude',
-        'plans',
-      );
-      try {
-        if (fs.existsSync(globalPlansDir)) {
-          const files = fs.readdirSync(globalPlansDir)
-            .filter((f) => f.endsWith('.md'))
-            .map((f) => ({
-              name: f,
-              mtime: fs.statSync(path.join(globalPlansDir, f)).mtimeMs,
-            }))
-            .sort((a, b) => b.mtime - a.mtime);
-
-          if (files.length > 0) {
-            const planPath = path.join(globalPlansDir, files[0].name);
-            planContent = fs.readFileSync(planPath, 'utf-8');
-          }
-        }
-      } catch (err) {
-        logger.warn('daemon', `Error reading global plan file: ${(err as Error).message}`);
-      }
-    }
-
-    const flat: Record<string, unknown> = {
-      type: 'session_output',
-      session_id: sessionId,
-      output_type: 'plan_review',
-      plan_content: planContent || '(Could not read plan file)',
-      request_id: requestId,
-      allowed_prompts: toolInput.allowedPrompts ?? [],
-      timestamp: new Date().toISOString(),
-      ttl: HOOK_HOLD_TIMEOUT_SECONDS,
-    };
-
-    this.sendNotificationEventToPhone(flat as unknown as PcEvent, 'plan_review', sessionId, requestId, {
-      type: 'plan_review',
-      session_name: this.getSessionName(sessionId),
-      body: truncateUtf8(planContent || 'A plan is ready for your review', 256),
-      sound: 'default',
-      category: 'PLAN_REVIEW',
-      session_id: sessionId,
-      request_id: requestId,
-    });
-    this.trackBlockingRequest(requestId, sessionId, flat as unknown as PcEvent, 'plan_review');
+    sendPlanForReviewExternal(
+      {
+        getSessionName: (id) => this.getSessionName(id),
+        sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        trackBlockingRequest: (rId, sId, e, et) => this.trackBlockingRequest(rId, sId, e, et),
+      },
+      sessionId,
+      requestId,
+      toolInput,
+      cwd,
+    );
   }
 
   /**
