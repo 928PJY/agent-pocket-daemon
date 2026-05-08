@@ -101,6 +101,35 @@ export function sendInterrupt(target: TerminalTarget): void {
   }
 }
 
+/**
+ * Send two Ctrl-C presses ~150ms apart to a terminal session running Claude
+ * Code's REPL. The first cancels the current input/turn; the second confirms
+ * exit and prints `claude --resume <id>` so the user can pick up where they
+ * left off. Sending only one Ctrl-C does not exit.
+ */
+export function sendQuit(target: TerminalTarget): void {
+  switch (target.type) {
+    case 'iterm2':
+      iTerm2SendCtrlC(target.target);
+      // Tiny delay so Claude's REPL processes the first Ctrl-C as "cancel"
+      // before the second one is read as "confirm exit".
+      sleepBlocking(150);
+      iTerm2SendCtrlC(target.target);
+      break;
+    case 'tmux':
+      tmuxSendCtrlC(target.socket!, target.target);
+      sleepBlocking(150);
+      tmuxSendCtrlC(target.socket!, target.target);
+      break;
+  }
+}
+
+function sleepBlocking(ms: number): void {
+  // execFileSync blocks the event loop, which is what we want here — the next
+  // injection must observe the REPL's reaction to the first Ctrl-C.
+  try { deps.execFileSync('sleep', [String(ms / 1000)], { timeout: ms + 500 }); } catch { /* best-effort */ }
+}
+
 // ============================================================================
 // iTerm2 (AppleScript)
 // ============================================================================
@@ -208,6 +237,37 @@ end tell`;
   }
 }
 
+/**
+ * Send an ETX (Ctrl-C, ASCII 3) character to an iTerm2 session.
+ */
+function iTerm2SendCtrlC(ttyPath: string): void {
+  const script = `
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s contains "${ttyPath}" then
+          write s text (ASCII character 3) newline no
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "not found"
+end tell`;
+
+  try {
+    const result = deps.execFileSync('osascript', ['-e', script], { timeout: 5000 });
+    const output = result.toString().trim();
+    if (output === 'not found') {
+      throw new Error(`iTerm2 session with TTY ${ttyPath} not found`);
+    }
+  } catch (err) {
+    if ((err as Error).message.includes('not found')) throw err;
+    throw new Error(`iTerm2 AppleScript failed: ${(err as Error).message}`);
+  }
+}
+
 // ============================================================================
 // tmux
 // ============================================================================
@@ -280,6 +340,15 @@ function tmuxSendEscape(socket: string, target: string): void {
   ]);
   if (result.status !== 0) {
     throw new Error(`tmux send Escape failed: ${result.stderr?.toString() ?? 'unknown error'}`);
+  }
+}
+
+function tmuxSendCtrlC(socket: string, target: string): void {
+  const result = deps.spawnSync('tmux', [
+    '-S', socket, 'send-keys', '-t', target, 'C-c',
+  ]);
+  if (result.status !== 0) {
+    throw new Error(`tmux send C-c failed: ${result.stderr?.toString() ?? 'unknown error'}`);
   }
 }
 

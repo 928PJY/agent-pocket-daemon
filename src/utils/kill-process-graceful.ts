@@ -29,7 +29,7 @@ function isAlive(pid: number): boolean {
   }
 }
 
-async function waitForExit(pid: number, timeoutMs: number, pollIntervalMs: number): Promise<boolean> {
+export async function waitForPidExit(pid: number, timeoutMs: number, pollIntervalMs = 100): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!isAlive(pid)) return true;
@@ -57,7 +57,7 @@ export async function killProcessGraceful(
   } catch {
     return isAlive(pid) ? 'failed' : 'already_dead';
   }
-  if (await waitForExit(pid, sigintGraceMs, pollIntervalMs)) return 'sigint';
+  if (await waitForPidExit(pid, sigintGraceMs, pollIntervalMs)) return 'sigint';
 
   logger.warn('kill', `PID ${pid} ignored SIGINT, escalating to SIGTERM`);
   try {
@@ -65,7 +65,7 @@ export async function killProcessGraceful(
   } catch {
     return isAlive(pid) ? 'failed' : 'already_dead';
   }
-  if (await waitForExit(pid, sigtermGraceMs, pollIntervalMs)) return 'sigterm';
+  if (await waitForPidExit(pid, sigtermGraceMs, pollIntervalMs)) return 'sigterm';
 
   logger.warn('kill', `PID ${pid} ignored SIGTERM, escalating to SIGKILL`);
   try {
@@ -73,7 +73,7 @@ export async function killProcessGraceful(
   } catch {
     return isAlive(pid) ? 'failed' : 'already_dead';
   }
-  if (await waitForExit(pid, sigtermGraceMs, pollIntervalMs)) return 'sigkill';
+  if (await waitForPidExit(pid, sigtermGraceMs, pollIntervalMs)) return 'sigkill';
 
   return 'failed';
 }

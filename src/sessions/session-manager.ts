@@ -39,9 +39,9 @@ import type {
 } from 'agent-pocket-protocol';
 import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
-import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt } from '../pty/tmux-injector.js';
+import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt, sendQuit as terminalSendQuit } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
-import { killProcessGraceful } from '../utils/kill-process-graceful.js';
+import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
 
 // ============================================================================
@@ -709,10 +709,11 @@ export class SessionManager extends EventEmitter {
   /**
    * Kill a specific session.
    *
-   * Observer mode: send SIGINT to the terminal Claude process so it unwinds
-   * cleanly (closes MCP, writes SessionEnd hook), escalating to SIGTERM/SIGKILL
-   * if it ignores SIGINT. Without this the terminal Claude keeps running and
-   * the user's "Stop" tap is a lie (issue #48).
+   * Observer mode: prefer injecting Ctrl-C×2 into the user's terminal so the
+   * Claude REPL exits the way it does for an interactive Ctrl-C — printing
+   * `claude --resume <id>` so the user can resume in-place. Falls back to
+   * SIGINT (escalating to SIGTERM/SIGKILL) if no terminal target is attached
+   * or if the REPL doesn't exit within a few seconds.
    *
    * Controller mode: abort the SDK Query.
    *
@@ -729,6 +730,7 @@ export class SessionManager extends EventEmitter {
 
     const wasObserved = session.isObserved;
     const terminalPid = session.terminalPid;
+    const terminalTarget = session.terminalTarget;
     const abortController = session.abortController;
 
     this.cleanupSession(session);
@@ -736,17 +738,50 @@ export class SessionManager extends EventEmitter {
     this.emit('session_ended', sessionId, 0);
 
     if (wasObserved) {
-      if (terminalPid) {
-        const outcome = await killProcessGraceful(terminalPid);
-        logger.info('session-manager', 'Killed terminal process for observed session', {
-          sessionId, pid: terminalPid, outcome,
-        });
-      } else {
-        logger.warn('session-manager', 'Observed session has no terminalPid to kill', { sessionId });
-      }
+      await this.killObservedTerminal(sessionId, terminalPid, terminalTarget);
     } else {
       abortController.abort();
     }
+  }
+
+  /**
+   * Try Ctrl-C×2 injection first (so the user sees the resume hint), fall back
+   * to SIGINT/SIGTERM/SIGKILL if injection isn't available or doesn't take.
+   */
+  private async killObservedTerminal(
+    sessionId: string,
+    terminalPid: number | undefined,
+    terminalTarget: TerminalTarget | undefined,
+  ): Promise<void> {
+    if (terminalTarget && terminalPid) {
+      try {
+        terminalSendQuit(terminalTarget);
+        const exited = await waitForPidExit(terminalPid, 2500, 100);
+        if (exited) {
+          logger.info('session-manager', 'Terminal Claude exited after Ctrl-C injection', {
+            sessionId, pid: terminalPid,
+          });
+          return;
+        }
+        logger.warn('session-manager', 'Terminal Claude ignored Ctrl-C, falling back to SIGINT', {
+          sessionId, pid: terminalPid,
+        });
+      } catch (err) {
+        logger.warn('session-manager', `Ctrl-C injection failed, falling back to SIGINT: ${(err as Error).message}`, {
+          sessionId, pid: terminalPid,
+        });
+      }
+    }
+
+    if (!terminalPid) {
+      logger.warn('session-manager', 'Observed session has no terminalPid to kill', { sessionId });
+      return;
+    }
+
+    const outcome = await killProcessGraceful(terminalPid);
+    logger.info('session-manager', 'Killed terminal process for observed session', {
+      sessionId, pid: terminalPid, outcome,
+    });
   }
 
   /**
