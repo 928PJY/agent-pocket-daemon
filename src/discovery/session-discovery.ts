@@ -5,13 +5,17 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { execFileSync } from 'node:child_process';
-import { findTerminalForPid } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
 import { parseHistoryEntry } from './jsonl-parser.js';
 import { getSubagentHistory } from './subagent-history.js';
+import {
+  getRunningCliSessions as scanRunningCliSessions,
+  getRunningAllSessions as scanRunningAllSessions,
+  getRunningSessionEntrypoints as scanRunningSessionEntrypoints,
+} from './pid-scanner.js';
+export { isProcessSuspendedOrZombie } from './pid-scanner.js';
 
 // Cap individual tool_output strings when shipping history to the phone.
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
@@ -101,25 +105,8 @@ export interface SessionPidInfo {
 // ============================================================================
 // Process State Helpers
 // ============================================================================
-
-/**
- * Check if a process is suspended (T) or zombie (Z).
- * Uses `ps -p <pid> -o state=` via execFileSync to avoid shell injection.
- */
-export function isProcessSuspendedOrZombie(pid: number): boolean {
-  try {
-    const output = execFileSync('ps', ['-p', String(pid), '-o', 'state='], {
-      encoding: 'utf-8',
-      timeout: 2000,
-    }).trim();
-    // macOS ps state column: first char is the state code
-    const state = output.charAt(0).toUpperCase();
-    return state === 'T' || state === 'Z';
-  } catch {
-    // ps failed — process may have exited between check and ps call
-    return false;
-  }
-}
+// (isProcessSuspendedOrZombie now lives in ./pid-scanner.ts and is re-exported
+// from the top of this module to keep the public import path stable.)
 
 // ============================================================================
 // SessionDiscovery
@@ -476,49 +463,7 @@ export class SessionDiscovery {
    * Only returns sessions with entrypoint === "cli" that have a live process.
    */
   getRunningCliSessions(): RunningCliSession[] {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return [];
-
-    const results: RunningCliSession[] = [];
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const filePath = path.join(sessionsDir, entry);
-        try {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          if (data.entrypoint !== 'cli') continue;
-
-          const pid = data.pid as number;
-          if (!pid) continue;
-
-          // Check if the process is still alive
-          try {
-            process.kill(pid, 0);
-          } catch {
-            // Process not running — skip
-            continue;
-          }
-
-          // Skip suspended (Ctrl+Z) or zombie processes
-          if (isProcessSuspendedOrZombie(pid)) continue;
-
-          results.push({
-            pid,
-            sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
-            terminalTarget: findTerminalForPid(pid) ?? undefined,
-            entrypoint: 'cli',
-            name: typeof data.name === 'string' ? (data.name as string) : undefined,
-          });
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error reading sessions dir
-    }
-    return results;
+    return scanRunningCliSessions(this.claudeDir);
   }
 
   /**
@@ -526,46 +471,7 @@ export class SessionDiscovery {
    * Same as getRunningCliSessions() but without the entrypoint filter.
    */
   getRunningAllSessions(): RunningCliSession[] {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return [];
-
-    const results: RunningCliSession[] = [];
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        const filePath = path.join(sessionsDir, entry);
-        try {
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          const pid = data.pid as number;
-          if (!pid) continue;
-
-          try {
-            process.kill(pid, 0);
-          } catch {
-            continue;
-          }
-
-          // Skip suspended (Ctrl+Z) or zombie processes
-          if (isProcessSuspendedOrZombie(pid)) continue;
-
-          const entrypoint = (data.entrypoint as string) ?? 'unknown';
-          results.push({
-            pid,
-            sessionId: (data.sessionId as string) ?? '',
-            cwd: (data.cwd as string) ?? '',
-            terminalTarget: entrypoint === 'cli' ? (findTerminalForPid(pid) ?? undefined) : undefined,
-            entrypoint,
-            name: typeof data.name === 'string' ? (data.name as string) : undefined,
-          });
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error reading sessions dir
-    }
-    return results;
+    return scanRunningAllSessions(this.claudeDir);
   }
 
   /**
@@ -573,31 +479,7 @@ export class SessionDiscovery {
    * by reading PID files. Returns a map of sessionId -> entrypoint.
    */
   getRunningSessionEntrypoints(): Map<string, string> {
-    const sessionsDir = path.join(this.claudeDir, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return new Map();
-
-    const result = new Map<string, string>();
-    try {
-      const entries = fs.readdirSync(sessionsDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.json')) continue;
-        try {
-          const filePath = path.join(sessionsDir, entry);
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-          const pid = data.pid as number;
-          if (!pid) continue;
-          try { process.kill(pid, 0); } catch { continue; }
-          const sessionId = data.sessionId as string;
-          const entrypoint = (data.entrypoint as string) ?? 'unknown';
-          if (sessionId) result.set(sessionId, entrypoint);
-        } catch {
-          // Skip unparseable files
-        }
-      }
-    } catch {
-      // Permission error
-    }
-    return result;
+    return scanRunningSessionEntrypoints(this.claudeDir);
   }
 
   /**
