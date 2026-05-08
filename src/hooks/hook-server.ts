@@ -10,17 +10,16 @@ import * as os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { formatTimestamp, logger } from '../logger.js';
 import { HOOK_HOLD_TIMEOUT_MS } from 'agent-pocket-protocol';
+import { PreToolUseCorrelator } from './pre-tool-use-correlator.js';
+import { parseCodexHookRequest, type CodexHookRequest } from './codex-hook-parser.js';
+
+export type { CodexHookRequest } from './codex-hook-parser.js';
 
 const DEBUG_LOG = path.join(os.homedir(), '.agent-pocket', 'hook-debug.log');
-const MAX_PRE_TOOL_USE_QUEUE_SIZE = 32;
 
 function debugLog(msg: string): void {
   const line = `[${formatTimestamp()}] ${msg}\n`;
   try { fs.appendFileSync(DEBUG_LOG, line); } catch { /* ignore */ }
-}
-
-function sameToolInput(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 // ============================================================================
@@ -55,12 +54,6 @@ interface PendingPermission {
   permissionSuggestions?: unknown[];
 }
 
-interface QueuedPreToolUse {
-  toolUseId: string;
-  toolInput: Record<string, unknown>;
-  createdAt: number;
-}
-
 export interface HookPermissionPrompt {
   sessionId: string;
   toolUseId: string;
@@ -74,22 +67,6 @@ export interface HookPermissionExpired {
   sessionId: string;
   toolUseId: string;
   toolName: string;
-}
-
-export interface CodexHookRequest {
-  sessionId: string;
-  threadId?: string;
-  turnId?: string;
-  cwd: string;
-  transcriptPath: string;
-  hookEventName: string;
-  source?: string;
-  prompt?: string;
-  toolUseId?: string;
-  toolName?: string;
-  toolInput?: Record<string, unknown>;
-  hookPid?: number;
-  codexPid?: number;
 }
 
 export interface HookServerEvents {
@@ -120,7 +97,7 @@ export class HookServer extends EventEmitter {
   // Map PreToolUse tool_use_id → PermissionRequest hook_id for correlation
   private toolUseToHookId: Map<string, string> = new Map();
   // FIFO PreToolUse tool_use_id queue per session+toolName (for PermissionRequest correlation)
-  private preToolUseQueues: Map<string, QueuedPreToolUse[]> = new Map();
+  private preToolUseCorrelator = new PreToolUseCorrelator({ ttlMs: HOOK_HOLD_TIMEOUT_MS });
   private hookCounter: number = 0;
   private readonly DEFAULT_TIMEOUT_MS = HOOK_HOLD_TIMEOUT_MS;
 
@@ -433,7 +410,7 @@ export class HookServer extends EventEmitter {
     // Store correlation: PreToolUse tool_use_id for later PermissionRequest matching
     if (json.tool_use_id) {
       const key = `${sessionId}:${toolName}`;
-      this.enqueuePreToolUseId(key, toolUseId, (json.tool_input as Record<string, unknown>) ?? {});
+      this.preToolUseCorrelator.enqueue(key, toolUseId, (json.tool_input as Record<string, unknown>) ?? {});
     }
 
     const request: HookPermissionRequest = {
@@ -558,8 +535,8 @@ export class HookServer extends EventEmitter {
     // Correlate with the PreToolUse tool_use_id that fired just before this
     const preToolKey = `${sessionId}:${toolName}`;
     const preToolUseId = typeof json.tool_use_id === 'string'
-      ? this.removePreToolUseId(preToolKey, json.tool_use_id) ?? json.tool_use_id
-      : this.shiftPreToolUseId(preToolKey, (json.tool_input as Record<string, unknown>) ?? {});
+      ? this.preToolUseCorrelator.remove(preToolKey, json.tool_use_id) ?? json.tool_use_id
+      : this.preToolUseCorrelator.shift(preToolKey, (json.tool_input as Record<string, unknown>) ?? {});
     // Prefer the Claude tool_use_id as the wire request_id so live events and
     // JSONL history replay carry the same identity — otherwise iOS sees the
     // same logical card under two different ids and renders it twice.
@@ -670,63 +647,6 @@ export class HookServer extends EventEmitter {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{}');
-  }
-
-  private shiftPreToolUseId(key: string, toolInput: Record<string, unknown>): string | undefined {
-    const queue = this.prunePreToolUseQueue(key);
-    if (!queue || queue.length === 0) return undefined;
-
-    let entry: QueuedPreToolUse | undefined;
-    const matchingIndex = queue.findIndex((candidate) => sameToolInput(candidate.toolInput, toolInput));
-    if (matchingIndex >= 0) {
-      [entry] = queue.splice(matchingIndex, 1);
-    } else {
-      entry = queue.shift();
-    }
-    if (queue.length === 0) {
-      this.preToolUseQueues.delete(key);
-    }
-    return entry?.toolUseId;
-  }
-
-  private enqueuePreToolUseId(key: string, toolUseId: string, toolInput: Record<string, unknown>): void {
-    const queue = this.prunePreToolUseQueue(key) ?? [];
-    queue.push({ toolUseId, toolInput, createdAt: Date.now() });
-    while (queue.length > MAX_PRE_TOOL_USE_QUEUE_SIZE) {
-      queue.shift();
-    }
-    this.preToolUseQueues.set(key, queue);
-  }
-
-  private removePreToolUseId(key: string, toolUseId: string): string | undefined {
-    const queue = this.prunePreToolUseQueue(key);
-    if (!queue) return undefined;
-
-    const index = queue.findIndex((entry) => entry.toolUseId === toolUseId);
-    if (index === -1) return undefined;
-
-    const [entry] = queue.splice(index, 1);
-    if (queue.length === 0) {
-      this.preToolUseQueues.delete(key);
-    }
-    return entry.toolUseId;
-  }
-
-  private prunePreToolUseQueue(key: string): QueuedPreToolUse[] | undefined {
-    const queue = this.preToolUseQueues.get(key);
-    if (!queue) return undefined;
-
-    const cutoff = Date.now() - this.DEFAULT_TIMEOUT_MS;
-    const fresh = queue.filter((entry) => entry.createdAt >= cutoff);
-    if (fresh.length === 0) {
-      this.preToolUseQueues.delete(key);
-      return undefined;
-    }
-
-    if (fresh.length !== queue.length) {
-      this.preToolUseQueues.set(key, fresh);
-    }
-    return fresh;
   }
 
   private handleStopHook(
@@ -889,44 +809,4 @@ export class HookServer extends EventEmitter {
 
     this.emit('codex_permission_request', { ...request, toolUseId, toolName });
   }
-}
-
-function parseCodexHookRequest(json: Record<string, unknown>): CodexHookRequest {
-  const sessionId = pickString(json, ['session_id', 'thread_id', 'conversation_id']) ?? '';
-  const hookEventName = pickString(json, ['hook_event_name', 'hookEventName']) ?? 'CodexHook';
-  const toolInput = json.tool_input && typeof json.tool_input === 'object' && !Array.isArray(json.tool_input)
-    ? json.tool_input as Record<string, unknown>
-    : undefined;
-  return {
-    sessionId,
-    threadId: pickString(json, ['thread_id', 'session_id']),
-    turnId: pickString(json, ['turn_id']),
-    cwd: pickString(json, ['cwd']) ?? '',
-    transcriptPath: pickString(json, ['transcript_path', 'rollout_path']) ?? '',
-    hookEventName,
-    source: pickString(json, ['source']),
-    prompt: pickString(json, ['prompt']),
-    toolUseId: pickString(json, ['tool_use_id', 'call_id']),
-    toolName: pickString(json, ['tool_name', 'name']),
-    toolInput,
-    hookPid: pickNumber(json, ['agent_pocket_hook_pid', 'hook_pid']),
-    codexPid: pickNumber(json, ['agent_pocket_codex_pid', 'codex_pid']),
-  };
-}
-
-function pickString(json: Record<string, unknown>, keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = json[key];
-    if (typeof value === 'string' && value.length > 0) return value;
-  }
-  return undefined;
-}
-
-function pickNumber(json: Record<string, unknown>, keys: string[]): number | undefined {
-  for (const key of keys) {
-    const value = json[key];
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
-  }
-  return undefined;
 }
