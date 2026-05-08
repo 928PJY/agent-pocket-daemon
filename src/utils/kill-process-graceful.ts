@@ -14,6 +14,12 @@ export interface GracefulKillOptions {
   sigintGraceMs?: number;
   /** ms to wait after SIGTERM before escalating to SIGKILL. Default 1000. */
   sigtermGraceMs?: number;
+  /**
+   * ms to wait after SIGKILL for the process to disappear from the table.
+   * SIGKILL itself can't be ignored, but the kernel may take a tick to reap
+   * the entry; this is just a final liveness window. Default 1000.
+   */
+  sigkillGraceMs?: number;
   /** ms between liveness polls. Default 100. */
   pollIntervalMs?: number;
 }
@@ -48,6 +54,7 @@ export async function killProcessGraceful(
 ): Promise<KillOutcome> {
   const sigintGraceMs = opts.sigintGraceMs ?? 1000;
   const sigtermGraceMs = opts.sigtermGraceMs ?? 1000;
+  const sigkillGraceMs = opts.sigkillGraceMs ?? 1000;
   const pollIntervalMs = opts.pollIntervalMs ?? 100;
 
   if (!isAlive(pid)) return 'already_dead';
@@ -73,7 +80,7 @@ export async function killProcessGraceful(
   } catch {
     return isAlive(pid) ? 'failed' : 'already_dead';
   }
-  if (await waitForPidExit(pid, sigtermGraceMs, pollIntervalMs)) return 'sigkill';
+  if (await waitForPidExit(pid, sigkillGraceMs, pollIntervalMs)) return 'sigkill';
 
   return 'failed';
 }

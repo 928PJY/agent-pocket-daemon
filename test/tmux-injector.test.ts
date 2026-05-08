@@ -5,6 +5,7 @@ import {
   findTerminalForPid,
   sendInterrupt,
   sendMessage,
+  sendQuit,
   type TerminalTarget,
 } from '../src/pty/tmux-injector.js';
 
@@ -253,4 +254,82 @@ test('iTerm2 sendMessage and sendInterrupt report not-found and AppleScript fail
       restore();
     }
   }
+});
+
+test('sendQuit dispatches tmux send-keys C-c twice with a sleep in between', () => {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const restore = __setTmuxInjectorDepsForTest({
+    spawnSync(command, args) {
+      calls.push({ command, args: args as string[] });
+      return ok() as ReturnType<typeof import('node:child_process').spawnSync>;
+    },
+    execFileSync(command, args) {
+      calls.push({ command, args: args as string[] });
+      return Buffer.from('') as ReturnType<typeof import('node:child_process').execFileSync>;
+    },
+  });
+
+  try {
+    sendQuit({ type: 'tmux', socket: '/tmp/tmux/socket', target: 'main:0.1' });
+  } finally {
+    restore();
+  }
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0], {
+    command: 'tmux',
+    args: ['-S', '/tmp/tmux/socket', 'send-keys', '-t', 'main:0.1', 'C-c'],
+  });
+  assert.equal(calls[1].command, 'sleep');
+  assert.deepEqual(calls[2], {
+    command: 'tmux',
+    args: ['-S', '/tmp/tmux/socket', 'send-keys', '-t', 'main:0.1', 'C-c'],
+  });
+});
+
+test('sendQuit dispatches iTerm2 ASCII Ctrl-C twice with a sleep in between', () => {
+  const calls: Array<{ command: string; arg: string }> = [];
+  const restore = __setTmuxInjectorDepsForTest({
+    execFileSync(command, args) {
+      const argList = args as string[];
+      calls.push({ command, arg: argList[command === 'osascript' ? 1 : 0] });
+      return Buffer.from(command === 'osascript' ? 'ok\n' : '') as ReturnType<typeof import('node:child_process').execFileSync>;
+    },
+  });
+
+  try {
+    sendQuit({ type: 'iterm2', target: '/dev/ttys037' });
+  } finally {
+    restore();
+  }
+
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].command, 'osascript');
+  assert.match(calls[0].arg, /ttys037/);
+  assert.match(calls[0].arg, /ASCII character 3/);
+  assert.equal(calls[1].command, 'sleep');
+  assert.equal(calls[2].command, 'osascript');
+  assert.match(calls[2].arg, /ASCII character 3/);
+});
+
+test('sendQuit swallows sleep failures (best-effort) and still sends both Ctrl-C', () => {
+  const tmuxCalls: number[] = [];
+  const restore = __setTmuxInjectorDepsForTest({
+    spawnSync() {
+      tmuxCalls.push(Date.now());
+      return ok() as ReturnType<typeof import('node:child_process').spawnSync>;
+    },
+    execFileSync(command) {
+      if (command === 'sleep') throw new Error('sleep blew up');
+      return Buffer.from('') as ReturnType<typeof import('node:child_process').execFileSync>;
+    },
+  });
+
+  try {
+    sendQuit({ type: 'tmux', socket: '/tmp/tmux/socket', target: 'main:0.1' });
+  } finally {
+    restore();
+  }
+
+  assert.equal(tmuxCalls.length, 2);
 });

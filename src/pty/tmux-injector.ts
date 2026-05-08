@@ -33,13 +33,21 @@ export function __setTmuxInjectorDepsForTest(overrides: Partial<TmuxInjectorDeps
 // Types
 // ============================================================================
 
-export interface TerminalTarget {
-  type: 'iterm2' | 'tmux';
-  /** iTerm2: the TTY path (e.g., "/dev/ttys037"). tmux: the pane target (e.g., "main:0.1"). */
+export interface ITerm2Target {
+  type: 'iterm2';
+  /** TTY path (e.g., "/dev/ttys037"). */
   target: string;
-  /** tmux only: the socket path */
-  socket?: string;
 }
+
+export interface TmuxTarget {
+  type: 'tmux';
+  /** Pane target (e.g., "main:0.1"). */
+  target: string;
+  /** Path to the tmux socket this pane lives under. */
+  socket: string;
+}
+
+export type TerminalTarget = ITerm2Target | TmuxTarget;
 
 // ============================================================================
 // Public API
@@ -81,7 +89,7 @@ export function sendMessage(target: TerminalTarget, text: string): void {
       iTerm2ClearAndWriteText(target.target, text);
       break;
     case 'tmux':
-      tmuxClearAndSendKeys(target.socket!, target.target, text);
+      tmuxClearAndSendKeys(target.socket, target.target, text);
       break;
   }
 }
@@ -96,7 +104,7 @@ export function sendInterrupt(target: TerminalTarget): void {
       iTerm2SendEscape(target.target);
       break;
     case 'tmux':
-      tmuxSendEscape(target.socket!, target.target);
+      tmuxSendEscape(target.socket, target.target);
       break;
   }
 }
@@ -117,9 +125,9 @@ export function sendQuit(target: TerminalTarget): void {
       iTerm2SendCtrlC(target.target);
       break;
     case 'tmux':
-      tmuxSendCtrlC(target.socket!, target.target);
+      tmuxSendCtrlC(target.socket, target.target);
       sleepBlocking(150);
-      tmuxSendCtrlC(target.socket!, target.target);
+      tmuxSendCtrlC(target.socket, target.target);
       break;
   }
 }
@@ -127,6 +135,10 @@ export function sendQuit(target: TerminalTarget): void {
 function sleepBlocking(ms: number): void {
   // execFileSync blocks the event loop, which is what we want here — the next
   // injection must observe the REPL's reaction to the first Ctrl-C.
+  // Note: relies on BSD sleep accepting a fractional argument (e.g. "0.15").
+  // macOS-only daemon today, so this is fine; GNU coreutils sleep also
+  // accepts fractions, but minimal busybox builds do not — revisit if we
+  // ever ship for non-macOS hosts.
   try { deps.execFileSync('sleep', [String(ms / 1000)], { timeout: ms + 500 }); } catch { /* best-effort */ }
 }
 

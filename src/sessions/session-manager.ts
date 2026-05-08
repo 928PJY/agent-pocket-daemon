@@ -713,7 +713,11 @@ export class SessionManager extends EventEmitter {
    * Claude REPL exits the way it does for an interactive Ctrl-C — printing
    * `claude --resume <id>` so the user can resume in-place. Falls back to
    * SIGINT (escalating to SIGTERM/SIGKILL) if no terminal target is attached
-   * or if the REPL doesn't exit within a few seconds.
+   * or if the REPL doesn't exit within a few seconds. Note: on the fallback
+   * path, an external SIGINT alone usually does NOT exit the REPL (Claude
+   * treats it the same as one Ctrl-C — cancel the current turn, stay alive),
+   * so the helper will typically escalate to SIGTERM or SIGKILL before the
+   * process actually goes away.
    *
    * Controller mode: abort the SDK Query.
    *
