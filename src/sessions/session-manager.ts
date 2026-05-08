@@ -171,7 +171,12 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Get the count of active (non-ended) sessions.
+   * Get the count of active (non-ended) sessions, including observed ones.
+   *
+   * This is the broad "anything live in the map" count. For the
+   * `max_concurrent_sessions` cap, use `getControllerSessionCount()` —
+   * the cap exists to bound concurrent SDK `query()` instances and
+   * observed sessions don't own one.
    */
   getActiveSessionCount(): number {
     let count = 0;
@@ -184,11 +189,28 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Count of active controller-mode sessions (i.e. sessions that own an SDK
+   * `query()` and an AbortController). Used to enforce
+   * `max_concurrent_sessions`. Observed sessions are pure JSONL tailers and
+   * don't consume the resource being capped, so they're excluded.
+   */
+  getControllerSessionCount(): number {
+    let count = 0;
+    for (const session of this.sessions.values()) {
+      if (session.isObserved) continue;
+      if (session.status !== SessionStatus.HISTORY && session.status !== SessionStatus.ERROR) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
    * Create a new Claude Code session via the Agent SDK.
    */
   createSession(config: SessionConfig): string {
     const maxSessions = this.config.max_concurrent_sessions ?? 5;
-    if (this.getActiveSessionCount() >= maxSessions) {
+    if (this.getControllerSessionCount() >= maxSessions) {
       throw new Error(`Maximum concurrent sessions (${maxSessions}) reached`);
     }
 
@@ -252,7 +274,7 @@ export class SessionManager extends EventEmitter {
    */
   resumeSession(claudeSessionId: string, config: SessionConfig = {}): string {
     const maxSessions = this.config.max_concurrent_sessions ?? 5;
-    if (this.getActiveSessionCount() >= maxSessions) {
+    if (this.getControllerSessionCount() >= maxSessions) {
       throw new Error(`Maximum concurrent sessions (${maxSessions}) reached`);
     }
 
