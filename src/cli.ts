@@ -15,6 +15,13 @@ import { runLanPairing } from './lan/lan-pairing.js';
 import { rawX25519ToSpki, rawEd25519ToSpki, spkiEd25519ToRaw } from './crypto/key-format.js';
 import { RelayClient } from './relay/relay-client.js';
 import { logger } from './logger.js';
+import {
+  installClaudeHooks as installClaudeHooksImpl,
+  installCodexHooks as installCodexHooksImpl,
+  removeClaudeHooks as removeClaudeHooksImpl,
+  removeCodexHooks as removeCodexHooksImpl,
+  type HooksManagerPaths,
+} from './cli/hooks-manager.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -126,387 +133,33 @@ function isDaemonRunning(): { running: boolean; pid: number | null } {
 }
 
 // ============================================================================
-// Claude Hooks configuration
+// Hooks (delegators to src/cli/hooks-manager.ts)
 // ============================================================================
 
-const MANAGED_BY_TAG = 'agent-pocket';
-const SESSION_START_SCRIPT = path.join(HOOKS_DIR, 'session-start.sh');
-const CODEX_HOOK_SCRIPT = path.join(HOOKS_DIR, 'codex-hook.sh');
-
-interface ManagedHookEntry {
-  _managedBy: string;
-  hooks: Array<{ type: string; url?: string; command?: string; timeout: number }>;
-}
-
-function managedEntry(hookPort: number, endpoint: string, timeout: number): ManagedHookEntry {
-  return {
-    _managedBy: MANAGED_BY_TAG,
-    hooks: [{ type: 'http', url: `http://127.0.0.1:${hookPort}/hooks/${endpoint}`, timeout }],
-  };
-}
-
-function persistentCommandEntry(scriptPath: string, timeout: number): ManagedHookEntry {
-  return {
-    _managedBy: MANAGED_BY_TAG,
-    hooks: [{ type: 'command', command: scriptPath, timeout }],
-  };
-}
-
-function codexManagedGroup(command: string, timeout: number, statusMessage?: string): Record<string, unknown> {
-  return {
-    matcher: '*',
-    _managedBy: MANAGED_BY_TAG,
-    hooks: [{
-      type: 'command',
-      command,
-      timeout,
-      ...(statusMessage ? { statusMessage } : {}),
-      _managedBy: MANAGED_BY_TAG,
-    }],
-  };
-}
-
-function isCodexManagedGroup(entry: unknown): boolean {
-  if (typeof entry !== 'object' || entry === null) return false;
-  const e = entry as Record<string, unknown>;
-  if (e._managedBy === MANAGED_BY_TAG) return true;
-  const hooks = e.hooks as Array<Record<string, unknown>> | undefined;
-  if (!Array.isArray(hooks)) return false;
-  return hooks.some(h => h._managedBy === MANAGED_BY_TAG
-    || (typeof h.command === 'string' && h.command.includes(CODEX_HOOK_SCRIPT)));
-}
-
-function isHttpManagedEntry(entry: unknown): boolean {
-  if (typeof entry !== 'object' || entry === null) return false;
-  const e = entry as Record<string, unknown>;
-  if (e._managedBy === MANAGED_BY_TAG) {
-    const hooks = e.hooks as Array<Record<string, unknown>> | undefined;
-    if (hooks?.[0]?.type === 'command') return false; // persistent command hook — keep
-    return true;
-  }
-  const hooks = e.hooks as Array<Record<string, unknown>> | undefined;
-  if (!Array.isArray(hooks) || hooks.length === 0) return false;
-  const hook = hooks[0];
-  if (typeof hook?.url === 'string' && hook.url.includes('/hooks/')) return true;
-  return false;
-}
-
-function isManagedEntry(entry: unknown): boolean {
-  if (typeof entry !== 'object' || entry === null) return false;
-  const e = entry as Record<string, unknown>;
-  if (e._managedBy === MANAGED_BY_TAG) return true;
-  const hooks = e.hooks as Array<Record<string, unknown>> | undefined;
-  if (!Array.isArray(hooks) || hooks.length === 0) return false;
-  const hook = hooks[0];
-  if (typeof hook?.url === 'string' && hook.url.includes('/hooks/')) return true;
-  if (typeof hook?.command === 'string' && (hook.command.includes('/hooks/') || hook.command.includes('agent-pocket') || hook.command.includes('pocket-agent'))) return true;
-  return false;
-}
-
-/**
- * Install the persistent session-start.sh script.
- * This script runs even when the daemon is stopped, persisting session ID
- * changes (from /clear) to ~/.agent-pocket/session-map.json.
- */
-function installSessionStartScript(hookPort: number): void {
-  fs.mkdirSync(HOOKS_DIR, { recursive: true });
-
-  const script = `#!/bin/bash
-# Agent Pocket — SessionStart hook
-# Persists session ID changes to disk and forwards to daemon (best effort).
-# This script runs even when the daemon is stopped.
-
-INPUT=$(cat)
-
-# Resolve Claude Code PID by walking up the process tree until we find
-# a PID that has a session file in ~/.claude/sessions/<PID>.json
-CLAUDE_PID=0
-WALK_PID=$$
-while [ "$WALK_PID" -gt 1 ]; do
-  WALK_PID=$(ps -p $WALK_PID -o ppid= 2>/dev/null | tr -d ' ')
-  [ -z "$WALK_PID" ] && break
-  if [ -f "$HOME/.claude/sessions/\${WALK_PID}.json" ]; then
-    CLAUDE_PID=$WALK_PID
-    break
-  fi
-done
-
-MAP_FILE="$HOME/.agent-pocket/session-map.json"
-mkdir -p "$(dirname "$MAP_FILE")"
-
-# Use python3 to parse JSON safely and update the session map
-python3 -c "
-import sys, json, os, time
-
-input_json = json.loads(sys.argv[1])
-claude_pid = sys.argv[2]
-session_id = input_json.get('session_id', '')
-source = input_json.get('source', '')
-cwd = input_json.get('cwd', '')
-transcript_path = input_json.get('transcript_path', '')
-agent_id = input_json.get('agent_id', '')
-
-if not session_id or not source:
-    sys.exit(0)
-
-# Skip subagent SessionStart events: they share the parent Claude PID but
-# refer to a transient subagent session, which would clobber the parent's
-# real session-id mapping. Detect via agent_id or subagent transcript path.
-if agent_id or '/subagents/' in transcript_path:
-    sys.exit(0)
-
-# Without a real PID we can't later look this entry up by process; writing
-# pid=0 just leaves dead weight in the map. The hook walked the process
-# tree and found nothing — drop the event.
-if not claude_pid.isdigit() or int(claude_pid) == 0:
-    sys.exit(0)
-
-map_file = os.path.expanduser('~/.agent-pocket/session-map.json')
-try:
-    with open(map_file) as f:
-        m = json.load(f)
-except:
-    m = {}
-
-now = int(time.time())
-m[session_id] = {
-    'source': source,
-    'cwd': cwd,
-    'transcript_path': transcript_path,
-    'pid': int(claude_pid),
-    'timestamp': now,
-}
-
-# Prune entries older than 1 hour
-cutoff = now - 3600
-m = {k: v for k, v in m.items() if v.get('timestamp', 0) > cutoff}
-
-with open(map_file, 'w') as f:
-    json.dump(m, f)
-" "$INPUT" "$CLAUDE_PID" 2>/dev/null
-
-# Forward to daemon HTTP endpoint (best effort — daemon may not be running)
-curl -s -X POST -H 'Content-Type: application/json' \\
-  -d "$INPUT" \\
-  "http://127.0.0.1:${hookPort}/hooks/session-start" \\
-  --connect-timeout 1 --max-time 3 >/dev/null 2>&1 || true
-`;
-
-  fs.writeFileSync(SESSION_START_SCRIPT, script, { mode: 0o755 });
-}
+const HOOKS_PATHS: HooksManagerPaths = {
+  hooksDir: HOOKS_DIR,
+  claudeSettingsFile: CLAUDE_SETTINGS_FILE,
+  codexConfigFile: CODEX_CONFIG_FILE,
+  codexHooksFile: CODEX_HOOKS_FILE,
+  hookDebugLogFile: HOOK_DEBUG_LOG_FILE,
+};
 
 function installClaudeHooks(hookPort: number): void {
-  // Install the persistent session-start script first
-  installSessionStartScript(hookPort);
-
-  let settings: Record<string, unknown> = {};
-  try {
-    if (fs.existsSync(CLAUDE_SETTINGS_FILE)) {
-      settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_FILE, 'utf-8'));
-    }
-  } catch {
-    // Start fresh if unreadable
-  }
-
-  const hooks: Record<string, unknown> = (settings.hooks as Record<string, unknown>) ?? {};
-
-  const managed: Record<string, ManagedHookEntry> = {
-    PreToolUse: managedEntry(hookPort, 'permission-request', 600),
-    PermissionRequest: managedEntry(hookPort, 'permission-prompt', 600),
-    PostToolUse: managedEntry(hookPort, 'post-tool-use', 10),
-    Stop: managedEntry(hookPort, 'stop', 10),
-    SubagentStart: managedEntry(hookPort, 'subagent-start', 10),
-    SubagentStop: managedEntry(hookPort, 'subagent-stop', 10),
-    SessionStart: persistentCommandEntry(SESSION_START_SCRIPT, 5),
-    SessionEnd: managedEntry(hookPort, 'session-end', 5),
-  };
-
-  for (const [event, entry] of Object.entries(managed)) {
-    const existing = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-    const preserved = existing.filter(e => !isManagedEntry(e));
-    hooks[event] = [...preserved, entry];
-  }
-
-  settings.hooks = hooks;
-  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_FILE), { recursive: true });
-  fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
-  logger.info('cli', `Installed Claude hooks pointing to port ${hookPort}`);
-}
-
-function installCodexHookScript(hookPort: number): void {
-  fs.mkdirSync(HOOKS_DIR, { recursive: true });
-
-  const script = `#!/bin/bash
-# Agent Pocket — Codex hook bridge
-# Adds process-correlation metadata and forwards Codex hook JSON to the daemon.
-
-ENDPOINT="$1"
-INPUT=$(cat)
-DEBUG_LOG="${HOOK_DEBUG_LOG_FILE}"
-
-CODEX_PID=0
-WALK_PID=$$
-while [ "$WALK_PID" -gt 1 ]; do
-  WALK_PID=$(ps -p "$WALK_PID" -o ppid= 2>/dev/null | tr -d ' ')
-  [ -z "$WALK_PID" ] && break
-  COMM=$(ps -p "$WALK_PID" -o comm= 2>/dev/null | awk '{print $1}')
-  BASE=$(basename "$COMM" 2>/dev/null)
-  if [ "$BASE" = "codex" ]; then
-    CODEX_PID=$WALK_PID
-    break
-  fi
-done
-
-python3 -c '
-import json, os, sys
-payload = json.loads(sys.argv[1] or "{}")
-payload["agent_pocket_hook_pid"] = int(sys.argv[2])
-try:
-    codex_pid = int(sys.argv[3])
-except Exception:
-    codex_pid = 0
-if codex_pid:
-    payload["agent_pocket_codex_pid"] = codex_pid
-print(json.dumps(payload, separators=(",", ":")))
-' "$INPUT" "$$" "$CODEX_PID" | curl -s -X POST -H 'Content-Type: application/json' \
-  --data-binary @- \
-  "http://127.0.0.1:${hookPort}/hooks/codex/$ENDPOINT" \
-  --connect-timeout 1 --max-time 600
-STATUS=$?
-if [ "$STATUS" -ne 0 ]; then
-  mkdir -p "$(dirname "$DEBUG_LOG")"
-  printf '%s Codex hook bridge failed endpoint=%s status=%s port=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ENDPOINT" "$STATUS" "${hookPort}" >> "$DEBUG_LOG" 2>/dev/null || true
-fi
-exit 0
-`;
-
-  fs.writeFileSync(CODEX_HOOK_SCRIPT, script, { mode: 0o755 });
+  installClaudeHooksImpl(hookPort, HOOKS_PATHS);
 }
 
 function installCodexHooks(hookPort: number): void {
-  installCodexHookScript(hookPort);
-  enableCodexHooksFeature();
-
-  let config: Record<string, unknown> = {};
-  try {
-    if (fs.existsSync(CODEX_HOOKS_FILE)) {
-      config = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')) as Record<string, unknown>;
-    }
-  } catch {
-    config = {};
-  }
-
-  const hooks: Record<string, unknown[]> = (config.hooks && typeof config.hooks === 'object')
-    ? config.hooks as Record<string, unknown[]>
-    : {};
-  const managed: Record<string, Record<string, unknown>> = {
-    SessionStart: codexManagedGroup(`${CODEX_HOOK_SCRIPT} session-start`, 5),
-    UserPromptSubmit: codexManagedGroup(`${CODEX_HOOK_SCRIPT} user-prompt-submit`, 5),
-    PermissionRequest: codexManagedGroup(`${CODEX_HOOK_SCRIPT} permission-request`, 600, 'Waiting for Agent Pocket approval'),
-    Stop: codexManagedGroup(`${CODEX_HOOK_SCRIPT} stop`, 10),
-  };
-
-  for (const [event, entry] of Object.entries(managed)) {
-    const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
-    hooks[event] = [...existing.filter(e => !isCodexManagedGroup(e)), entry];
-  }
-
-  config.hooks = hooks;
-  fs.mkdirSync(path.dirname(CODEX_HOOKS_FILE), { recursive: true });
-  fs.writeFileSync(CODEX_HOOKS_FILE, JSON.stringify(config, null, 2), 'utf-8');
-  logger.info('cli', `Installed Codex hooks pointing to port ${hookPort}`);
-}
-
-function enableCodexHooksFeature(): void {
-  fs.mkdirSync(path.dirname(CODEX_CONFIG_FILE), { recursive: true });
-  let content = '';
-  try {
-    if (fs.existsSync(CODEX_CONFIG_FILE)) {
-      content = fs.readFileSync(CODEX_CONFIG_FILE, 'utf-8');
-    }
-  } catch {
-    content = '';
-  }
-
-  const features = findTomlSection(content, 'features');
-  if (features) {
-    const section = content.slice(features.bodyStart, features.bodyEnd);
-    if (/^codex_hooks\s*=\s*true\s*$/m.test(section)) return;
-    if (/^codex_hooks\s*=\s*false\s*$/m.test(section)) {
-      const updatedSection = section.replace(/^codex_hooks\s*=\s*false\s*$/m, 'codex_hooks = true');
-      fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, features.bodyStart)}${updatedSection}${content.slice(features.bodyEnd)}`, 'utf-8');
-      return;
-    }
-
-    const needsNewline = section.length > 0 && !section.endsWith('\n') ? '\n' : '';
-    fs.writeFileSync(CODEX_CONFIG_FILE, `${content.slice(0, features.bodyEnd)}${needsNewline}codex_hooks = true\n${content.slice(features.bodyEnd)}`, 'utf-8');
-    return;
-  }
-
-  const prefix = content.length > 0 && !content.endsWith('\n') ? '\n\n' : content.length > 0 ? '\n' : '';
-  fs.writeFileSync(CODEX_CONFIG_FILE, `${content}${prefix}[features]\ncodex_hooks = true\n`, 'utf-8');
-}
-
-function findTomlSection(content: string, sectionName: string): { bodyStart: number; bodyEnd: number } | null {
-  const headerRe = /^\[([^\]]+)\]\s*$/gm;
-  let match: RegExpExecArray | null;
-  while ((match = headerRe.exec(content)) !== null) {
-    if (match[1].trim() !== sectionName) continue;
-    const bodyStart = match.index + match[0].length + (content[match.index + match[0].length] === '\n' ? 1 : 0);
-    const nextHeaderRe = /^\[[^\]]+\]\s*$/gm;
-    nextHeaderRe.lastIndex = bodyStart;
-    const next = nextHeaderRe.exec(content);
-    return { bodyStart, bodyEnd: next?.index ?? content.length };
-  }
-  return null;
+  installCodexHooksImpl(hookPort, HOOKS_PATHS);
 }
 
 function removeClaudeHooks(): void {
-  try {
-    if (!fs.existsSync(CLAUDE_SETTINGS_FILE)) return;
-    const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_FILE, 'utf-8'));
-    const hooks = settings.hooks as Record<string, unknown> | undefined;
-    if (!hooks) return;
-
-    // Only remove HTTP hooks — keep persistent command hooks (SessionStart script)
-    for (const event of Object.keys(hooks)) {
-      const entries = hooks[event];
-      if (!Array.isArray(entries)) continue;
-      const kept = entries.filter(e => !isHttpManagedEntry(e));
-      if (kept.length === 0) delete hooks[event];
-      else hooks[event] = kept;
-    }
-
-    if (Object.keys(hooks).length === 0) delete settings.hooks;
-    fs.writeFileSync(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
-    logger.info('cli', 'Removed Claude hooks from settings');
-  } catch {
-    // Best effort
-  }
+  removeClaudeHooksImpl(HOOKS_PATHS);
 }
 
 function removeCodexHooks(): void {
-  try {
-    if (!fs.existsSync(CODEX_HOOKS_FILE)) return;
-    const config = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')) as Record<string, unknown>;
-    const hooks = config.hooks as Record<string, unknown[]> | undefined;
-    if (!hooks || typeof hooks !== 'object') return;
-
-    for (const event of Object.keys(hooks)) {
-      const entries = hooks[event];
-      if (!Array.isArray(entries)) continue;
-      const kept = entries.filter(e => !isCodexManagedGroup(e));
-      if (kept.length === 0) delete hooks[event];
-      else hooks[event] = kept;
-    }
-
-    if (Object.keys(hooks).length === 0) delete config.hooks;
-    fs.writeFileSync(CODEX_HOOKS_FILE, JSON.stringify(config, null, 2), 'utf-8');
-    logger.info('cli', 'Removed Codex hooks from settings');
-  } catch {
-    // Best effort
-  }
+  removeCodexHooksImpl(HOOKS_PATHS);
 }
+
 
 // ============================================================================
 // Argument Parsing
