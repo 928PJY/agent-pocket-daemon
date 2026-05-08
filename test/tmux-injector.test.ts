@@ -292,8 +292,15 @@ test('sendQuit dispatches iTerm2 ASCII Ctrl-C twice with a sleep in between', ()
   const restore = __setTmuxInjectorDepsForTest({
     execFileSync(command, args) {
       const argList = args as string[];
-      calls.push({ command, arg: argList[command === 'osascript' ? 1 : 0] });
-      return Buffer.from(command === 'osascript' ? 'ok\n' : '') as ReturnType<typeof import('node:child_process').execFileSync>;
+      // osascript args are ['-e', <script>]; sleep args are [<seconds>].
+      // Capture whichever is the meaningful payload for each command so the
+      // assertions below stay readable.
+      if (command === 'osascript') {
+        calls.push({ command, arg: argList[1] });
+        return Buffer.from('ok\n') as ReturnType<typeof import('node:child_process').execFileSync>;
+      }
+      calls.push({ command, arg: argList[0] });
+      return Buffer.from('') as ReturnType<typeof import('node:child_process').execFileSync>;
     },
   });
 
@@ -332,4 +339,8 @@ test('sendQuit swallows sleep failures (best-effort) and still sends both Ctrl-C
   }
 
   assert.equal(tmuxCalls.length, 2);
+  // If sleep had silently slept anyway (e.g. catch in wrong place), the two
+  // Ctrl-C timestamps would be ~150ms apart. Anything well under that proves
+  // the throw short-circuited the gap.
+  assert.ok(tmuxCalls[1] - tmuxCalls[0] < 50, `expected near-zero gap, got ${tmuxCalls[1] - tmuxCalls[0]}ms`);
 });

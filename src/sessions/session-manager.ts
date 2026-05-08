@@ -760,6 +760,10 @@ export class SessionManager extends EventEmitter {
     if (terminalTarget && terminalPid) {
       try {
         terminalSendQuit(terminalTarget);
+        // 2.5s is short enough that PID reuse on macOS is effectively
+        // impossible (default PID space is ~99k and reuse is sequential).
+        // If this window ever grows much larger, revisit — a reused PID
+        // would mean the SIGINT escalation below targets a stranger.
         const exited = await waitForPidExit(terminalPid, 2500, 100);
         if (exited) {
           logger.info('session-manager', 'Terminal Claude exited after Ctrl-C injection', {
@@ -767,11 +771,11 @@ export class SessionManager extends EventEmitter {
           });
           return;
         }
-        logger.warn('session-manager', 'Terminal Claude ignored Ctrl-C, falling back to SIGINT', {
+        logger.warn('session-manager', 'Terminal Claude ignored Ctrl-C, falling back to SIGINT/SIGTERM/SIGKILL escalation', {
           sessionId, pid: terminalPid,
         });
       } catch (err) {
-        logger.warn('session-manager', `Ctrl-C injection failed, falling back to SIGINT: ${(err as Error).message}`, {
+        logger.warn('session-manager', `Ctrl-C injection failed, falling back to SIGINT/SIGTERM/SIGKILL escalation: ${(err as Error).message}`, {
           sessionId, pid: terminalPid,
         });
       }

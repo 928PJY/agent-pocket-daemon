@@ -6,6 +6,7 @@
 import { spawnSync, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { logger } from '../logger.js';
 
 interface TmuxInjectorDeps {
   spawnSync: typeof spawnSync;
@@ -139,7 +140,14 @@ function sleepBlocking(ms: number): void {
   // macOS-only daemon today, so this is fine; GNU coreutils sleep also
   // accepts fractions, but minimal busybox builds do not — revisit if we
   // ever ship for non-macOS hosts.
-  try { deps.execFileSync('sleep', [String(ms / 1000)], { timeout: ms + 500 }); } catch { /* best-effort */ }
+  try {
+    deps.execFileSync('sleep', [String(ms / 1000)], { timeout: ms + 500 });
+  } catch (err) {
+    // Best-effort: if `sleep` is missing or times out we just skip the gap.
+    // Logged at debug because a missing /usr/bin/sleep is the only realistic
+    // root cause and would be noisy at warn.
+    logger.debug('tmux-injector', `sleepBlocking failed: ${(err as Error).message}`);
+  }
 }
 
 // ============================================================================
