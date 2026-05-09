@@ -10,6 +10,7 @@ import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
 import { parseHistoryEntry } from './jsonl-parser.js';
 import { getSubagentHistory } from './subagent-history.js';
+import { PREFETCH_CWD } from '../sessions/observer-commands.js';
 import {
   getRunningCliSessions as scanRunningCliSessions,
   getRunningAllSessions as scanRunningAllSessions,
@@ -629,6 +630,13 @@ export class SessionDiscovery {
 
       // The encoded project path uses URL-safe encoding or hyphens for slashes
       const projectDir = this.decodeProjectPath(relativePath);
+
+      // Drop daemon's own SDK-prefetch sessions — they're internal-only
+      // (used to fetch supportedCommands once at startup) and must not
+      // surface to the phone or fire a session_completed notification.
+      if (projectDir === PREFETCH_CWD) {
+        return null;
+      }
 
       // Read the first few lines to extract custom-title
       const customTitle = this.extractCustomTitle(filePath);

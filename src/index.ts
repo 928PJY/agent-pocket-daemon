@@ -9,6 +9,7 @@ import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
+import { getObserverCommands } from './sessions/observer-commands.js';
 import { RelayClient } from './relay/relay-client.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
@@ -446,6 +447,10 @@ export class AgentPocketDaemon extends EventEmitter {
     await this.discoverAndObserveSessions();
     this.discoverAndObserveCodexSessions();
     this.initialDiscoveryDone = true;
+
+    getObserverCommands().catch(err => {
+      logger.warn('daemon', `Observer commands prefetch failed: ${(err as Error).message}`);
+    });
 
     // Sweep stale session-map.json entries (e.g. CLIs that ended before this
     // daemon started, or PIDs reused by unrelated processes). One sweep at

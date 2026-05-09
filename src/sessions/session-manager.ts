@@ -43,6 +43,7 @@ import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterr
 import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
+import { getObserverCommands } from './observer-commands.js';
 
 // ============================================================================
 // Types
@@ -913,7 +914,7 @@ export class SessionManager extends EventEmitter {
   async getSupportedCommands(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['supportedCommands']>>> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
-    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query supported commands');
+    if (session.isObserved) return await getObserverCommands();
     if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
     return await session.queryHandle.supportedCommands();
   }
