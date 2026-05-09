@@ -159,6 +159,14 @@ export const OBSERVER_HIDDEN_COMMANDS: ReadonlySet<string> = new Set([
   'ide',
   'insights',
   'mobile', 'ios', 'android',         // /mobile aliases
+  'permissions', 'allowed-tools',     // /permissions alias /allowed-tools
+  'agents',
+  'plan',                             // toggles plan mode but no remote-friendly UX yet
+
+  // Hidden until phone-side picker exists. /effort with no arg opens a TUI
+  // dialog; with an arg it changes a hidden global setting the user can't
+  // observe from the phone. Tracked: agent-pocket-daemon#64.
+  'effort',
 ]);
 
 let cachedSdkCommands: SlashCommand[] | null = null;

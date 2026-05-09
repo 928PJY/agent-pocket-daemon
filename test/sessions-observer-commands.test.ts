@@ -88,6 +88,11 @@ test('OBSERVER_HIDDEN_COMMANDS: covers the documented categories', () => {
   // Diagnostic:
   assert.ok(OBSERVER_HIDDEN_COMMANDS.has('doctor'));
   assert.ok(OBSERVER_HIDDEN_COMMANDS.has('heapdump'));
+  // TUI-only / picker-required (verified empirically against Claude Code 2.1.x):
+  assert.ok(OBSERVER_HIDDEN_COMMANDS.has('permissions'));
+  assert.ok(OBSERVER_HIDDEN_COMMANDS.has('agents'));
+  assert.ok(OBSERVER_HIDDEN_COMMANDS.has('plan'));
+  assert.ok(OBSERVER_HIDDEN_COMMANDS.has('effort'));
 });
 
 test('BUILTIN_TERMINAL_COMMANDS: no internal duplicates', () => {
