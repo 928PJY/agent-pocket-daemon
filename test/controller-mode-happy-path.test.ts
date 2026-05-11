@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import type { Options as SDKQueryOptions, Query, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { SessionStatus } from 'agent-pocket-protocol';
 import type { ClaudeEvent } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import { SessionManager, type QueryFactory } from '../src/sessions/session-manager.js';
 
 interface FakeQueryHandle {
@@ -739,6 +740,121 @@ test('createSession still throws when controller cap itself is reached', async (
       () => manager.createSession({ name: 'c', agent_type: 'claude_code', working_directory: cwd }),
       /Maximum concurrent sessions \(2\) reached/,
     );
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// Controller-mode wraps slash-command output as a synthesized assistant `text`
+// block. With the STABLE_SDK_UUID cap announced, the manager must route
+// `<local-command-stdout>` / `<local-command-stderr>` / `<command-name>` text
+// through parseLocalCommandUserText and emit the structured LocalCommand* event
+// (using the same sdk_uuid the JSONL row carries) instead of an
+// AssistantMessageEvent. Without this, live emit and history replay disagree on
+// the row type even though they share the row uuid — which is the cold-start
+// duplicate the iOS richer-type merge papers over.
+test('controller text block: <local-command-stdout> emits LocalCommandOutputEvent under STABLE_SDK_UUID cap', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({
+    queryFactory: makeFactory(fake),
+    hasPeerCapability: (name) => name === PEER_CAPABILITIES.STABLE_SDK_UUID,
+  });
+
+  const outputs: ClaudeEvent[] = [];
+  manager.on('session_output', (_id, event) => outputs.push(event));
+
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-localcmd-stdout-'));
+  try {
+    const sessionId = manager.createSession({
+      name: 'localcmd', agent_type: 'claude_code', working_directory: cwd,
+    });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+
+    fake.emit({
+      type: 'assistant',
+      uuid: 'row-uuid-abc',
+      message: {
+        content: [
+          { type: 'text', text: '<local-command-stdout>Total cost: $0.42</local-command-stdout>' },
+        ],
+      },
+    } as unknown as SDKMessage);
+
+    await waitFor(() => outputs.length > 0);
+    assert.equal(outputs.length, 1);
+    const ev = outputs[0] as { type: string; stdout?: string; sdkUuid?: string; sdkBlockIndex?: number; is_stderr?: boolean };
+    assert.equal(ev.type, 'local_command_output');
+    assert.equal(ev.stdout, 'Total cost: $0.42');
+    assert.equal(ev.sdkUuid, 'row-uuid-abc');
+    assert.equal(ev.sdkBlockIndex, 0);
+    assert.equal(ev.is_stderr, undefined);
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('controller text block: <local-command-stderr> sets is_stderr=true', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({
+    queryFactory: makeFactory(fake),
+    hasPeerCapability: (name) => name === PEER_CAPABILITIES.STABLE_SDK_UUID,
+  });
+
+  const outputs: ClaudeEvent[] = [];
+  manager.on('session_output', (_id, event) => outputs.push(event));
+
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-localcmd-stderr-'));
+  try {
+    const sessionId = manager.createSession({
+      name: 'localcmd-err', agent_type: 'claude_code', working_directory: cwd,
+    });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+
+    fake.emit({
+      type: 'assistant',
+      uuid: 'row-uuid-err',
+      message: { content: [{ type: 'text', text: '<local-command-stderr>boom</local-command-stderr>' }] },
+    } as unknown as SDKMessage);
+
+    await waitFor(() => outputs.length > 0);
+    const ev = outputs[0] as { type: string; stdout?: string; is_stderr?: boolean; sdkUuid?: string };
+    assert.equal(ev.type, 'local_command_output');
+    assert.equal(ev.stdout, 'boom');
+    assert.equal(ev.is_stderr, true);
+    assert.equal(ev.sdkUuid, 'row-uuid-err');
+  } finally {
+    manager.shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// Without the cap (old iOS), the wrapper detection must NOT fire — old clients
+// can't reassemble a tag from a delta slice and rely on the existing
+// assistant_message path. This guards the capability gate.
+test('controller text block: without STABLE_SDK_UUID cap, tagged text still emits assistant_message (delta path)', async () => {
+  const fake = createFakeQuery();
+  const manager = new SessionManager({ queryFactory: makeFactory(fake) });
+
+  const outputs: ClaudeEvent[] = [];
+  manager.on('session_output', (_id, event) => outputs.push(event));
+
+  const cwd = mkdtempSync(join(tmpdir(), 'cm-localcmd-nocap-'));
+  try {
+    const sessionId = manager.createSession({
+      name: 'no-cap', agent_type: 'claude_code', working_directory: cwd,
+    });
+    await waitFor(() => manager.getSession(sessionId)?.queryHandle != null);
+
+    fake.emit({
+      type: 'assistant',
+      uuid: 'row-uuid-nocap',
+      message: { content: [{ type: 'text', text: '<local-command-stdout>x</local-command-stdout>' }] },
+    } as unknown as SDKMessage);
+
+    await waitFor(() => outputs.length > 0);
+    assert.equal(outputs[0].type, 'assistant_message');
   } finally {
     manager.shutdown();
     rmSync(cwd, { recursive: true, force: true });

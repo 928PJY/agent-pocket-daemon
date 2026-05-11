@@ -45,6 +45,7 @@ import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
 import { getObserverCommands } from './observer-commands.js';
+import { parseLocalCommandUserText } from '../utils/local-command-parse.js';
 
 // ============================================================================
 // Types
@@ -1315,6 +1316,24 @@ export class SessionManager extends EventEmitter {
               case 'text': {
                 const fullText = block.text ?? '';
                 if (fullText.length <= state.lastEmittedTextLength) break;
+
+                if (fullTextEmit) {
+                  const localCmd = parseLocalCommandUserText(fullText);
+                  if (localCmd === 'drop') {
+                    state.lastEmittedTextLength = fullText.length;
+                    break;
+                  }
+                  if (localCmd) {
+                    state.lastEmittedTextLength = fullText.length;
+                    state.status = SessionStatus.RUNNING;
+                    this.emit('session_output', sessionId, {
+                      ...localCmd,
+                      ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                    });
+                    break;
+                  }
+                }
+
                 const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedTextLength);
                 state.lastEmittedTextLength = fullText.length;
                 if (payload.length === 0) break;
