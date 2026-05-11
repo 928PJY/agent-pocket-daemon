@@ -15,17 +15,34 @@
 // describe a property of the parser, not of the discovery class.
 
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
+import { parseLocalCommandUserText } from '../utils/local-command-parse.js';
 
 // Subset of HistoryMessage used by parseHistoryEntry. Kept here to avoid an
 // import cycle with session-discovery.ts (which re-exports the full type).
 type ParsedMessage = {
-  role: 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'subagent' | 'system';
+  role:
+    | 'user'
+    | 'assistant'
+    | 'tool_use'
+    | 'tool_result'
+    | 'subagent'
+    | 'system'
+    | 'local_command_invoke'
+    | 'local_command_output'
+    | 'compact_boundary'
+    | 'compact_summary';
   content: string;
   sdkUuid?: string;
   toolName?: string;
   toolId?: string;
   toolInput?: Record<string, unknown>;
   timestamp?: string;
+  /** local_command_invoke: command name without leading slash. */
+  localCommandName?: string;
+  /** local_command_invoke: raw `<command-args>` body if present. */
+  localCommandArgs?: string;
+  /** local_command_output: true when sourced from `<local-command-stderr>`. */
+  localCommandIsStderr?: boolean;
 };
 
 const HISTORY_TOOL_INPUT_VALUE_CAP = 2000;
@@ -67,9 +84,71 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
             .join('')
         : '';
     if (!content) return [];
+
+    // Slash-command artifacts (`<command-name>` invoke, `<local-command-stdout>`
+    // output, caveats) — surface as structured rows so the phone can pair
+    // them into a card on history replay, matching the live observer pipeline.
+    const localCmd = parseLocalCommandUserText(content);
+    if (localCmd === 'drop') return [];
+    if (localCmd?.type === 'local_command_invoke') {
+      return [{
+        role: 'local_command_invoke',
+        content: '',
+        localCommandName: localCmd.name,
+        localCommandArgs: localCmd.args,
+        timestamp,
+      }];
+    }
+    if (localCmd?.type === 'local_command_output') {
+      return [{
+        role: 'local_command_output',
+        content: localCmd.stdout,
+        localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
+        timestamp,
+      }];
+    }
+
+    // /compact summary lives on a `type: 'user'` row with `isCompactSummary`.
+    if (entry.isCompactSummary === true) {
+      return [{ role: 'compact_summary', content, timestamp }];
+    }
+
     if (isInternalMessage(content)) return [];
     const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
     return [{ role: 'user', content, timestamp, sdkUuid }];
+  }
+
+  if (type === 'system') {
+    // /compact boundary marker between pre-compact transcript and the summary.
+    if (entry.subtype === 'compact_boundary') {
+      return [{ role: 'compact_boundary', content: '', timestamp }];
+    }
+    // Some Claude Code releases emit local-command stdout/stderr as `system`
+    // rows with `subtype: 'local_command'` and the wrapped tag in `content`.
+    // Parse via the same shared regex so card rendering on history matches
+    // live behavior.
+    if (entry.subtype === 'local_command' && typeof entry.content === 'string') {
+      const localCmd = parseLocalCommandUserText(entry.content);
+      if (localCmd === 'drop') return [];
+      if (localCmd?.type === 'local_command_output') {
+        return [{
+          role: 'local_command_output',
+          content: localCmd.stdout,
+          localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
+          timestamp,
+        }];
+      }
+      if (localCmd?.type === 'local_command_invoke') {
+        return [{
+          role: 'local_command_invoke',
+          content: '',
+          localCommandName: localCmd.name,
+          localCommandArgs: localCmd.args,
+          timestamp,
+        }];
+      }
+    }
+    return [];
   }
 
   if (type === 'assistant') {
@@ -150,5 +229,5 @@ export function detectInterruptReason(content: unknown): 'streaming' | 'tool_use
 export function isInternalMessage(text: string): boolean {
   const trimmed = text.trimStart();
   if (!trimmed.startsWith('<')) return false;
-  return /^<(teammate-message|system-reminder|task-notification|command-name|local-command-caveat|local-command|user-prompt-submit-hook)[\s>]/.test(trimmed);
+  return /^<(teammate-message|system-reminder|task-notification|command-name|command-message|command-args|local-command-caveat|local-command-stdout|local-command-stderr|local-command|user-prompt-submit-hook)[\s>]/.test(trimmed);
 }

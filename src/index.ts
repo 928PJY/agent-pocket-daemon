@@ -282,6 +282,10 @@ export class AgentPocketDaemon extends EventEmitter {
   private sessionIdMap: Map<string, string> = new Map();
   // Claude session IDs that were replaced by /clear (stale PID files still reference them)
   private replacedSessionIds: Set<string> = new Set();
+  // Claude session IDs spawned by the daemon's SDK prefetch (e.g. supportedCommands lookup).
+  // Tagged at session_start when cwd === PREFETCH_CWD, consumed at session_stop to suppress
+  // the noop session_completed notification on the phone.
+  private prefetchClaudeSessionIds: Set<string> = new Set();
   // Temporary storage for terminal info between SessionEnd and SessionStart during /clear
   private pendingClearInfo: Map<string, { pid: number; cwd: string; target: import('./pty/tmux-injector.js').TerminalTarget | undefined; entrypoint?: string }> = new Map();
   // Reverse map: request_id -> internal session_id (for new_session responses)
@@ -776,6 +780,7 @@ export class AgentPocketDaemon extends EventEmitter {
         sessionManager: this.sessionManager,
         resolveExternalSessionId: (id) => this.resolveExternalSessionId(id),
         pendingBlockingRequests: this.pendingBlockingRequests,
+        prefetchClaudeSessionIds: this.prefetchClaudeSessionIds,
         clearNotificationDelivery: (et, sId, rId) => this.clearNotificationDelivery(et, sId, rId),
         nextCompletionRequestId: (sId, ts) => this.nextCompletionRequestId(sId, ts),
         sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
@@ -803,6 +808,7 @@ export class AgentPocketDaemon extends EventEmitter {
         pendingClearInfo: this.pendingClearInfo,
         sessionIdMap: this.sessionIdMap,
         replacedSessionIds: this.replacedSessionIds,
+        prefetchClaudeSessionIds: this.prefetchClaudeSessionIds,
         sendToPhone: (event) => this.sendToPhone(event),
         isInitialDiscoveryDone: () => this.initialDiscoveryDone,
         sendSessionHistory: (id) => this.sendSessionHistory(id),
@@ -1416,7 +1422,11 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private sendFlattenedSessionOutput(sessionId: string, agentEvent: ClaudeEvent, agentType: AgentType): void {
     sendFlattenedSessionOutputExternal(
-      { codexInjectedMessages: this.codexInjectedMessages, sendToPhone: (e) => this.sendToPhone(e) },
+      {
+        codexInjectedMessages: this.codexInjectedMessages,
+        sendToPhone: (e) => this.sendToPhone(e),
+        hasPeerCapability: (name) => this.hasPeerCapability(name),
+      },
       sessionId,
       agentEvent,
       agentType,
@@ -1486,6 +1496,11 @@ export class AgentPocketDaemon extends EventEmitter {
 
   private handlePeerHello(hello: PeerHello): void {
     handlePeerHelloExternal(this.peers, hello);
+    logger.info('peer-debug', 'received peer_hello from phone', {
+      productVersion: hello.product_version,
+      wire: hello.wire_version,
+      capabilities: this.peers.list(),
+    });
   }
 
   /**
@@ -1639,6 +1654,7 @@ export class AgentPocketDaemon extends EventEmitter {
         codexDiscovery: this.codexDiscovery,
         phonePreferences: this.phonePreferences,
         sendToPhone: (e) => this.sendToPhone(e),
+        hasPeerCapability: (name) => this.hasPeerCapability(name),
       },
       claudeSessionId,
       options,

@@ -53,6 +53,7 @@ function makeSessionStopDeps(opts: {
   showCompletionMetrics?: boolean;
   summary?: TurnSummary | null;
   summaryThrows?: boolean;
+  prefetchClaudeSessionIds?: Set<string>;
 } = {}) {
   const harness: SessionStopHarness = {
     pending: new Map(opts.pending ?? []),
@@ -74,6 +75,7 @@ function makeSessionStopDeps(opts: {
         return externalIdMap[internalId] ?? internalId;
       },
       pendingBlockingRequests: harness.pending,
+      prefetchClaudeSessionIds: opts.prefetchClaudeSessionIds ?? new Set<string>(),
       clearNotificationDelivery(et: string, sId: string, rId: string) {
         harness.clearedDeliveries.push({ et, sId, rId });
       },
@@ -187,6 +189,27 @@ test('session_stop: showCompletionMetrics=false suppresses metrics chip', async 
   assert.equal(harness.scheduledTimers.length, 0);
 });
 
+test('session_stop: SDK-prefetch session is suppressed (no notification, no chip)', async () => {
+  const hooks = makeHooks();
+  const summary: TurnSummary = { text: 'noop', toolUseCount: 0, totalTokens: 1, durationSec: 1 };
+  const prefetchSet = new Set<string>(['claude-prefetch']);
+  const { harness, deps } = makeSessionStopDeps({
+    summary,
+    showCompletionMetrics: true,
+    prefetchClaudeSessionIds: prefetchSet,
+  });
+  registerSessionStopHandler(hooks, deps);
+  hooks.emit('session_stop', 'claude-prefetch', '/tmp/transcript.jsonl');
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+
+  assert.equal(harness.notifiedEvents.length, 0);
+  assert.equal(harness.sentEvents.length, 0);
+  assert.equal(harness.scheduledTimers.length, 0);
+  // Tag is consumed so a later real Stop with the same id wouldn't be suppressed.
+  assert.equal(prefetchSet.has('claude-prefetch'), false);
+});
+
 test('session_stop: defaults setTimeoutFn + readLastTurnSummaryFn when omitted', async () => {
   const hooks = makeHooks();
   const harness = { notified: [] as unknown[] };
@@ -197,6 +220,7 @@ test('session_stop: defaults setTimeoutFn + readLastTurnSummaryFn when omitted',
     },
     resolveExternalSessionId(id: string) { return id; },
     pendingBlockingRequests: new Map(),
+    prefetchClaudeSessionIds: new Set(),
     clearNotificationDelivery() {},
     nextCompletionRequestId(s: string, t: number) { return `${s}_${t}`; },
     sendNotificationEventToPhone(event: unknown) { harness.notified.push(event); },
@@ -419,6 +443,7 @@ test('session_start: ignores non-clear sources', () => {
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return true; },
     sendSessionHistory() { return 0; },
   });
@@ -442,6 +467,7 @@ test('session_start(clear): already-tracked session is skipped', () => {
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return true; },
     sendSessionHistory() { return 0; },
   });
@@ -470,6 +496,7 @@ test('session_start(clear): uses pendingClearInfo + transcriptPath, calls sendSe
     sessionIdMap,
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return true; },
     sendSessionHistory(id: string) { histCalls.push(id); return 5; },
   });
@@ -504,6 +531,7 @@ test('session_start(clear): jsonlPath fallback when transcriptPath empty', () =>
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return false; },
     sendSessionHistory() { return 0; },
   });
@@ -531,6 +559,7 @@ test('session_start(clear): isInitialDiscoveryDone=false suppresses sendSessionH
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return false; },
     sendSessionHistory() { histCalled = true; return 0; },
   });
@@ -567,6 +596,7 @@ test('session_start(clear): falls back to readSessionMap + findByTerminalPid, te
     sessionIdMap,
     replacedSessionIds: replaced,
     sendToPhone(e: unknown) { sent.push(e); },
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return true; },
     sendSessionHistory() { return 0; },
     readSessionMapFn: (() => ({ 'claude-new': { source: 'startup', cwd: '/proj', pid: 7, timestamp: 0 } })) as unknown as () => SessionMap,
@@ -597,6 +627,7 @@ test('session_start(clear): readSessionMap with no matching pid bails out', () =
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return true; },
     sendSessionHistory() { return 0; },
     readSessionMapFn: (() => ({})) as unknown as () => SessionMap,
@@ -620,6 +651,7 @@ test('session_start: defaults readSessionMapFn when omitted', () => {
     sessionIdMap: new Map(),
     replacedSessionIds: new Set(),
     sendToPhone() {},
+    prefetchClaudeSessionIds: new Set(),
     isInitialDiscoveryDone() { return false; },
     sendSessionHistory() { return 0; },
   });
@@ -627,6 +659,57 @@ test('session_start: defaults readSessionMapFn when omitted', () => {
   // it returns {} and the handler bails.
   hooks.emit('session_start', 'claude-new', 'clear', '/cwd', '/t');
   assert.ok(true);
+});
+
+test('session_start: cwd === PREFETCH_CWD tags session id and short-circuits', async () => {
+  const { PREFETCH_CWD } = await import('../src/sessions/observer-commands.js');
+  const hooks = makeHooks();
+  const tagged = new Set<string>();
+  let touchedSessionManager = false;
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() { touchedSessionManager = true; return undefined as never; },
+      findByTerminalPid() { touchedSessionManager = true; return undefined as never; },
+      observeSession() { touchedSessionManager = true; return 'int-new'; },
+      markObservedSessionHistory() { touchedSessionManager = true; },
+      removeSession() { touchedSessionManager = true; },
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap: new Map(),
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: tagged,
+    sendToPhone() { throw new Error('should not emit'); },
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory() { throw new Error('should not query history'); },
+  });
+  hooks.emit('session_start', 'claude-prefetch', 'startup', PREFETCH_CWD, '/t');
+  assert.ok(tagged.has('claude-prefetch'));
+  assert.equal(touchedSessionManager, false);
+});
+
+test('session_start: non-prefetch cwd does not tag', () => {
+  const hooks = makeHooks();
+  const tagged = new Set<string>();
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() { return undefined as never; },
+      findByTerminalPid() { return undefined as never; },
+      observeSession() { return 'int-new'; },
+      markObservedSessionHistory() {},
+      removeSession() {},
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap: new Map(),
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: tagged,
+    sendToPhone() {},
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory() { return 0; },
+  });
+  hooks.emit('session_start', 'claude-x', 'startup', '/some/other/cwd', '/t');
+  assert.equal(tagged.size, 0);
 });
 
 // ---------------------------------------------------------------------------

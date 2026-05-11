@@ -15,10 +15,15 @@ import type {
   ToolResultEvent,
   UserMessageEvent,
   SystemMessageEvent,
+  CompactBoundaryEvent,
+  CompactSummaryEvent,
 } from 'agent-pocket-protocol';
 import { SubagentObserver } from './subagent-observer.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText, type InterruptReason } from '../utils/interrupt-messages.js';
+import { parseLocalCommandUserText } from '../utils/local-command-parse.js';
+
+export { parseLocalCommandUserText };
 
 function isMissingFileError(err: unknown): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT';
@@ -275,6 +280,7 @@ export class SessionObserver extends EventEmitter {
 
   private processEntry(entry: Record<string, unknown>): void {
     const type = entry.type as string | undefined;
+    const entryTimestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
 
     if (type === 'custom-title' || type === 'ai-title') {
       const title = (entry.customTitle ?? entry.aiTitle) as string | undefined;
@@ -334,13 +340,59 @@ export class SessionObserver extends EventEmitter {
         return;
       }
 
-      this.emit('status_change', 'running');
+      // Local-command rows (`<command-name>`, caveats, stdout) are local
+      // terminal artifacts that don't trigger Claude inference.
+      //   - invoke / caveat / drop → keep status untouched
+      //   - stdout / stderr → command finished, flip to ready so the phone's
+      //     session list doesn't sit on the spinner indefinitely
+      // Anything else falls through and emits 'running'.
+      const peekContent = typeof message?.content === 'string'
+        ? message.content
+        : (Array.isArray(message?.content) && message.content[0]?.type === 'text')
+          ? (message.content[0].text ?? '')
+          : '';
+      const peekLocalCmd = peekContent ? parseLocalCommandUserText(peekContent) : null;
+      logger.debug('observer', 'peek local-command', {
+        peekKind: peekLocalCmd === null ? 'none' : (peekLocalCmd === 'drop' ? 'drop' : peekLocalCmd.type),
+        peekPreview: peekContent.substring(0, 80),
+      });
+      if (!peekLocalCmd) {
+        this.emit('status_change', 'running');
+      } else if (peekLocalCmd !== 'drop' && peekLocalCmd.type === 'local_command_output') {
+        this.emit('status_change', 'ready');
+      }
+
+      // /compact writes a special user entry whose content is the auto-summary
+      // and the row carries `isCompactSummary: true`. Surface it as a dedicated
+      // event so the phone can render it as a collapsed disclosure rather than
+      // a 10KB user message bubble.
+      if (entry.isCompactSummary === true) {
+        const summary = typeof message?.content === 'string'
+          ? message.content
+          : Array.isArray(message?.content)
+            ? message.content.filter((b): b is { type: string; text?: string } => b?.type === 'text').map(b => b.text ?? '').join('')
+            : '';
+        if (summary.length > 0) {
+          const event: CompactSummaryEvent = { type: 'compact_summary', summary, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) };
+          this.emit('output', event);
+        }
+        return;
+      }
 
       if (!message?.content) return;
 
       // Emit user text message
       const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
       if (typeof message.content === 'string') {
+        const localCmd = parseLocalCommandUserText(message.content);
+        if (localCmd) {
+          logger.debug('observer', 'parseLocalCommandUserText hit (string)', {
+            kind: localCmd === 'drop' ? 'drop' : (localCmd as { type: string }).type,
+            preview: message.content.substring(0, 80),
+          });
+          if (localCmd !== 'drop') this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+          return;
+        }
         // Skip internal protocol messages (XML-tagged: teammate, system, task, command)
         if (message.content.length > 0 && !this.isInternalMessage(message.content)) {
           const event: UserMessageEvent = { type: 'user_message', message: message.content, ...(sdkUuid ? { sdkUuid } : {}) };
@@ -348,9 +400,20 @@ export class SessionObserver extends EventEmitter {
         }
       } else if (Array.isArray(message.content)) {
         for (const block of message.content) {
-          if (block.type === 'text' && block.text && !this.isInternalMessage(block.text)) {
-            const event: UserMessageEvent = { type: 'user_message', message: block.text, ...(sdkUuid ? { sdkUuid } : {}) };
-            this.emit('output', event);
+          if (block.type === 'text' && block.text) {
+            const localCmd = parseLocalCommandUserText(block.text);
+            if (localCmd) {
+              logger.debug('observer', 'parseLocalCommandUserText hit (block)', {
+                kind: localCmd === 'drop' ? 'drop' : (localCmd as { type: string }).type,
+                preview: block.text.substring(0, 80),
+              });
+              if (localCmd !== 'drop') this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+              continue;
+            }
+            if (!this.isInternalMessage(block.text)) {
+              const event: UserMessageEvent = { type: 'user_message', message: block.text, ...(sdkUuid ? { sdkUuid } : {}) };
+              this.emit('output', event);
+            }
           } else if (block.type === 'tool_result' && block.tool_use_id) {
             this.pendingToolUseIds.delete(block.tool_use_id);
             const contentStr = typeof block.content === 'string'
@@ -366,6 +429,31 @@ export class SessionObserver extends EventEmitter {
             this.emit('output', event);
           }
         }
+      }
+      return;
+    }
+
+    // /compact emits a `system` row with `subtype: 'compact_boundary'` between
+    // the pre-compact transcript and the auto-summary. Surface it so the phone
+    // can render a horizontal "Conversation compacted" divider at the right
+    // session_seq position.
+    if (type === 'system' && entry.subtype === 'compact_boundary') {
+      const event: CompactBoundaryEvent = { type: 'compact_boundary', ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) };
+      this.emit('output', event);
+      return;
+    }
+
+    // Claude Code 2.1.x emits local-command stdout/stderr as `system` rows
+    // with `subtype: 'local_command'` and the wrapped tag in `content`.
+    // (Earlier versions emitted them as user messages — parser handles both
+    // shapes via parseLocalCommandUserText.)
+    if (type === 'system' && entry.subtype === 'local_command' && typeof entry.content === 'string') {
+      const localCmd = parseLocalCommandUserText(entry.content);
+      if (localCmd && localCmd !== 'drop') {
+        this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+        // stdout/stderr signals the command finished — restore session to ready
+        // so the phone's session list doesn't sit on the spinner indefinitely.
+        this.emit('status_change', 'ready');
       }
       return;
     }

@@ -34,7 +34,17 @@ export interface DiscoveredSession {
 }
 
 export interface HistoryMessage {
-  role: 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'subagent' | 'system';
+  role:
+    | 'user'
+    | 'assistant'
+    | 'tool_use'
+    | 'tool_result'
+    | 'subagent'
+    | 'system'
+    | 'local_command_invoke'
+    | 'local_command_output'
+    | 'compact_boundary'
+    | 'compact_summary';
   content: string;
   /**
    * For role='user' entries: the SDK transcript UUID from the JSONL row's
@@ -65,6 +75,12 @@ export interface HistoryMessage {
   subagentToolUseCount?: number;
   /** Final cumulative token count from archive (only set when archive exists). */
   subagentTokenCount?: number;
+  /** local_command_invoke: command name without leading slash. */
+  localCommandName?: string;
+  /** local_command_invoke: raw `<command-args>` body if present. */
+  localCommandArgs?: string;
+  /** local_command_output: true when sourced from `<local-command-stderr>`. */
+  localCommandIsStderr?: boolean;
   /**
    * Per-session monotonically increasing seq assigned in chronological
    * order when history is parsed from disk. Stable across calls (same

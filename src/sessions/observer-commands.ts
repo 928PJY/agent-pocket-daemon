@@ -63,6 +63,7 @@ export const BUILTIN_TERMINAL_COMMANDS: ReadonlyArray<SlashCommand> = [
   { name: 'compact', description: 'Free up context by summarizing the conversation so far', argumentHint: '[instructions]' },
   { name: 'config', description: 'Open the Settings interface', argumentHint: '', aliases: ['settings'] },
   { name: 'context', description: 'Visualize current context usage as a colored grid', argumentHint: '', aliases: ['usage'] },
+  { name: 'cost', description: 'Show the total cost and duration of the current session', argumentHint: '' },
   { name: 'diff', description: 'Open an interactive diff viewer showing uncommitted and per-turn changes', argumentHint: '' },
   { name: 'effort', description: 'Set the model effort level (low, medium, high, xhigh, max)', argumentHint: '[level|auto]' },
   { name: 'exit', description: 'Exit the CLI', argumentHint: '', aliases: ['quit'] },
@@ -127,6 +128,14 @@ export const OBSERVER_HIDDEN_COMMANDS: ReadonlySet<string> = new Set([
   'desktop', 'app',                   // /desktop alias /app
   'keybindings',
   'terminal-setup',
+  'add-dir',
+  'chrome',
+  'color',
+  'statusline',
+  'theme',
+  'tui',
+  'sandbox',
+  'voice',
 
   // Cloud provider local setup
   'setup-bedrock',
@@ -141,6 +150,11 @@ export const OBSERVER_HIDDEN_COMMANDS: ReadonlySet<string> = new Set([
   'install-slack-app',
   'web-setup',
   'teleport', 'tp',                   // /teleport alias /tp
+  'login',
+  'logout',
+  'mcp',
+  'feedback', 'bug',                  // /feedback alias /bug
+  'stickers',
 
   // Diagnostic / debug local dumps
   'heapdump',
@@ -162,6 +176,20 @@ export const OBSERVER_HIDDEN_COMMANDS: ReadonlySet<string> = new Set([
   'permissions', 'allowed-tools',     // /permissions alias /allowed-tools
   'agents',
   'plan',                             // toggles plan mode but no remote-friendly UX yet
+  'config', 'settings',               // /config alias /settings
+  'model',
+  'fast',
+  'plugin',
+  'powerup',
+  'remote-control', 'rc',             // /remote-control alias /rc
+  'remote-env',
+  'resume', 'continue',               // /resume alias /continue
+  'rewind', 'checkpoint', 'undo',     // /rewind aliases
+  'schedule', 'routines',             // /schedule alias /routines
+  'team-onboarding',
+  'autofix-pr',
+  'ultrareview',
+  'btw',
 
   // Hidden until phone-side picker exists. /effort with no arg opens a TUI
   // dialog; with an arg it changes a hidden global setting the user can't

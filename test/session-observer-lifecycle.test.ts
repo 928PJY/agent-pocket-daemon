@@ -137,6 +137,7 @@ test('SessionObserver maps queue, user, assistant, and tool result entries', () 
     assert.deepEqual(outputs, [
       { type: 'user_message', message: 'queued user text' },
       { type: 'user_message', message: 'plain user' },
+      { type: 'local_command_invoke', name: 'skip', args: '' },
       { type: 'thinking', thinking: 'think' },
       { type: 'assistant_message', message: 'hello' },
       { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Read', tool_input: { file_path: 'a.ts' } },
