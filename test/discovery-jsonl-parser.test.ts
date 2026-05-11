@@ -236,16 +236,24 @@ test('parseHistoryEntry: assistant row with non-array content returns []', () =>
   }), []);
 });
 
-test('parseHistoryEntry: assistant row with multi-text blocks joins them with \\n', () => {
+test('parseHistoryEntry: assistant row emits one ParsedMessage per text block with sdkBlockIndex', () => {
   const out = parseHistoryEntry({
     type: 'assistant',
+    uuid: 'row-uuid-1',
     message: { content: [
       { type: 'text', text: 'a' },
       { type: 'text', text: 'b' },
     ] },
   });
-  assert.equal(out.length, 1);
-  assert.equal(out[0].content, 'a\nb');
+  assert.equal(out.length, 2);
+  assert.equal(out[0].role, 'assistant');
+  assert.equal(out[0].content, 'a');
+  assert.equal(out[0].sdkUuid, 'row-uuid-1');
+  assert.equal(out[0].sdkBlockIndex, 0);
+  assert.equal(out[1].role, 'assistant');
+  assert.equal(out[1].content, 'b');
+  assert.equal(out[1].sdkUuid, 'row-uuid-1');
+  assert.equal(out[1].sdkBlockIndex, 1);
 });
 
 test('parseHistoryEntry: assistant row with [Tool use interrupted] text emits system marker (timestamp+1ms)', () => {

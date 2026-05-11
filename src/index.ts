@@ -344,6 +344,7 @@ export class AgentPocketDaemon extends EventEmitter {
       default_working_directory: config.defaultWorkingDirectory,
       default_model: config.defaultModel,
       max_concurrent_sessions: config.maxConcurrentSessions,
+      hasPeerCapability: (name) => this.hasPeerCapability(name),
     });
 
     this.cryptoEngine = new CryptoEngine();

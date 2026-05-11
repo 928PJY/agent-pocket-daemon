@@ -22,6 +22,8 @@ import { SubagentObserver } from './subagent-observer.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText, type InterruptReason } from '../utils/interrupt-messages.js';
 import { parseLocalCommandUserText } from '../utils/local-command-parse.js';
+import { stableEventId } from '../utils/stable-event-id.js';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 
 export { parseLocalCommandUserText };
 
@@ -117,10 +119,24 @@ export class SessionObserver extends EventEmitter {
   // Subagent observation
   private subagentObserver: SubagentObserver | null = null;
 
-  constructor(sessionId: string, jsonlPath: string) {
+  /**
+   * Returns true when the phone announces PEER_CAPABILITIES.STABLE_SDK_UUID.
+   * When true the observer emits full block text on each entry instead of a
+   * delta slice, so the phone can key ChatMessage.id off (sdkUuid, blockIndex)
+   * and overwrite in place. When false (or unset) the observer falls back to
+   * legacy delta-emit behaviour for back-compat with older iOS builds.
+   */
+  private getPeerCapability: (name: string) => boolean;
+
+  constructor(
+    sessionId: string,
+    jsonlPath: string,
+    options?: { hasPeerCapability?: (name: string) => boolean },
+  ) {
     super();
     this.sessionId = sessionId;
     this.jsonlPath = jsonlPath;
+    this.getPeerCapability = options?.hasPeerCapability ?? (() => false);
   }
 
   /**
@@ -153,7 +169,9 @@ export class SessionObserver extends EventEmitter {
     const jsonlDir = path.dirname(this.jsonlPath);
     const jsonlBasename = path.basename(this.jsonlPath, '.jsonl');
     const subagentsDir = path.join(jsonlDir, jsonlBasename, 'subagents');
-    this.subagentObserver = new SubagentObserver(subagentsDir);
+    this.subagentObserver = new SubagentObserver(subagentsDir, {
+      hasPeerCapability: this.getPeerCapability,
+    });
     this.subagentObserver.on('output', (event: SubagentEvent) => {
       this.emit('output', event);
     });
@@ -296,7 +314,16 @@ export class SessionObserver extends EventEmitter {
       if (trimmed.startsWith('<task-notification>') || trimmed.startsWith('<system-reminder>')) {
         return;
       }
-      const event: UserMessageEvent = { type: 'user_message', message: entry.content };
+      // queue-operation rows have no source `uuid` — derive a deterministic
+      // id from session + timestamp + content prefix so live + history land
+      // on the same key.
+      const sdkUuid = stableEventId([
+        this.sessionId,
+        entryTimestamp,
+        'queue_enqueue',
+        entry.content.slice(0, 64),
+      ]);
+      const event: UserMessageEvent = { type: 'user_message', message: entry.content, sdkUuid };
       this.emit('output', event);
       return;
     }
@@ -327,6 +354,7 @@ export class SessionObserver extends EventEmitter {
             tool_id: toolId,
             status: 'error',
             output: '[Tool use interrupted]',
+            sdkUuid: stableEventId([this.sessionId, entryTimestamp, 'tool_result_interrupt', toolId]),
           };
           this.emit('output', event);
         }
@@ -334,6 +362,7 @@ export class SessionObserver extends EventEmitter {
         const sysEvent: SystemMessageEvent = {
           type: 'system_message',
           message: interruptMessageText(interruptReason),
+          sdkUuid: stableEventId([this.sessionId, entryTimestamp, 'system_interrupt', interruptReason]),
         };
         this.emit('output', sysEvent);
         this.emit('interrupted', interruptReason);
@@ -373,7 +402,13 @@ export class SessionObserver extends EventEmitter {
             ? message.content.filter((b): b is { type: string; text?: string } => b?.type === 'text').map(b => b.text ?? '').join('')
             : '';
         if (summary.length > 0) {
-          const event: CompactSummaryEvent = { type: 'compact_summary', summary, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) };
+          const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+          const event: CompactSummaryEvent = {
+            type: 'compact_summary',
+            summary,
+            ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
+            ...(sdkUuid ? { sdkUuid } : {}),
+          };
           this.emit('output', event);
         }
         return;
@@ -390,7 +425,13 @@ export class SessionObserver extends EventEmitter {
             kind: localCmd === 'drop' ? 'drop' : (localCmd as { type: string }).type,
             preview: message.content.substring(0, 80),
           });
-          if (localCmd !== 'drop') this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+          if (localCmd !== 'drop') {
+            this.emit('output', {
+              ...localCmd,
+              ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
+              ...(sdkUuid ? { sdkUuid } : {}),
+            });
+          }
           return;
         }
         // Skip internal protocol messages (XML-tagged: teammate, system, task, command)
@@ -407,7 +448,13 @@ export class SessionObserver extends EventEmitter {
                 kind: localCmd === 'drop' ? 'drop' : (localCmd as { type: string }).type,
                 preview: block.text.substring(0, 80),
               });
-              if (localCmd !== 'drop') this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+              if (localCmd !== 'drop') {
+                this.emit('output', {
+                  ...localCmd,
+                  ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
+                  ...(sdkUuid ? { sdkUuid } : {}),
+                });
+              }
               continue;
             }
             if (!this.isInternalMessage(block.text)) {
@@ -425,6 +472,7 @@ export class SessionObserver extends EventEmitter {
               tool_id: block.tool_use_id,
               status: (block.is_error || isCancelled) ? 'error' : 'success',
               output: contentStr,
+              ...(sdkUuid ? { sdkUuid } : {}),
             };
             this.emit('output', event);
           }
@@ -438,7 +486,12 @@ export class SessionObserver extends EventEmitter {
     // can render a horizontal "Conversation compacted" divider at the right
     // session_seq position.
     if (type === 'system' && entry.subtype === 'compact_boundary') {
-      const event: CompactBoundaryEvent = { type: 'compact_boundary', ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) };
+      const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+      const event: CompactBoundaryEvent = {
+        type: 'compact_boundary',
+        ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
+        ...(sdkUuid ? { sdkUuid } : {}),
+      };
       this.emit('output', event);
       return;
     }
@@ -450,7 +503,12 @@ export class SessionObserver extends EventEmitter {
     if (type === 'system' && entry.subtype === 'local_command' && typeof entry.content === 'string') {
       const localCmd = parseLocalCommandUserText(entry.content);
       if (localCmd && localCmd !== 'drop') {
-        this.emit('output', { ...localCmd, ...(entryTimestamp ? { timestamp: entryTimestamp } : {}) });
+        const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+        this.emit('output', {
+          ...localCmd,
+          ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
+          ...(sdkUuid ? { sdkUuid } : {}),
+        });
         // stdout/stderr signals the command finished — restore session to ready
         // so the phone's session list doesn't sit on the spinner indefinitely.
         this.emit('status_change', 'ready');
@@ -484,16 +542,27 @@ export class SessionObserver extends EventEmitter {
     const message = entry.message as { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }> } | undefined;
     if (!message?.content || !Array.isArray(message.content)) return;
 
-    for (const block of message.content) {
+    const entryUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+    // When the phone supports STABLE_SDK_UUID we emit full block text so each
+    // (sdkUuid, sdkBlockIndex) row replaces in place; otherwise fall back to
+    // the legacy delta-slice behaviour so old phones don't see piling chunks.
+    const fullTextEmit = this.getPeerCapability(PEER_CAPABILITIES.STABLE_SDK_UUID);
+
+    for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
+      const block = message.content[blockIndex];
       switch (block.type) {
         case 'thinking': {
           const fullText = block.thinking ?? '';
-          const delta = fullText.slice(this.lastEmittedThinkingLength);
+          if (fullText.length <= this.lastEmittedThinkingLength) break;
+          const payload = fullTextEmit ? fullText : fullText.slice(this.lastEmittedThinkingLength);
           this.lastEmittedThinkingLength = fullText.length;
-          if (delta.length > 0) {
-            const event: ThinkingEvent = { type: 'thinking', thinking: delta };
-            this.emit('output', event);
-          }
+          if (payload.length === 0) break;
+          const event: ThinkingEvent = {
+            type: 'thinking',
+            thinking: payload,
+            ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
+          };
+          this.emit('output', event);
           break;
         }
 
@@ -505,12 +574,16 @@ export class SessionObserver extends EventEmitter {
             this.lastEmittedTextLength = fullText.length;
             break;
           }
-          const delta = fullText.slice(this.lastEmittedTextLength);
+          if (fullText.length <= this.lastEmittedTextLength) break;
+          const payload = fullTextEmit ? fullText : fullText.slice(this.lastEmittedTextLength);
           this.lastEmittedTextLength = fullText.length;
-          if (delta.length > 0) {
-            const event: AssistantMessageEvent = { type: 'assistant_message', message: delta };
-            this.emit('output', event);
-          }
+          if (payload.length === 0) break;
+          const event: AssistantMessageEvent = {
+            type: 'assistant_message',
+            message: payload,
+            ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
+          };
+          this.emit('output', event);
           break;
         }
 
@@ -524,6 +597,7 @@ export class SessionObserver extends EventEmitter {
             tool_id: toolId,
             tool_name: block.name ?? 'unknown',
             tool_input: (block.input as Record<string, unknown>) ?? {},
+            ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
           };
           this.emit('output', event);
           break;

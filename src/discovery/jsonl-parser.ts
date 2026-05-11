@@ -33,6 +33,7 @@ type ParsedMessage = {
     | 'compact_summary';
   content: string;
   sdkUuid?: string;
+  sdkBlockIndex?: number;
   toolName?: string;
   toolId?: string;
   toolInput?: Record<string, unknown>;
@@ -65,6 +66,7 @@ export function truncateToolInput(
 export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage[] {
   const type = entry.type as string | undefined;
   const timestamp = entry.timestamp as string | undefined;
+  const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
 
   if (type === 'user') {
     const message = entry.message as { role?: string; content?: unknown } | undefined;
@@ -72,7 +74,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
 
     const reason = detectInterruptReason(message.content);
     if (reason) {
-      return [{ role: 'system', content: interruptMessageText(reason), timestamp }];
+      return [{ role: 'system', content: interruptMessageText(reason), timestamp, sdkUuid }];
     }
 
     const content = typeof message.content === 'string'
@@ -97,6 +99,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
         localCommandName: localCmd.name,
         localCommandArgs: localCmd.args,
         timestamp,
+        sdkUuid,
       }];
     }
     if (localCmd?.type === 'local_command_output') {
@@ -105,23 +108,23 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
         content: localCmd.stdout,
         localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
         timestamp,
+        sdkUuid,
       }];
     }
 
     // /compact summary lives on a `type: 'user'` row with `isCompactSummary`.
     if (entry.isCompactSummary === true) {
-      return [{ role: 'compact_summary', content, timestamp }];
+      return [{ role: 'compact_summary', content, timestamp, sdkUuid }];
     }
 
     if (isInternalMessage(content)) return [];
-    const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
     return [{ role: 'user', content, timestamp, sdkUuid }];
   }
 
   if (type === 'system') {
     // /compact boundary marker between pre-compact transcript and the summary.
     if (entry.subtype === 'compact_boundary') {
-      return [{ role: 'compact_boundary', content: '', timestamp }];
+      return [{ role: 'compact_boundary', content: '', timestamp, sdkUuid }];
     }
     // Some Claude Code releases emit local-command stdout/stderr as `system`
     // rows with `subtype: 'local_command'` and the wrapped tag in `content`.
@@ -136,6 +139,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
           content: localCmd.stdout,
           localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
           timestamp,
+          sdkUuid,
         }];
       }
       if (localCmd?.type === 'local_command_invoke') {
@@ -145,6 +149,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
           localCommandName: localCmd.name,
           localCommandArgs: localCmd.args,
           timestamp,
+          sdkUuid,
         }];
       }
     }
@@ -156,30 +161,29 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
     if (!message?.content || !Array.isArray(message.content)) return [];
 
     const results: ParsedMessage[] = [];
-
-    const textParts: string[] = [];
     let interruptedInAssistant = false;
-    for (const block of message.content) {
+
+    // Walk message.content[] preserving the source block index. Each text
+    // block becomes its own ParsedMessage so the phone can key by
+    // (sdkUuid, sdkBlockIndex) and overwrite in place across live + history.
+    // tool_use blocks use the same row uuid + their own block index;
+    // ChatMessage.id for tool_use stays on tool_id end-to-end (the sdkUuid
+    // here is informational, mirroring the live observer).
+    for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
+      const block = message.content[blockIndex];
       if (block.type === 'text' && block.text) {
         if (detectInterruptText(block.text)) {
           interruptedInAssistant = true;
         } else {
-          textParts.push(block.text);
+          results.push({
+            role: 'assistant',
+            content: block.text,
+            timestamp,
+            sdkUuid,
+            sdkBlockIndex: blockIndex,
+          });
         }
-      }
-    }
-    if (textParts.length > 0) {
-      results.push({ role: 'assistant', content: textParts.join('\n'), timestamp });
-    }
-    if (interruptedInAssistant) {
-      // Offset by 1ms so the interrupt marker sorts AFTER any synthesized
-      // plan_review / user_question cards that share the tool_use timestamp.
-      const bumped = timestamp ? new Date(new Date(timestamp).getTime() + 1).toISOString() : timestamp;
-      results.push({ role: 'system', content: interruptMessageText('tool_use'), timestamp: bumped });
-    }
-
-    for (const block of message.content) {
-      if (block.type === 'tool_use') {
+      } else if (block.type === 'tool_use') {
         results.push({
           role: 'tool_use',
           content: '',
@@ -187,8 +191,24 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
           toolId: block.id,
           toolInput: truncateToolInput(block.input as Record<string, unknown> | undefined),
           timestamp,
+          sdkUuid,
+          sdkBlockIndex: blockIndex,
         });
       }
+    }
+
+    if (interruptedInAssistant) {
+      // Offset by 1ms so the interrupt marker sorts AFTER any synthesized
+      // plan_review / user_question cards that share the tool_use timestamp.
+      const bumped = timestamp ? new Date(new Date(timestamp).getTime() + 1).toISOString() : timestamp;
+      // No source uuid for the synthesized marker — derive a deterministic
+      // one from row uuid + 'interrupt' so live + history agree.
+      results.push({
+        role: 'system',
+        content: interruptMessageText('tool_use'),
+        timestamp: bumped,
+        sdkUuid: sdkUuid ? `${sdkUuid}:interrupt` : undefined,
+      });
     }
 
     return results;

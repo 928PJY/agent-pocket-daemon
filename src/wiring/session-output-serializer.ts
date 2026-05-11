@@ -71,7 +71,6 @@ export function flattenAgentEvent(
     case 'user_message':
       flat.output_type = 'user_message';
       flat.content = agentEvent.message;
-      if (agentEvent.sdkUuid) flat.sdk_uuid = agentEvent.sdkUuid;
       break;
 
     case 'system_message':
@@ -119,6 +118,18 @@ export function flattenAgentEvent(
       flat.output_type = (agentEvent as { type: string }).type;
       flat.content = JSON.stringify(agentEvent);
       break;
+  }
+
+  // Mirror sdkUuid + sdkBlockIndex onto the flattened wire envelope so the
+  // phone can read them at the top level without unwrapping the discriminated
+  // event union. Set on every variant that carries them (user_message,
+  // thinking, assistant_message, tool_use, tool_result, system_message,
+  // subagent_event, local_command_*, compact_*).
+  if ('sdkUuid' in agentEvent && typeof agentEvent.sdkUuid === 'string') {
+    flat.sdk_uuid = agentEvent.sdkUuid;
+  }
+  if ('sdkBlockIndex' in agentEvent && typeof agentEvent.sdkBlockIndex === 'number') {
+    flat.sdk_block_index = agentEvent.sdkBlockIndex;
   }
 
   return flat;

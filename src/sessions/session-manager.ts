@@ -38,6 +38,7 @@ import type {
   PermissionMode,
 } from 'agent-pocket-protocol';
 import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
 import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt, sendQuit as terminalSendQuit } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
@@ -128,6 +129,13 @@ export interface SessionManagerConfig {
   /** Override the SDK query() factory. Used by tests to inject a fake Query
    *  without spawning the Claude binary. */
   queryFactory?: QueryFactory;
+  /**
+   * Returns true when the phone announces a peer capability. Used by
+   * `handleSDKMessage` to gate the delta→full-text switch on
+   * PEER_CAPABILITIES.STABLE_SDK_UUID, and propagated to per-session
+   * SessionObservers so the observer makes the same decision.
+   */
+  hasPeerCapability?: (name: string) => boolean;
 }
 
 export interface SessionManagerEvents {
@@ -523,7 +531,9 @@ export class SessionManager extends EventEmitter {
     const inputController = new StreamInputController();
     inputController.ownerSessionId = sessionId;
 
-    const observer = new SessionObserver(claudeSessionId, jsonlPath);
+    const observer = new SessionObserver(claudeSessionId, jsonlPath, {
+      hasPeerCapability: this.config.hasPeerCapability,
+    });
 
     // Use the JSONL file's mtime as initial lastActivity (more accurate than Date.now())
     let initialLastActivity = Date.now();
@@ -1281,30 +1291,40 @@ export class SessionManager extends EventEmitter {
 
       case 'assistant': {
         const betaMessage = (message as { message?: { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }> } }).message;
+        const sdkUuid = (message as { uuid?: string }).uuid;
+        const fullTextEmit = this.config.hasPeerCapability?.(PEER_CAPABILITIES.STABLE_SDK_UUID) ?? false;
         if (betaMessage?.content) {
-          for (const block of betaMessage.content) {
+          for (let blockIndex = 0; blockIndex < betaMessage.content.length; blockIndex++) {
+            const block = betaMessage.content[blockIndex];
             switch (block.type) {
               case 'thinking': {
                 const fullText = block.thinking ?? '';
-                // SDK sends full accumulated text; emit only the new delta
-                const delta = fullText.slice(state.lastEmittedThinkingLength);
+                if (fullText.length <= state.lastEmittedThinkingLength) break;
+                const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedThinkingLength);
                 state.lastEmittedThinkingLength = fullText.length;
-                if (delta.length > 0) {
-                  const event: ThinkingEvent = { type: 'thinking', thinking: delta };
-                  state.status = SessionStatus.RUNNING;
-                  this.emit('session_output', sessionId, event);
-                }
+                if (payload.length === 0) break;
+                const event: ThinkingEvent = {
+                  type: 'thinking',
+                  thinking: payload,
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                };
+                state.status = SessionStatus.RUNNING;
+                this.emit('session_output', sessionId, event);
                 break;
               }
               case 'text': {
                 const fullText = block.text ?? '';
-                const delta = fullText.slice(state.lastEmittedTextLength);
+                if (fullText.length <= state.lastEmittedTextLength) break;
+                const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedTextLength);
                 state.lastEmittedTextLength = fullText.length;
-                if (delta.length > 0) {
-                  const event: AssistantMessageEvent = { type: 'assistant_message', message: delta };
-                  state.status = SessionStatus.RUNNING;
-                  this.emit('session_output', sessionId, event);
-                }
+                if (payload.length === 0) break;
+                const event: AssistantMessageEvent = {
+                  type: 'assistant_message',
+                  message: payload,
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                };
+                state.status = SessionStatus.RUNNING;
+                this.emit('session_output', sessionId, event);
                 break;
               }
               case 'tool_use': {
@@ -1317,6 +1337,7 @@ export class SessionManager extends EventEmitter {
                   tool_id: toolId,
                   tool_name: block.name ?? 'unknown',
                   tool_input: (block.input as Record<string, unknown>) ?? {},
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
                 };
                 state.status = SessionStatus.RUNNING;
                 this.emit('session_output', sessionId, event);
@@ -1335,6 +1356,7 @@ export class SessionManager extends EventEmitter {
         state.emittedToolUseIds.clear();
 
         const userMessage = (message as { message?: { content?: unknown } }).message;
+        const sdkUuid = (message as { uuid?: string }).uuid;
         const content = userMessage?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -1344,6 +1366,7 @@ export class SessionManager extends EventEmitter {
                 tool_id: block.tool_use_id,
                 status: block.is_error ? 'error' : 'success',
                 output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''),
+                ...(sdkUuid ? { sdkUuid } : {}),
               };
               state.status = SessionStatus.RUNNING;
               this.emit('session_output', sessionId, event);

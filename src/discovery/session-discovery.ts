@@ -53,8 +53,20 @@ export interface HistoryMessage {
    * the SDK uuid, not our app-side ChatMessage.id (which is locally generated).
    * Older daemons won't set this; phone treats absence as "rewind unavailable
    * for this turn".
+   *
+   * Beyond rewind: when PEER_CAPABILITIES.STABLE_SDK_UUID is in effect this
+   * is the row's primary key for every replayed event (assistant, tool_use,
+   * tool_result, system, local_command_*, compact_*) so the phone keys
+   * `ChatMessage.id` off it and live + history collapse without fingerprint.
    */
   sdkUuid?: string;
+  /**
+   * Block index inside the source assistant row's `message.content[]`.
+   * Set on `assistant` and `tool_use` history rows produced from a multi-
+   * block JSONL entry; lets the phone disambiguate sibling blocks that
+   * share one `sdkUuid`.
+   */
+  sdkBlockIndex?: number;
   toolName?: string;
   toolId?: string;
   toolStatus?: 'success' | 'error';
