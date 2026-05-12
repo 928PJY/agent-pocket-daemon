@@ -64,6 +64,10 @@ export interface ListSessionsDeps {
   // ── Daemon static / state ───────────────────────────────────────────────
   replacedSessionIds: Set<string>;
   claudeAgentVersion: string | undefined;
+  // Optional: only present once binding-journal wiring lands. Used to
+  // suppress phantom Phase-2 rows whose JSONL has been adopted by a
+  // different live PID (Anomaly B's `528fcedd-104` ghost).
+  getBindingJournal?: () => { lastObserveForJsonl: (jsonlPath: string) => { pid: number } | undefined } | null;
 }
 
 const DEBUG_LOG_PATH = '/tmp/daemon-debug.log';
@@ -272,6 +276,18 @@ function collectAlivePids(
     if (exactMatch) {
       lastActivity = exactMatch.lastModified;
       customTitle = exactMatch.customTitle;
+    }
+
+    // Phase-2 phantom suppression (Anomaly B defense in depth): if the
+    // binding journal records a different PID as the most recent observer
+    // of this JSONL, the row is a stale ghost — skip it. The live PID's
+    // legitimate row will still be included via its own iteration.
+    if (exactMatch) {
+      const journal = deps.getBindingJournal?.();
+      const lastObs = journal?.lastObserveForJsonl(exactMatch.filePath);
+      if (lastObs && lastObs.pid !== pidInfo.pid) {
+        continue;
+      }
     }
 
     out.push({

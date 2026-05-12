@@ -1068,14 +1068,19 @@ export class AgentPocketDaemon extends EventEmitter {
         // Also check if process is suspended or zombie
         if (isProcessSuspendedOrZombie(session.terminalPid)) {
           logger.warn('daemon', 'Terminal PID suspended/zombie', { pid: session.terminalPid, sessionId: session.sessionId });
-          this.sessionManager.markObservedSessionHistory(session.sessionId);
+          this.sessionManager.markObservedSessionHistory(session.sessionId, 'pid_zombie');
           deadPids.push(session.terminalPid);
         }
       } catch {
         // PID is dead — terminal exited
         logger.info('daemon', 'Terminal PID exited', { pid: session.terminalPid, sessionId: session.sessionId });
-        this.sessionManager.markObservedSessionHistory(session.sessionId);
-        deadPids.push(session.terminalPid);
+        const terminalPid = session.terminalPid;
+        const claudeSessionId = session.claudeSessionId;
+        this.sessionManager.markObservedSessionHistory(session.sessionId, 'pid_exited');
+        if (claudeSessionId) {
+          this.sessionManager.getBindingJournal()?.appendPidExited({ pid: terminalPid, sessionId: claudeSessionId });
+        }
+        deadPids.push(terminalPid);
       }
     }
 
@@ -1309,6 +1314,7 @@ export class AgentPocketDaemon extends EventEmitter {
       pendingBlockingRequests: this.pendingBlockingRequests,
       replacedSessionIds: this.replacedSessionIds,
       claudeAgentVersion: this.claudeAgentVersion,
+      getBindingJournal: () => this.sessionManager.getBindingJournal(),
     };
   }
 

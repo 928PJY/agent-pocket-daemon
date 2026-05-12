@@ -295,7 +295,7 @@ export function registerSessionEndHandler(
     };
     deps.sendToPhone(endEvent);
 
-    deps.sessionManager.markObservedSessionHistory(oldInternalId);
+    deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_end_clear');
     deps.sessionIdMap.delete(oldInternalId);
     deps.sessionManager.removeSession(oldInternalId);
     deps.replacedSessionIds.add(claudeSessionId);
@@ -365,7 +365,7 @@ export function registerSessionStartHandler(
             end_reason: 'completed',
           };
           deps.sendToPhone(endEvent);
-          deps.sessionManager.markObservedSessionHistory(oldInternalId);
+          deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_end_clear');
           deps.sessionIdMap.delete(oldInternalId);
           deps.sessionManager.removeSession(oldInternalId);
           if (oldClaudeId) deps.replacedSessionIds.add(oldClaudeId);

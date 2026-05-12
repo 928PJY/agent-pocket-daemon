@@ -43,6 +43,9 @@ import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterr
 import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
+import { BindingJournal, type HistorifyReason } from '../persistence/binding-journal.js';
+
+export type { HistorifyReason } from '../persistence/binding-journal.js';
 
 // ============================================================================
 // Types
@@ -109,6 +112,9 @@ export interface SessionState {
   observer?: SessionObserver;
   /** PID of the terminal Claude process (for observed sessions) */
   terminalPid?: number;
+  /** PID that owned this session before historification. Set by markObservedSessionHistory.
+   *  Used by findByLastKnownPid for re-promotion when the PID is still alive. */
+  lastKnownPid?: number;
   /** Custom title from the JSONL file or discovery */
   customTitle?: string;
   /** Terminal injection target (iTerm2 or tmux) */
@@ -127,6 +133,10 @@ export interface SessionManagerConfig {
   /** Override the SDK query() factory. Used by tests to inject a fake Query
    *  without spawning the Claude binary. */
   queryFactory?: QueryFactory;
+  /** Optional binding journal for tracking (pid, claudeSessionId, jsonlPath)
+   *  state transitions. Defaults to a journal at ~/.agent-pocket/binding.jsonl
+   *  unless `bindingJournal: null` is passed (tests). */
+  bindingJournal?: BindingJournal | null;
 }
 
 export interface SessionManagerEvents {
@@ -149,11 +159,21 @@ export class SessionManager extends EventEmitter {
   private config: SessionManagerConfig;
   private sessionCounter: number = 0;
   private queryFactory: QueryFactory;
+  private journal: BindingJournal | null;
 
   constructor(config: SessionManagerConfig = {}) {
     super();
     this.config = config;
     this.queryFactory = config.queryFactory ?? ((args) => query(args));
+    // Tests can pass `bindingJournal: null` to disable journal writes.
+    // Default: real journal at ~/.agent-pocket/binding.jsonl.
+    this.journal = config.bindingJournal === null ? null : (config.bindingJournal ?? new BindingJournal());
+  }
+
+  /** Internal access to the binding journal (for callers that need to record
+   *  events outside SessionManager, e.g. session-discovery-loop's clear event). */
+  getBindingJournal(): BindingJournal | null {
+    return this.journal;
   }
 
   /**
@@ -564,7 +584,63 @@ export class SessionManager extends EventEmitter {
 
     this.sessions.set(sessionId, state);
 
-    // Wire observer events to session manager events
+    this.wireObserverEvents(state);
+
+    // Start tailing
+    observer.start();
+
+    if (!state.hasEmittedStarted) {
+      state.hasEmittedStarted = true;
+      this.emit('session_started', sessionId, workingDirectory, customTitle);
+    }
+
+    // Check if JSONL indicates the session is already waiting for user input
+    // (e.g., daemon started after Claude was already showing a permission dialog)
+    const pendingCheck = SessionObserver.isPendingUserAction(jsonlPath);
+    if (pendingCheck.pending) {
+      state.status = SessionStatus.PENDING_ACTIONS;
+      this.emit('session_status', sessionId, SessionStatus.PENDING_ACTIONS);
+      this.emit('pending_action_detected', sessionId, pendingCheck.toolName);
+      logger.info('session-manager', 'Session detected as pending user action on startup', { sessionId, toolName: pendingCheck.toolName });
+    } else {
+      // Start as ready — the observer will emit 'running' when it sees activity
+      this.emit('session_status', sessionId, SessionStatus.READY);
+    }
+
+    logger.info('session-manager', 'Observing terminal session', {
+      sessionId,
+      claudeSessionId,
+      terminalPid,
+      targetType: terminalTarget?.type,
+      target: terminalTarget?.target,
+    });
+
+    if (this.journal) {
+      this.journal.appendObserve({
+        pid: terminalPid,
+        sessionId: claudeSessionId,
+        cwd: workingDirectory,
+        jsonlPath,
+        customTitle,
+        entrypoint,
+      });
+    }
+
+    return sessionId;
+  }
+
+  /**
+   * Wire SessionObserver event handlers to SessionManager events. Extracted
+   * from observeSession() so rePromoteHistoryToObserved() can rewire when
+   * a HISTORY record is brought back to observed state.
+   */
+  private wireObserverEvents(state: SessionState): void {
+    const sessionId = state.sessionId;
+    const observer = state.observer;
+    if (!observer) return;
+    const workingDirectory = state.workingDirectory;
+    const customTitle = state.customTitle;
+
     observer.on('output', (event: ClaudeEvent) => {
       state.lastActivity = Date.now();
       state.hasReceivedEvents = true;
@@ -621,36 +697,8 @@ export class SessionManager extends EventEmitter {
       this.emit('session_interrupted', sessionId, reason, 'observer');
     });
 
-    // Start tailing
-    observer.start();
-
-    if (!state.hasEmittedStarted) {
-      state.hasEmittedStarted = true;
-      this.emit('session_started', sessionId, workingDirectory, customTitle);
-    }
-
-    // Check if JSONL indicates the session is already waiting for user input
-    // (e.g., daemon started after Claude was already showing a permission dialog)
-    const pendingCheck = SessionObserver.isPendingUserAction(jsonlPath);
-    if (pendingCheck.pending) {
-      state.status = SessionStatus.PENDING_ACTIONS;
-      this.emit('session_status', sessionId, SessionStatus.PENDING_ACTIONS);
-      this.emit('pending_action_detected', sessionId, pendingCheck.toolName);
-      logger.info('session-manager', 'Session detected as pending user action on startup', { sessionId, toolName: pendingCheck.toolName });
-    } else {
-      // Start as ready — the observer will emit 'running' when it sees activity
-      this.emit('session_status', sessionId, SessionStatus.READY);
-    }
-
-    logger.info('session-manager', 'Observing terminal session', {
-      sessionId,
-      claudeSessionId,
-      terminalPid,
-      targetType: terminalTarget?.type,
-      target: terminalTarget?.target,
-    });
-
-    return sessionId;
+    // Touch unused parameter to silence TS — preserved for symmetry with original.
+    void customTitle;
   }
 
   /**
@@ -694,21 +742,47 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Find a historified session whose previous owner was `pid`. Used by the
+   * standalone-PID rescue path to re-promote a HISTORY record back to
+   * observed when its claimed PID is still alive on disk. Mirror of
+   * findByTerminalPid but for the LAST-known PID, not the live one.
+   */
+  findByLastKnownPid(pid: number): SessionState | undefined {
+    for (const session of this.sessions.values()) {
+      if (!session.isObserved && session.lastKnownPid === pid) return session;
+    }
+    return undefined;
+  }
+
+  /**
    * Mark an observed session as history (terminal PID exited).
    * Stops the observer and notifies the phone. Does NOT take over the session.
+   *
+   * Records `lastKnownPid` so the standalone-PID rescue path can find this
+   * record again if the PID turns out to still be alive (e.g. after a
+   * spurious zombie/suspended detection). Writes a `historify` event to
+   * the binding journal carrying `reason` for forensic correlation.
    */
-  markObservedSessionHistory(sessionId: string): void {
+  markObservedSessionHistory(sessionId: string, reason: HistorifyReason = 'unknown'): void {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isObserved) return;
+
+    const oldPid = session.terminalPid;
+    const claudeSessionId = session.claudeSessionId;
 
     session.observer?.stop();
     session.isObserved = false;
     session.observer = undefined;
     session.terminalPid = undefined;
     session.terminalTarget = undefined;
+    if (oldPid !== undefined) session.lastKnownPid = oldPid;
     session.status = SessionStatus.HISTORY;
     this.emit('session_status', sessionId, SessionStatus.HISTORY);
-    logger.debug('session-manager', 'Terminal exited for observed session', { sessionId });
+    logger.debug('session-manager', 'Terminal exited for observed session', { sessionId, reason });
+
+    if (this.journal && oldPid !== undefined && claudeSessionId) {
+      this.journal.appendHistorify({ pid: oldPid, sessionId: claudeSessionId, reason });
+    }
 
     // Discard any queued messages — terminal is gone
     if (session.messageQueue.length > 0) {
@@ -718,11 +792,73 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Re-promote a historified observed session back to active observation.
+   * Used by the standalone-PID rescue path when a HISTORY record's
+   * `lastKnownPid` is still alive AND owns its claimed JSONL.
+   *
+   * Reverses the four-line nullification in markObservedSessionHistory:
+   * sets isObserved=true, status=READY, terminalPid, terminalTarget,
+   * and creates a fresh SessionObserver. Returns true on success.
+   */
+  rePromoteHistoryToObserved(
+    sessionId: string,
+    pid: number,
+    jsonlPath: string,
+    customTitle?: string,
+    terminalTarget?: TerminalTarget,
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (session.isObserved) return false;
+    if (!session.claudeSessionId) return false;
+
+    const demotedFor = Date.now() - session.lastActivity;
+
+    const observer = new SessionObserver(session.claudeSessionId, jsonlPath);
+    session.observer = observer;
+    session.isObserved = true;
+    session.status = SessionStatus.READY;
+    session.terminalPid = pid;
+    session.terminalTarget = terminalTarget;
+    if (customTitle && !session.titleIsCustom) session.customTitle = customTitle;
+    session.lastActivity = Date.now();
+    session.hasReceivedEvents = false;
+
+    this.wireObserverEvents(session);
+    observer.start();
+
+    this.emit('session_status', sessionId, SessionStatus.READY);
+    logger.info('session-manager', 'Re-promoted historified session', {
+      sessionId,
+      claudeSessionId: session.claudeSessionId,
+      pid,
+      demotedForMs: demotedFor,
+    });
+
+    if (this.journal) {
+      this.journal.appendObserve({
+        pid,
+        sessionId: session.claudeSessionId,
+        cwd: session.workingDirectory,
+        jsonlPath,
+        customTitle: session.customTitle,
+        entrypoint: session.entrypoint,
+      });
+    }
+
+    return true;
+  }
+
+  /**
    * Remove a session from tracking entirely (e.g. after /clear replaces it).
    */
   removeSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+
+    if (this.journal && session.claudeSessionId) {
+      this.journal.appendRemove({ pid: session.terminalPid ?? session.lastKnownPid, sessionId: session.claudeSessionId });
+    }
 
     this.cleanupSession(session);
     this.sessions.delete(sessionId);

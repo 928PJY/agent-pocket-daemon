@@ -18,6 +18,8 @@ import {
   type SessionEndedEvent,
 } from 'agent-pocket-protocol';
 import type { SessionManager } from '../sessions/session-manager.js';
+import type { BindingJournal } from '../persistence/binding-journal.js';
+import type { TerminalTarget } from '../pty/tmux-injector.js';
 import type { SessionDiscovery } from '../discovery/session-discovery.js';
 import type { CodexDiscovery, CodexSession } from '../discovery/codex-discovery.js';
 import { CodexObserver } from '../observers/codex-observer.js';
@@ -36,7 +38,20 @@ export interface ClaudeDiscoveryDeps {
     | 'observeSession'
     | 'removeSession'
     | 'markObservedSessionHistory'
-  >;
+  > & {
+    // Optional: only present once binding-journal wiring lands. Falsy on
+    // older callers / tests, in which case the orphan guard and standalone
+    // rescue degrade to legacy behavior.
+    getBindingJournal?: () => BindingJournal | null;
+    findByLastKnownPid?: (pid: number) => { sessionId: string; claudeSessionId?: string } | undefined;
+    rePromoteHistoryToObserved?: (
+      sessionId: string,
+      pid: number,
+      jsonlPath: string,
+      customTitle?: string,
+      terminalTarget?: TerminalTarget,
+    ) => boolean;
+  };
   /** Live reference — handler mutates with set/delete. */
   sessionIdMap: Map<string, string>;
   /** Live reference — handler mutates with add. */
@@ -58,6 +73,25 @@ export interface ClaudeDiscoveryDeps {
   killFn?: (pid: number, signal: number) => void;
   /** Date.now wrapper — defaults to Date.now. */
   nowFn?: () => number;
+}
+
+/**
+ * Anomaly A guard. A discovered JSONL file is safe to adopt onto `pid` only if
+ * either (a) no other PID has ever observed it (journal silent), or
+ * (b) the most-recent observer of that JSONL in the binding journal IS this
+ * PID. Without the guard the discovery loop attaches whichever fresh JSONL
+ * happens to share a project dir to whichever observed PID happens to be
+ * present, producing the (pid, claudeSessionId) misbind reported in Anomaly A.
+ */
+function passesOrphanAdoptionGuard(
+  jsonlPath: string,
+  pid: number,
+  journal: BindingJournal | null | undefined,
+): boolean {
+  if (!journal) return true;
+  const last = journal.lastObserveForJsonl(jsonlPath);
+  if (!last) return true;
+  return last.pid === pid;
 }
 
 export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Promise<void> {
@@ -103,7 +137,13 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         d.lastModified > (session.lastActivity || 0) &&
         d.filePath !== currentJsonlPath &&
         (!sessionIdsByPid.has(d.sessionId) || sessionIdsByPid.get(d.sessionId) === session.terminalPid) &&
-        !deps.replacedSessionIds.has(d.sessionId),
+        !deps.replacedSessionIds.has(d.sessionId) &&
+        // Three-state predicate (Anomaly A guard): only adopt an orphan JSONL
+        // onto this PID if either (a) no other PID has ever observed it, or
+        // (b) the most recent observer in the binding journal IS this PID.
+        // Without this, the daemon mis-binds a JSONL written by some other
+        // process to whichever observed PID happens to share the project dir.
+        passesOrphanAdoptionGuard(d.filePath, session.terminalPid!, deps.sessionManager.getBindingJournal?.()),
       );
 
       if (newerFile) {
@@ -111,7 +151,12 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         const cwd = session.workingDirectory;
         const target = session.terminalTarget;
 
-        logger.info('daemon', 'Detected /clear', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
+        logger.info('daemon', 'Adopted JSONL onto observed PID (verified)', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
+        deps.sessionManager.getBindingJournal?.()?.appendClear({
+          pid,
+          oldSessionId: session.claudeSessionId ?? '',
+          newSessionId: newerFile.sessionId,
+        });
 
         const oldInternalId = session.sessionId;
         const oldClaudeId = session.claudeSessionId;
@@ -126,7 +171,7 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
           deps.sendToPhone(endEvent);
         }
 
-        deps.sessionManager.markObservedSessionHistory(oldInternalId);
+        deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_replaced');
         deps.sessionIdMap.delete(oldInternalId);
         deps.sessionManager.removeSession(oldInternalId);
         if (oldClaudeId) deps.replacedSessionIds.add(oldClaudeId);
@@ -170,7 +215,7 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
           const oldInternalId = existingByPid.sessionId;
           const oldClaudeId = existingByPid.claudeSessionId;
 
-          deps.sessionManager.markObservedSessionHistory(oldInternalId);
+          deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_replaced');
           deps.sessionIdMap.delete(oldInternalId);
           deps.sessionManager.removeSession(oldInternalId);
           if (oldClaudeId) deps.replacedSessionIds.add(oldClaudeId);
@@ -240,7 +285,36 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
       }
 
       const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-      if (!match) continue;
+      if (!match) {
+        // Standalone-PID rescue (Anomaly B): the CLI PID is alive but the
+        // JSONL discovery couldn't match it. Consult the binding journal —
+        // if we previously observed this PID and historified it (e.g. due
+        // to a transient zombie/suspended check), re-promote that record
+        // back to observed instead of leaving the PID invisible.
+        const journal = deps.sessionManager.getBindingJournal?.();
+        const lastObserve = journal?.lastObserveForPid(pidInfo.pid);
+        if (lastObserve) {
+          const historified = deps.sessionManager.findByLastKnownPid?.(pidInfo.pid);
+          if (historified && historified.claudeSessionId === lastObserve.claudeSessionId) {
+            const repromoted = deps.sessionManager.rePromoteHistoryToObserved?.(
+              historified.sessionId,
+              pidInfo.pid,
+              lastObserve.jsonlPath,
+              undefined,
+              pidInfo.terminalTarget,
+            );
+            if (repromoted) {
+              deps.sessionIdMap.set(historified.sessionId, lastObserve.claudeSessionId);
+              logger.info('daemon', 'Re-promoted historified session via binding journal', {
+                pid: pidInfo.pid,
+                claudeSessionId: lastObserve.claudeSessionId,
+              });
+              continue;
+            }
+          }
+        }
+        continue;
+      }
 
       let observeMatch = match;
       let observeSessionId = pidInfo.sessionId;
