@@ -88,6 +88,42 @@ interface CollectedEntry {
   historyKey: string;
 }
 
+/**
+ * Build the unified merged session view: tracked sessions (Phase 1) +
+ * alive-but-untracked PIDs (Phase 2) + history-only JSONLs (Phase 3) +
+ * Codex sessions (Phase 4), with pending-actions status overlay applied.
+ *
+ * This is the single source of truth for "what sessions exist". Both the
+ * phone-facing `handleListSessions` and the local-introspection
+ * `api_sessions` derive their output by projecting from this same merged
+ * view, so the two channels can never diverge on what counts as a session.
+ */
+export async function buildMergedSessionView(
+  ctx: Pick<CommandContext, 'resolveExternalSessionId'>,
+  deps: ListSessionsDeps,
+): Promise<CollectedEntry[]> {
+  const discoveredSessions = deps.getCachedSessions() ?? await deps.discoverSessions();
+  const allSessions: CollectedEntry[] = [];
+  const claimedPids = new Set<number>();
+  const claimedSessionIds = new Set<string>();
+
+  const runningAll = deps.getRunningAllSessions();
+  const pidNameByPid = new Map<number, string>();
+  for (const r of runningAll) {
+    if (r.name) pidNameByPid.set(r.pid, r.name);
+  }
+
+  const activeSessions = deps.getAllTrackedSessions();
+  collectTrackedSessions(activeSessions, ctx, deps, pidNameByPid, allSessions, claimedPids, claimedSessionIds);
+  collectAlivePids(runningAll, discoveredSessions, deps, allSessions, claimedPids, claimedSessionIds);
+  collectHistorySessions(discoveredSessions, deps, allSessions, claimedSessionIds);
+  collectCodexSessions(deps, allSessions, claimedSessionIds);
+  overlayPendingActions(deps, allSessions);
+
+  allSessions.sort(compareSessions);
+  return allSessions;
+}
+
 export async function handleListSessions(
   ctx: Pick<CommandContext, 'sendToPhone' | 'sendError' | 'resolveExternalSessionId'>,
   deps: ListSessionsDeps,
@@ -98,41 +134,7 @@ export async function handleListSessions(
     const offset = command.offset ?? 0;
     const limit = command.limit ?? 20;
 
-    const discoveredSessions = deps.getCachedSessions() ?? await deps.discoverSessions();
-    const allSessions: CollectedEntry[] = [];
-    const claimedPids = new Set<number>();
-    const claimedSessionIds = new Set<string>();
-
-    const runningAll = deps.getRunningAllSessions();
-    const pidNameByPid = new Map<number, string>();
-    for (const r of runningAll) {
-      if (r.name) pidNameByPid.set(r.pid, r.name);
-    }
-
-    const activeSessions = deps.getAllTrackedSessions();
-    fs.appendFileSync(
-      DEBUG_LOG_PATH,
-      `${formatTimestamp()} handleListSessions: Phase 1 has ${activeSessions.length} sessions: ${activeSessions
-        .map((s) => `${s.claudeSessionId?.slice(0, 8)}(status=${s.status},pid=${s.terminalPid})`)
-        .join(', ')}\n`,
-    );
-
-    collectTrackedSessions(activeSessions, ctx, deps, pidNameByPid, allSessions, claimedPids, claimedSessionIds);
-
-    fs.appendFileSync(
-      DEBUG_LOG_PATH,
-      `${formatTimestamp()} handleListSessions: Phase 2 has ${runningAll.length} running PIDs: ${runningAll
-        .map((s) => `pid=${s.pid},sid=${s.sessionId.slice(0, 8)}`)
-        .join(', ')}\n`,
-    );
-
-    collectAlivePids(runningAll, discoveredSessions, deps, allSessions, claimedPids, claimedSessionIds);
-    collectHistorySessions(discoveredSessions, deps, allSessions, claimedSessionIds);
-    collectCodexSessions(deps, allSessions, claimedSessionIds);
-
-    overlayPendingActions(deps, allSessions);
-
-    allSessions.sort(compareSessions);
+    const allSessions = await buildMergedSessionView(ctx, deps);
 
     const totalCount = allSessions.length;
     const pageSlice = allSessions.slice(offset, offset + limit);

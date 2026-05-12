@@ -89,6 +89,7 @@ import {
 } from './commands/handlers/send-message.js';
 import {
   handleListSessions as handleListSessionsExternal,
+  buildMergedSessionView,
   type ListSessionsDeps,
 } from './commands/handlers/list-sessions.js';
 import {
@@ -762,6 +763,7 @@ export class AgentPocketDaemon extends EventEmitter {
       apiSessions: {
         sessionManager: this.sessionManager,
         getRelayClient: () => this.relayClient,
+        getMergedSessionView: () => buildMergedSessionView(this.commandContext(), this.listSessionsDeps()),
       },
       apiStatus: {
         sessionManager: this.sessionManager,
