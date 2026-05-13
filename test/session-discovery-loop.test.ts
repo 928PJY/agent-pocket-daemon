@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { __test_passesStandalonePidNewerPick as passes } from '../src/wiring/session-discovery-loop.js';
+import { passesStandalonePidNewerPick as passes } from '../src/wiring/adoption-guards.js';
 import { BindingJournal } from '../src/persistence/binding-journal.js';
 import type { DiscoveredSession, RunningCliSession } from '../src/discovery/session-discovery.js';
 

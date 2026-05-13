@@ -112,11 +112,19 @@ export interface BindingJournalDeps {
 // Journal class
 // ---------------------------------------------------------------------------
 
+/** Soft warning threshold: a healthy journal stays well under this thanks to
+ *  per-100-tick compaction (compaction config lives at the call site, not here).
+ *  If we cross this line, compaction is likely misconfigured or skipped — emit
+ *  one warning per process so the regression is visible in logs. */
+const SOFT_CAP_LINES = 5_000;
+
 export class BindingJournal {
   private readonly filePath: string;
   private readonly fs: NonNullable<BindingJournalDeps['fsModule']>;
   private readonly now: () => number;
   private readonly jsonlExists: (p: string) => boolean;
+  /** Once-per-process flag so the soft-cap warning isn't spammed every read. */
+  private softCapWarned = false;
 
   constructor(deps: BindingJournalDeps = {}) {
     this.filePath = deps.filePath ?? DEFAULT_BINDING_JOURNAL_PATH;
@@ -196,6 +204,13 @@ export class BindingJournal {
       } catch {
         // skip malformed line
       }
+    }
+    if (events.length > SOFT_CAP_LINES && !this.softCapWarned) {
+      this.softCapWarned = true;
+      logger.warn(
+        'binding-journal',
+        `journal has ${events.length} events (soft cap ${SOFT_CAP_LINES}); compaction may be misconfigured or skipped`,
+      );
     }
     return events;
   }

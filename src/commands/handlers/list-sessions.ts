@@ -14,7 +14,6 @@
 // state in via `ListSessionsDeps` and replacing `this.<helper>` with the
 // corresponding dep callback.
 
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type {
   PcEvent,
@@ -28,7 +27,7 @@ import type { DiscoveredSession, HistoryPage, RunningCliSession } from '../../di
 import type { SessionState } from '../../sessions/session-manager.js';
 import type { CodexTerminalTargetEntry } from '../../codex/codex-handler.js';
 import { getLatestSessionMapEntryForPid } from '../../utils/session-map.js';
-import { formatTimestamp, logger } from '../../logger.js';
+import { logger } from '../../logger.js';
 
 /** Subset of the daemon's pendingBlockingRequests map used by list_sessions. */
 export interface PendingBlockingEntry {
@@ -70,7 +69,6 @@ export interface ListSessionsDeps {
   getBindingJournal?: () => { lastObserveForJsonl: (jsonlPath: string) => { pid: number } | undefined } | null;
 }
 
-const DEBUG_LOG_PATH = '/tmp/daemon-debug.log';
 const CLAUDE_CODE_CAPABILITIES = [
   'observe', 'terminal_remote_message', 'terminal_interrupt',
   'permissions', 'plan_review', 'user_question',
@@ -129,7 +127,6 @@ export async function handleListSessions(
   deps: ListSessionsDeps,
   command: ListSessionsCommand,
 ): Promise<void> {
-  fs.appendFileSync(DEBUG_LOG_PATH, `${formatTimestamp()} handleListSessions CALLED\n`);
   try {
     const offset = command.offset ?? 0;
     const limit = command.limit ?? 20;

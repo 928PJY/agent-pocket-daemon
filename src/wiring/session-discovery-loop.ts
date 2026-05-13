@@ -5,6 +5,24 @@
 // the discovery loop and reconcile the daemon's observation state with the
 // CLI's PID/JSONL files (Claude) or rollout files (Codex).
 //
+// Bug context referenced inline below as "Anomaly A/B" (originally tracked
+// in a now-deleted investigation doc):
+//
+//   Anomaly A — orphan-JSONL misbind. A fresh-mtime JSONL in the same
+//     project dir as an observed PID got mis-adopted as that PID's new
+//     session, even though it was actually a graveyard file from a dead
+//     `claude --resume <name>` invocation. Fixed via session-map
+//     corroboration in `passesAdoptionGuard` (observed-session newer-pick)
+//     and live PID-JSON corroboration in `passesStandalonePidNewerPick`
+//     (cold-start standalone-PID newer-pick).
+//
+//   Anomaly B — invisible PID. After a transient zombie/suspended check
+//     historified an observed session, the standalone-PID branch failed to
+//     re-observe the still-alive PID because PID JSON named the same sid
+//     that was just historified. Fixed via the binding-journal
+//     `lastObserveForPid` rescue path that re-promotes the historified
+//     record back to observed.
+//
 // Heavy logic preserved verbatim (the /clear detection, PID-mismatch
 // re-observation, and session-map.json fallback in Claude). Tests can
 // inject the session-map helpers + sessionDiscovery to drive scenarios
@@ -20,9 +38,10 @@ import {
 import type { SessionManager } from '../sessions/session-manager.js';
 import type { BindingJournal } from '../persistence/binding-journal.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
-import type { SessionDiscovery, DiscoveredSession, RunningCliSession } from '../discovery/session-discovery.js';
+import type { SessionDiscovery } from '../discovery/session-discovery.js';
 import type { CodexDiscovery, CodexSession } from '../discovery/codex-discovery.js';
 import { CodexObserver } from '../observers/codex-observer.js';
+import { passesAdoptionGuard, passesStandalonePidNewerPick } from './adoption-guards.js';
 import { logger } from '../logger.js';
 
 // ---------------------------------------------------------------------------
@@ -87,49 +106,20 @@ export interface ClaudeDiscoveryDeps {
  * by an earlier (pre-fix) daemon run that mis-bound the same orphan JSONL
  * onto this PID, and that misbind would then perpetuate across restarts.
  *
+ * Degradation window: between daemon start and the first SessionStart hook
+ * delivery, session-map.json may not yet contain the post-/clear (sid, pid)
+ * pair. This guard returns false in that window; the standalone-PID branch
+ * (~line 360 below) will pick up the new sid via PID JSON instead, so the
+ * session is not lost — the user just sees a brief "old session ended → new
+ * session appeared" instead of a smooth in-place adoption. Acceptable UX
+ * cost for correctness.
+ *
  * If session-map data is unavailable (legacy / test path), fall back to the
  * permissive behavior so existing fixtures aren't disturbed.
- */
-function passesAdoptionGuard(
-  jsonlSessionId: string,
-  pid: number,
-  sessionMap: Record<string, { pid?: number }> | null | undefined,
-): boolean {
-  if (!sessionMap) return true;
-  const entry = sessionMap[jsonlSessionId];
-  return entry?.pid === pid;
-}
-
-/**
- * Cold-start standalone-PID newer-pick guard. The newer-pick at the standalone
- * branch happily promoted whichever fresh JSONL shared a project dir with the
- * PID's primary JSONL — including orphan graveyard files left behind by dead
- * `claude --resume <name>` invocations whose mtime got bumped by some other
- * process. The journal-aware version refuses orphans and journal poisoning:
  *
- *  - Require live PID-JSON corroboration that THIS pid currently owns
- *    `d.sessionId` (i.e. the candidate appears in `runningCli` for this PID).
- *    The journal alone is not enough — a previous (buggy) daemon run can
- *    have written observe events for an orphan JSONL onto this PID, and
- *    blindly trusting that record perpetuates the misbind across restarts.
- *  - When no journal is wired (legacy / test fallback), behave as before
- *    (no extra check).
- *
- * The /clear case (PID JSON sessionId rotates to a brand-new sid) still
- * passes: the new sid IS in `runningCli` for this PID by definition.
+ * (Implementation lives in `./adoption-guards.ts` so unit tests can target
+ * it as public API.)
  */
-function passesStandalonePidNewerPick(
-  d: DiscoveredSession,
-  pid: number,
-  runningCli: ReadonlyArray<RunningCliSession>,
-  journal: BindingJournal | null | undefined,
-): boolean {
-  if (!journal) return true;
-  return runningCli.some(c => c.pid === pid && c.sessionId === d.sessionId);
-}
-
-// Exported for unit tests. The runtime path uses the local symbol.
-export const __test_passesStandalonePidNewerPick = passesStandalonePidNewerPick;
 
 export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Promise<void> {
   const stat = deps.statSyncFn ?? ((p: string) => fs.statSync(p));
