@@ -14,7 +14,6 @@
 // state in via `ListSessionsDeps` and replacing `this.<helper>` with the
 // corresponding dep callback.
 
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type {
   PcEvent,
@@ -28,7 +27,7 @@ import type { DiscoveredSession, HistoryPage, RunningCliSession } from '../../di
 import type { SessionState } from '../../sessions/session-manager.js';
 import type { CodexTerminalTargetEntry } from '../../codex/codex-handler.js';
 import { getLatestSessionMapEntryForPid } from '../../utils/session-map.js';
-import { formatTimestamp, logger } from '../../logger.js';
+import { logger } from '../../logger.js';
 
 /** Subset of the daemon's pendingBlockingRequests map used by list_sessions. */
 export interface PendingBlockingEntry {
@@ -64,9 +63,12 @@ export interface ListSessionsDeps {
   // ── Daemon static / state ───────────────────────────────────────────────
   replacedSessionIds: Set<string>;
   claudeAgentVersion: string | undefined;
+  // Optional: only present once binding-journal wiring lands. Used to
+  // suppress phantom Phase-2 rows whose JSONL has been adopted by a
+  // different live PID (Anomaly B's `528fcedd-104` ghost).
+  getBindingJournal?: () => { lastObserveForJsonl: (jsonlPath: string) => { pid: number } | undefined } | null;
 }
 
-const DEBUG_LOG_PATH = '/tmp/daemon-debug.log';
 const CLAUDE_CODE_CAPABILITIES = [
   'observe', 'terminal_remote_message', 'terminal_interrupt',
   'permissions', 'plan_review', 'user_question',
@@ -84,51 +86,52 @@ interface CollectedEntry {
   historyKey: string;
 }
 
+/**
+ * Build the unified merged session view: tracked sessions (Phase 1) +
+ * alive-but-untracked PIDs (Phase 2) + history-only JSONLs (Phase 3) +
+ * Codex sessions (Phase 4), with pending-actions status overlay applied.
+ *
+ * This is the single source of truth for "what sessions exist". Both the
+ * phone-facing `handleListSessions` and the local-introspection
+ * `api_sessions` derive their output by projecting from this same merged
+ * view, so the two channels can never diverge on what counts as a session.
+ */
+export async function buildMergedSessionView(
+  ctx: Pick<CommandContext, 'resolveExternalSessionId'>,
+  deps: ListSessionsDeps,
+): Promise<CollectedEntry[]> {
+  const discoveredSessions = deps.getCachedSessions() ?? await deps.discoverSessions();
+  const allSessions: CollectedEntry[] = [];
+  const claimedPids = new Set<number>();
+  const claimedSessionIds = new Set<string>();
+
+  const runningAll = deps.getRunningAllSessions();
+  const pidNameByPid = new Map<number, string>();
+  for (const r of runningAll) {
+    if (r.name) pidNameByPid.set(r.pid, r.name);
+  }
+
+  const activeSessions = deps.getAllTrackedSessions();
+  collectTrackedSessions(activeSessions, ctx, deps, pidNameByPid, allSessions, claimedPids, claimedSessionIds);
+  collectAlivePids(runningAll, discoveredSessions, deps, allSessions, claimedPids, claimedSessionIds);
+  collectHistorySessions(discoveredSessions, deps, allSessions, claimedSessionIds);
+  collectCodexSessions(deps, allSessions, claimedSessionIds);
+  overlayPendingActions(deps, allSessions);
+
+  allSessions.sort(compareSessions);
+  return allSessions;
+}
+
 export async function handleListSessions(
   ctx: Pick<CommandContext, 'sendToPhone' | 'sendError' | 'resolveExternalSessionId'>,
   deps: ListSessionsDeps,
   command: ListSessionsCommand,
 ): Promise<void> {
-  fs.appendFileSync(DEBUG_LOG_PATH, `${formatTimestamp()} handleListSessions CALLED\n`);
   try {
     const offset = command.offset ?? 0;
     const limit = command.limit ?? 20;
 
-    const discoveredSessions = deps.getCachedSessions() ?? await deps.discoverSessions();
-    const allSessions: CollectedEntry[] = [];
-    const claimedPids = new Set<number>();
-    const claimedSessionIds = new Set<string>();
-
-    const runningAll = deps.getRunningAllSessions();
-    const pidNameByPid = new Map<number, string>();
-    for (const r of runningAll) {
-      if (r.name) pidNameByPid.set(r.pid, r.name);
-    }
-
-    const activeSessions = deps.getAllTrackedSessions();
-    fs.appendFileSync(
-      DEBUG_LOG_PATH,
-      `${formatTimestamp()} handleListSessions: Phase 1 has ${activeSessions.length} sessions: ${activeSessions
-        .map((s) => `${s.claudeSessionId?.slice(0, 8)}(status=${s.status},pid=${s.terminalPid})`)
-        .join(', ')}\n`,
-    );
-
-    collectTrackedSessions(activeSessions, ctx, deps, pidNameByPid, allSessions, claimedPids, claimedSessionIds);
-
-    fs.appendFileSync(
-      DEBUG_LOG_PATH,
-      `${formatTimestamp()} handleListSessions: Phase 2 has ${runningAll.length} running PIDs: ${runningAll
-        .map((s) => `pid=${s.pid},sid=${s.sessionId.slice(0, 8)}`)
-        .join(', ')}\n`,
-    );
-
-    collectAlivePids(runningAll, discoveredSessions, deps, allSessions, claimedPids, claimedSessionIds);
-    collectHistorySessions(discoveredSessions, deps, allSessions, claimedSessionIds);
-    collectCodexSessions(deps, allSessions, claimedSessionIds);
-
-    overlayPendingActions(deps, allSessions);
-
-    allSessions.sort(compareSessions);
+    const allSessions = await buildMergedSessionView(ctx, deps);
 
     const totalCount = allSessions.length;
     const pageSlice = allSessions.slice(offset, offset + limit);
@@ -272,6 +275,18 @@ function collectAlivePids(
     if (exactMatch) {
       lastActivity = exactMatch.lastModified;
       customTitle = exactMatch.customTitle;
+    }
+
+    // Phase-2 phantom suppression (Anomaly B defense in depth): if the
+    // binding journal records a different PID as the most recent observer
+    // of this JSONL, the row is a stale ghost — skip it. The live PID's
+    // legitimate row will still be included via its own iteration.
+    if (exactMatch) {
+      const journal = deps.getBindingJournal?.();
+      const lastObs = journal?.lastObserveForJsonl(exactMatch.filePath);
+      if (lastObs && lastObs.pid !== pidInfo.pid) {
+        continue;
+      }
     }
 
     out.push({

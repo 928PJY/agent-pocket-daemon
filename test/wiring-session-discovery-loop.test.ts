@@ -384,6 +384,9 @@ test('claude /clear: detects new JSONL when current file is stale + PID alive', 
       { sessionId: 'old-claude', projectDir: '/proj', lastModified: 100, filePath: '/proj/.claude/old.jsonl' },
       { sessionId: 'cleared-new', projectDir: '/proj', lastModified: 500, filePath: '/proj/.claude/new.jsonl' },
     ],
+    // SessionStart hook recorded the new (sessionId, pid) pair on /clear —
+    // this is the authoritative signal the adoption guard now requires.
+    sessionMap: { 'cleared-new': { pid: 4242, cwd: '/proj', timestamp: 1 } },
     sessions: [observed],
     fakeStat: new Map([['/proj/.claude/old.jsonl', { mtimeMs: 0 }]]),
     alivePids: [4242],
@@ -468,6 +471,34 @@ test('claude /clear: skipped when newer JSONL belongs to a different running PID
   await discoverAndObserveSessions(f.deps);
   // Should NOT treat as /clear of A (B is owned by another PID).
   assert.equal(f.sentEvents.filter(e => (e as { type?: string }).type === 'session_ended').length, 0);
+});
+
+test('claude /clear: rejects orphan JSONL not in session-map (Anomaly A guard)', async () => {
+  // The candidate `orphan-sid` has a fresh mtime in the same project dir but
+  // SessionStart hook never recorded it — the new adoption guard must reject
+  // it. Without the guard, the daemon would mis-bind PID 4242 to the orphan
+  // JSONL (the bug originally reported as Anomaly A).
+  const observed: FakeSession = {
+    sessionId: 'internal-old', claudeSessionId: 'old-claude', isObserved: true,
+    terminalPid: 4242, workingDirectory: '/proj', lastActivity: 100,
+    observer: { jsonlPath: '/proj/.claude/old.jsonl' },
+  };
+  const f = makeClaudeFixture({
+    runningCli: [{ pid: 4242, sessionId: 'old-claude', cwd: '/proj', entrypoint: 'claude' }],
+    discovered: [
+      { sessionId: 'old-claude', projectDir: '/proj', lastModified: 100, filePath: '/proj/.claude/old.jsonl' },
+      { sessionId: 'orphan-sid', projectDir: '/proj', lastModified: 500, filePath: '/proj/.claude/orphan.jsonl' },
+    ],
+    sessionMap: { 'unrelated-sid': { pid: 9999, cwd: '/elsewhere', timestamp: 1 } },
+    sessions: [observed],
+    fakeStat: new Map([['/proj/.claude/old.jsonl', { mtimeMs: 0 }]]),
+    alivePids: [4242],
+    now: 1_000_000_000,
+  });
+  await discoverAndObserveSessions(f.deps);
+  assert.equal(f.sentEvents.length, 0);
+  assert.equal(f.replacedSessionIds.has('old-claude'), false);
+  assert.equal(f.observeCalls.find(o => o.claudeSessionId === 'orphan-sid'), undefined);
 });
 
 // ---------------------------------------------------------------------------

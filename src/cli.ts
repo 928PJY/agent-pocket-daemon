@@ -7,8 +7,6 @@ import type { ConnectionMode } from 'agent-pocket-protocol';
 import { VERSION } from './version.js';
 import { AgentPocketDaemon } from './index.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
-import { CodexDiscovery } from './discovery/codex-discovery.js';
-import type { CodexLiveSession, CodexSession } from './discovery/codex-discovery.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { LanServer } from './lan/lan-server.js';
 import { runLanPairing } from './lan/lan-pairing.js';
@@ -215,7 +213,7 @@ Commands:
   logs                     View daemon logs
   pair                     Generate QR code and pair with phone
   unpair                   Clear pairing and stop daemon
-  sessions                 List discoverable Claude Code sessions
+  sessions                 List active Claude/Codex sessions (use --include-history to also show history)
   panic                    Kill all Claude Code processes (emergency)
 
 Start options:
@@ -952,7 +950,8 @@ function formatSessionTitle(title?: string): string {
   return Array.from(title).slice(0, maxLength).join('');
 }
 
-async function cmdSessions(): Promise<void> {
+async function cmdSessions(flags: Record<string, string>): Promise<void> {
+  const includeHistory = flags['include-history'] === 'true';
   const { running } = isDaemonRunning();
   if (!running) {
     console.log('Daemon is not running. Start it with: agent-pocket start');
@@ -980,50 +979,34 @@ async function cmdSessions(): Promise<void> {
     return;
   }
 
-  const codexDiscovery = new CodexDiscovery();
-  const codexSessions = codexDiscovery.discoverSessions();
-  const liveCodexSessions = Array.from(codexDiscovery.discoverLiveSessions(codexSessions).values())
-    .map((live) => {
-      const session = codexSessions.find(s => s.sessionId === live.sessionId);
-      return session ? { live, session } : null;
-    })
-    .filter((entry): entry is { live: CodexLiveSession; session: CodexSession } => entry !== null);
+  if (!includeHistory) {
+    sessions = sessions.filter(s => s.status !== 'history');
+  }
 
-  if (sessions.length === 0 && liveCodexSessions.length === 0) {
-    console.log('No active sessions tracked by daemon.');
+  if (sessions.length === 0) {
+    console.log(includeHistory
+      ? 'No sessions tracked by daemon.'
+      : 'No active sessions tracked by daemon. Pass --include-history to also list history.');
     return;
   }
 
-  const claudeRows = sessions.map(s => ({
-    Agent: 'Claude',
+  const rows = sessions.map(s => ({
+    Agent: s.sessionId.startsWith('codex:') ? 'Codex' : 'Claude',
     PID: s.pid ?? '-',
     TTY: s.pid ? getTtyForPid(s.pid) ?? '-' : '-',
-    'Session ID': s.sessionId.slice(0, 8) + '...',
+    'Session ID': s.sessionId.slice(0, 14) + '...',
     Status: s.status,
     Type: s.entrypoint ?? '-',
     Title: formatSessionTitle(s.customTitle),
     CWD: s.cwd.replace(os.homedir(), '~'),
     Mode: s.isObserved ? 'observer' : 'controller',
     'Last Activity': formatLocalLastActivity(s.lastActivity),
-  }));
+  })).sort((a, b) => String(a.Agent).localeCompare(String(b.Agent)) || Number(a.PID) - Number(b.PID));
 
-  const codexRows = liveCodexSessions.map(({ live, session }) => ({
-    Agent: 'Codex',
-    PID: live.pid,
-    TTY: getTtyForPid(live.pid) ?? '-',
-    'Session ID': session.sessionId.slice(0, 14) + '...',
-    Status: 'ready',
-    Type: 'codex-cli',
-    Title: formatSessionTitle(session.title),
-    CWD: session.cwd.replace(os.homedir(), '~'),
-    Mode: 'observer',
-    'Last Activity': formatLocalLastActivity(live.lastActivityMs),
-  }));
-
-  const rows = [...claudeRows, ...codexRows]
-    .sort((a, b) => String(a.Agent).localeCompare(String(b.Agent)) || Number(a.PID) - Number(b.PID));
-
-  console.log(`${rows.length} active session(s): ${claudeRows.length} Claude, ${codexRows.length} Codex\n`);
+  const claudeCount = rows.filter(r => r.Agent === 'Claude').length;
+  const codexCount = rows.filter(r => r.Agent === 'Codex').length;
+  const suffix = includeHistory ? '' : ' (history hidden; pass --include-history to show)';
+  console.log(`${rows.length} session(s): ${claudeCount} Claude, ${codexCount} Codex${suffix}\n`);
   console.table(rows);
 }
 
@@ -1103,7 +1086,7 @@ async function main(): Promise<void> {
       await cmdPair(flags);
       break;
     case 'sessions':
-      await cmdSessions();
+      await cmdSessions(flags);
       break;
     case 'panic':
     case 'emergency-lockdown':

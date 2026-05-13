@@ -161,13 +161,40 @@ export interface ApiInspectionDeps {
    * connection-mode toggle, so we don't want to capture a snapshot here.
    */
   getRelayClient(): Pick<RelayClient, 'getConnectionState' | 'getPhonePeerOnline' | 'getOfflineQueueSize'> | null;
+  /**
+   * Build the unified merged session view (Phase 1+2+3+Codex+overlay).
+   * `api_sessions` projects from this so that local CLI introspection
+   * agrees with what the phone gets via `session_list`. Fallback path
+   * when omitted: the legacy flat `sessionManager.getAllSessions()` map
+   * (kept for tests + bring-up; production should always wire this).
+   */
+  getMergedSessionView?: () => Promise<ReadonlyArray<{ entry: Record<string, unknown> }>>;
 }
 
 export function registerApiSessionsHandler(
   hooks: HookGateway,
-  deps: Pick<ApiInspectionDeps, 'sessionManager'>,
+  deps: Pick<ApiInspectionDeps, 'sessionManager' | 'getMergedSessionView'>,
 ): void {
-  hooks.on('api_sessions', (respond: (sessions: unknown) => void) => {
+  hooks.on('api_sessions', async (respond: (sessions: unknown) => void) => {
+    if (deps.getMergedSessionView) {
+      try {
+        const merged = await deps.getMergedSessionView();
+        const sessions = merged.map(({ entry }) => ({
+          sessionId: entry.session_id,
+          status: entry.status,
+          pid: entry.pid,
+          cwd: entry.working_directory,
+          isObserved: entry.is_observed ?? false,
+          customTitle: entry.project_name,
+          entrypoint: entry.entrypoint,
+          lastActivity: entry.last_activity,
+        }));
+        respond(sessions);
+        return;
+      } catch (err) {
+        logger.warn('daemon', `api_sessions: merged view failed, falling back to flat map: ${(err as Error).message}`);
+      }
+    }
     const sessions = deps.sessionManager.getAllSessions().map(s => ({
       sessionId: s.claudeSessionId ?? s.sessionId,
       status: s.status,
