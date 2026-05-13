@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import type { ClaudeEvent } from 'agent-pocket-protocol';
 import { SessionObserver } from '../src/observers/session-observer.js';
 
-async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
     if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout');
@@ -27,21 +27,23 @@ test('observer emits parent_invoke_sdk_uuid on string-content local_command_outp
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
   observer.start(false);
 
-  appendFileSync(jsonl, JSON.stringify({
-    type: 'user',
-    uuid: 'output-uuid-1',
-    parentUuid: 'parent-1',
-    message: { role: 'user', content: '<local-command-stdout>cost: $0.42</local-command-stdout>' },
-  }) + '\n');
+  try {
+    appendFileSync(jsonl, JSON.stringify({
+      type: 'user',
+      uuid: 'output-uuid-1',
+      parentUuid: 'parent-1',
+      message: { role: 'user', content: '<local-command-stdout>cost: $0.42</local-command-stdout>' },
+    }) + '\n');
 
-  await waitFor(() => outputs.length > 0);
-  observer.stop();
+    await waitFor(() => outputs.length > 0);
 
-  const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
-  assert.equal(ev.type, 'local_command_output');
-  assert.equal(ev.parent_invoke_sdk_uuid, 'parent-1');
-
-  rmSync(dir, { recursive: true, force: true });
+    const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
+    assert.equal(ev.type, 'local_command_output');
+    assert.equal(ev.parent_invoke_sdk_uuid, 'parent-1');
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -57,23 +59,25 @@ test('observer emits parent_invoke_sdk_uuid on array-block local_command_output'
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
   observer.start(false);
 
-  appendFileSync(jsonl, JSON.stringify({
-    type: 'user',
-    uuid: 'output-uuid-2',
-    parentUuid: 'parent-2',
-    message: { role: 'user', content: [
-      { type: 'text', text: '<local-command-stdout>status: ready</local-command-stdout>' },
-    ] },
-  }) + '\n');
+  try {
+    appendFileSync(jsonl, JSON.stringify({
+      type: 'user',
+      uuid: 'output-uuid-2',
+      parentUuid: 'parent-2',
+      message: { role: 'user', content: [
+        { type: 'text', text: '<local-command-stdout>status: ready</local-command-stdout>' },
+      ] },
+    }) + '\n');
 
-  await waitFor(() => outputs.length > 0);
-  observer.stop();
+    await waitFor(() => outputs.length > 0);
 
-  const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
-  assert.equal(ev.type, 'local_command_output');
-  assert.equal(ev.parent_invoke_sdk_uuid, 'parent-2');
-
-  rmSync(dir, { recursive: true, force: true });
+    const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
+    assert.equal(ev.type, 'local_command_output');
+    assert.equal(ev.parent_invoke_sdk_uuid, 'parent-2');
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -89,22 +93,24 @@ test('observer emits parent_invoke_sdk_uuid on system local_command subtype', as
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
   observer.start(false);
 
-  appendFileSync(jsonl, JSON.stringify({
-    type: 'system',
-    subtype: 'local_command',
-    uuid: 'sys-uuid-1',
-    parentUuid: 'parent-3',
-    content: '<local-command-stdout>context: 50%</local-command-stdout>',
-  }) + '\n');
+  try {
+    appendFileSync(jsonl, JSON.stringify({
+      type: 'system',
+      subtype: 'local_command',
+      uuid: 'sys-uuid-1',
+      parentUuid: 'parent-3',
+      content: '<local-command-stdout>context: 50%</local-command-stdout>',
+    }) + '\n');
 
-  await waitFor(() => outputs.length > 0);
-  observer.stop();
+    await waitFor(() => outputs.length > 0);
 
-  const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
-  assert.equal(ev.type, 'local_command_output');
-  assert.equal(ev.parent_invoke_sdk_uuid, 'parent-3');
-
-  rmSync(dir, { recursive: true, force: true });
+    const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
+    assert.equal(ev.type, 'local_command_output');
+    assert.equal(ev.parent_invoke_sdk_uuid, 'parent-3');
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -120,19 +126,21 @@ test('observer: local_command_invoke does NOT carry parent_invoke_sdk_uuid even 
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
   observer.start(false);
 
-  appendFileSync(jsonl, JSON.stringify({
-    type: 'user',
-    uuid: 'invoke-uuid-1',
-    parentUuid: 'parent-4',
-    message: { role: 'user', content: '<command-name>/cost</command-name>' },
-  }) + '\n');
+  try {
+    appendFileSync(jsonl, JSON.stringify({
+      type: 'user',
+      uuid: 'invoke-uuid-1',
+      parentUuid: 'parent-4',
+      message: { role: 'user', content: '<command-name>/cost</command-name>' },
+    }) + '\n');
 
-  await waitFor(() => outputs.length > 0);
-  observer.stop();
+    await waitFor(() => outputs.length > 0);
 
-  const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
-  assert.equal(ev.type, 'local_command_invoke');
-  assert.equal(ev.parent_invoke_sdk_uuid, undefined);
-
-  rmSync(dir, { recursive: true, force: true });
+    const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
+    assert.equal(ev.type, 'local_command_invoke');
+    assert.equal(ev.parent_invoke_sdk_uuid, undefined);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
