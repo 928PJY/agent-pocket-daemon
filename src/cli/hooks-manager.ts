@@ -187,9 +187,18 @@ m[session_id] = {
     'timestamp': now,
 }
 
-# Prune entries older than 1 hour
-cutoff = now - 3600
-m = {k: v for k, v in m.items() if v.get('timestamp', 0) > cutoff}
+# Prune entries whose recorded PID is no longer alive. We used to prune by
+# a 1-hour cutoff, but that lost evidence of /clear events that happened
+# while the daemon was down — the next SessionStart fired more than 1h
+# later would silently delete the older entry, leaving the daemon unable
+# to learn the real session id when it eventually started.
+def _alive(p):
+    try:
+        os.kill(int(p), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+m = {k: v for k, v in m.items() if _alive(v.get('pid'))}
 
 with open(map_file, 'w') as f:
     json.dump(m, f)
