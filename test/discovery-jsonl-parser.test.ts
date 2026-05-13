@@ -317,3 +317,47 @@ test('parseHistoryEntry: unknown type returns []', () => {
   assert.deepEqual(parseHistoryEntry({ type: 'system' }), []);
   assert.deepEqual(parseHistoryEntry({}), []);
 });
+
+// ---------------------------------------------------------------------------
+// parseHistoryEntry — parentUuid → parentInvokeSdkUuid
+// ---------------------------------------------------------------------------
+
+test('parseHistoryEntry: user row with <local-command-stdout> + parentUuid sets parentInvokeSdkUuid', () => {
+  const out = parseHistoryEntry({
+    type: 'user',
+    uuid: 'u-stdout-1',
+    parentUuid: 'parent-2',
+    timestamp: 't',
+    message: { content: '<local-command-stdout>cost: $0.42</local-command-stdout>' },
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].role, 'local_command_output');
+  assert.equal(out[0].content, 'cost: $0.42');
+  assert.equal(out[0].parentInvokeSdkUuid, 'parent-2');
+  assert.equal(out[0].sdkUuid, 'u-stdout-1');
+});
+
+test('parseHistoryEntry: system local_command subtype with parentUuid sets parentInvokeSdkUuid', () => {
+  const out = parseHistoryEntry({
+    type: 'system',
+    subtype: 'local_command',
+    uuid: 'sys-1',
+    parentUuid: 'parent-3',
+    content: '<local-command-stdout>context: 50%</local-command-stdout>',
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].role, 'local_command_output');
+  assert.equal(out[0].parentInvokeSdkUuid, 'parent-3');
+});
+
+test('parseHistoryEntry: local_command_invoke does NOT carry parentInvokeSdkUuid', () => {
+  const out = parseHistoryEntry({
+    type: 'user',
+    uuid: 'u-invoke-1',
+    parentUuid: 'parent-4',
+    message: { content: '<command-name>/cost</command-name>' },
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].role, 'local_command_invoke');
+  assert.equal(out[0].parentInvokeSdkUuid, undefined);
+});

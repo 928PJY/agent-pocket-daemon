@@ -101,6 +101,7 @@ export function flattenAgentEvent(
       flat.stdout = agentEvent.stdout;
       if (agentEvent.is_stderr) flat.is_stderr = true;
       if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
+      if (agentEvent.parent_invoke_sdk_uuid) flat.parent_invoke_sdk_uuid = agentEvent.parent_invoke_sdk_uuid;
       break;
 
     case 'compact_boundary':
@@ -197,6 +198,10 @@ export interface SendSessionHistoryDeps {
   phonePreferences: Pick<PhonePreferences, 'showToolUse'>;
   sendToPhone(event: PcEvent): void;
   hasPeerCapability(name: string): boolean;
+  /** Recent controller-mode slash command synths (live-emitted invoke +
+   *  output pairs that JSONL will also contain as `<command-name>` echoes).
+   *  Empty array means no suppression for this session. */
+  getControllerSlashSynthLog(claudeSessionId: string): Array<{ name: string; args: string; syntheticAtMs: number }>;
 }
 
 const LOCAL_COMMAND_HISTORY_ROLES = new Set([
@@ -205,6 +210,12 @@ const LOCAL_COMMAND_HISTORY_ROLES = new Set([
   'compact_boundary',
   'compact_summary',
 ]);
+
+/** Window between a controller-mode synth and its JSONL echo. Wide enough to
+ *  absorb SDK-side write delay; narrow enough that two real `/cost` calls a
+ *  few seconds apart still each surface (the consume-once semantics handles
+ *  pairing within the window). */
+const SYNTH_SUPPRESS_WINDOW_MS = 10_000;
 
 export function sendSessionHistory(
   deps: SendSessionHistoryDeps,
@@ -235,11 +246,47 @@ export function sendSessionHistory(
   }));
 
   const hasLocalCommandCap = deps.hasPeerCapability(PEER_CAPABILITIES.LOCAL_COMMAND);
+
+  // Build a per-call set of JSONL invoke uuids that are echoes of a
+  // controller-mode synthesis we already pushed live. We then drop those
+  // invokes plus any output rows whose parentInvokeSdkUuid points at a
+  // suppressed invoke. The synth log uses (name, args, ms) — we consume
+  // each entry once, so two real /cost calls 200ms apart still both
+  // surface (one suppressed, the next allowed through).
+  const synthLog = deps.getControllerSlashSynthLog(claudeSessionId).map((s) => ({ ...s, used: false }));
+  const suppressedInvokeUuids = new Set<string>();
+  for (const m of truncated) {
+    if (m.role !== 'local_command_invoke' || !m.sdkUuid) continue;
+    const ts = typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : Number(m.timestamp ?? 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    const match = synthLog.find((s) => !s.used
+      && s.name === m.localCommandName
+      && (s.args ?? '') === (m.localCommandArgs ?? '')
+      && Math.abs(ts - s.syntheticAtMs) <= SYNTH_SUPPRESS_WINDOW_MS);
+    if (match) {
+      match.used = true;
+      suppressedInvokeUuids.add(m.sdkUuid);
+      logger.info('history-debug', 'suppressing JSONL invoke echo of controller synth', {
+        sessionId: claudeSessionId,
+        name: m.localCommandName,
+        args: m.localCommandArgs ?? '',
+        deltaMs: ts - match.syntheticAtMs,
+        sdkUuid: m.sdkUuid,
+      });
+    }
+  }
+
   const filtered = truncated.filter((m) => {
     if (!deps.phonePreferences.showToolUse && (m.role === 'tool_use' || m.role === 'tool_result')) {
       return false;
     }
     if (!hasLocalCommandCap && LOCAL_COMMAND_HISTORY_ROLES.has(m.role)) {
+      return false;
+    }
+    if (m.role === 'local_command_invoke' && m.sdkUuid && suppressedInvokeUuids.has(m.sdkUuid)) {
+      return false;
+    }
+    if (m.role === 'local_command_output' && m.parentInvokeSdkUuid && suppressedInvokeUuids.has(m.parentInvokeSdkUuid)) {
       return false;
     }
     return true;

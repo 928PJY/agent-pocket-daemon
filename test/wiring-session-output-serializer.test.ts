@@ -239,6 +239,7 @@ function makeDeps(opts: {
     phonePreferences: { showToolUse: opts.showToolUse },
     sendToPhone: (e) => sent.push(e),
     hasPeerCapability: () => true,
+    getControllerSlashSynthLog: () => [],
   };
   return { deps, sent, sd, cd };
 }

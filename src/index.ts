@@ -1681,6 +1681,7 @@ export class AgentPocketDaemon extends EventEmitter {
         phonePreferences: this.phonePreferences,
         sendToPhone: (e) => this.sendToPhone(e),
         hasPeerCapability: (name) => this.hasPeerCapability(name),
+        getControllerSlashSynthLog: (id) => this.sessionManager.getControllerSlashSynthLog(id),
       },
       claudeSessionId,
       options,

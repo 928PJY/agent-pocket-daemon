@@ -418,6 +418,7 @@ export class SessionObserver extends EventEmitter {
 
       // Emit user text message
       const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+      const parentInvokeSdkUuid = typeof entry.parentUuid === 'string' ? entry.parentUuid : undefined;
       if (typeof message.content === 'string') {
         const localCmd = parseLocalCommandUserText(message.content);
         if (localCmd) {
@@ -430,6 +431,9 @@ export class SessionObserver extends EventEmitter {
               ...localCmd,
               ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
               ...(sdkUuid ? { sdkUuid } : {}),
+              ...(localCmd.type === 'local_command_output' && parentInvokeSdkUuid
+                ? { parent_invoke_sdk_uuid: parentInvokeSdkUuid }
+                : {}),
             });
           }
           return;
@@ -453,6 +457,9 @@ export class SessionObserver extends EventEmitter {
                   ...localCmd,
                   ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
                   ...(sdkUuid ? { sdkUuid } : {}),
+                  ...(localCmd.type === 'local_command_output' && parentInvokeSdkUuid
+                    ? { parent_invoke_sdk_uuid: parentInvokeSdkUuid }
+                    : {}),
                 });
               }
               continue;
@@ -504,10 +511,14 @@ export class SessionObserver extends EventEmitter {
       const localCmd = parseLocalCommandUserText(entry.content);
       if (localCmd && localCmd !== 'drop') {
         const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+        const parentInvokeSdkUuid = typeof entry.parentUuid === 'string' ? entry.parentUuid : undefined;
         this.emit('output', {
           ...localCmd,
           ...(entryTimestamp ? { timestamp: entryTimestamp } : {}),
           ...(sdkUuid ? { sdkUuid } : {}),
+          ...(localCmd.type === 'local_command_output' && parentInvokeSdkUuid
+            ? { parent_invoke_sdk_uuid: parentInvokeSdkUuid }
+            : {}),
         });
         // stdout/stderr signals the command finished — restore session to ready
         // so the phone's session list doesn't sit on the spinner indefinitely.

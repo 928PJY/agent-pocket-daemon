@@ -305,7 +305,7 @@ test('SessionManager bridges observed output and suppresses injected message ech
     const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
     const session = manager.getSession(sessionId)!;
 
-    session.injectedMessages.add('already-rendered');
+    session.injectedMessages.set('already-rendered', '');
     session.observer!.emit('output', { type: 'user_message', message: 'already-rendered' });
     session.observer!.emit('output', { type: 'assistant_message', message: 'visible' });
 

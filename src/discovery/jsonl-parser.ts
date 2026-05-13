@@ -44,6 +44,10 @@ type ParsedMessage = {
   localCommandArgs?: string;
   /** local_command_output: true when sourced from `<local-command-stderr>`. */
   localCommandIsStderr?: boolean;
+  /** local_command_output: source row's `parentUuid` — points at the
+   *  matching `<command-name>` row's `uuid`. Lets the phone pair invoke
+   *  + output even under non-monotonic ordering. */
+  parentInvokeSdkUuid?: string;
 };
 
 const HISTORY_TOOL_INPUT_VALUE_CAP = 2000;
@@ -67,6 +71,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
   const type = entry.type as string | undefined;
   const timestamp = entry.timestamp as string | undefined;
   const sdkUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+  const parentInvokeSdkUuid = typeof entry.parentUuid === 'string' ? entry.parentUuid : undefined;
 
   if (type === 'user') {
     const message = entry.message as { role?: string; content?: unknown } | undefined;
@@ -109,6 +114,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
         localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
         timestamp,
         sdkUuid,
+        parentInvokeSdkUuid,
       }];
     }
 
@@ -140,6 +146,7 @@ export function parseHistoryEntry(entry: Record<string, unknown>): ParsedMessage
           localCommandIsStderr: localCmd.is_stderr === true ? true : undefined,
           timestamp,
           sdkUuid,
+          parentInvokeSdkUuid,
         }];
       }
       if (localCmd?.type === 'local_command_invoke') {

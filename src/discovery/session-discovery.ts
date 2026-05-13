@@ -93,6 +93,11 @@ export interface HistoryMessage {
   localCommandArgs?: string;
   /** local_command_output: true when sourced from `<local-command-stderr>`. */
   localCommandIsStderr?: boolean;
+  /** local_command_output: source row's `parentUuid` — points at the
+   *  matching `<command-name>` row's `uuid`. Lets the phone pair invoke
+   *  + output deterministically across non-monotonic ordering paths
+   *  (history backfill, multiple outputs interleaved). */
+  parentInvokeSdkUuid?: string;
   /**
    * Per-session monotonically increasing seq assigned in chronological
    * order when history is parsed from disk. Stable across calls (same
