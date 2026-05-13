@@ -5,6 +5,24 @@
 // the discovery loop and reconcile the daemon's observation state with the
 // CLI's PID/JSONL files (Claude) or rollout files (Codex).
 //
+// Bug context referenced inline below as "Anomaly A/B" (originally tracked
+// in a now-deleted investigation doc):
+//
+//   Anomaly A — orphan-JSONL misbind. A fresh-mtime JSONL in the same
+//     project dir as an observed PID got mis-adopted as that PID's new
+//     session, even though it was actually a graveyard file from a dead
+//     `claude --resume <name>` invocation. Fixed via session-map
+//     corroboration in `passesAdoptionGuard` (observed-session newer-pick)
+//     and live PID-JSON corroboration in `passesStandalonePidNewerPick`
+//     (cold-start standalone-PID newer-pick).
+//
+//   Anomaly B — invisible PID. After a transient zombie/suspended check
+//     historified an observed session, the standalone-PID branch failed to
+//     re-observe the still-alive PID because PID JSON named the same sid
+//     that was just historified. Fixed via the binding-journal
+//     `lastObserveForPid` rescue path that re-promotes the historified
+//     record back to observed.
+//
 // Heavy logic preserved verbatim (the /clear detection, PID-mismatch
 // re-observation, and session-map.json fallback in Claude). Tests can
 // inject the session-map helpers + sessionDiscovery to drive scenarios
@@ -18,9 +36,12 @@ import {
   type SessionEndedEvent,
 } from 'agent-pocket-protocol';
 import type { SessionManager } from '../sessions/session-manager.js';
+import type { BindingJournal } from '../persistence/binding-journal.js';
+import type { TerminalTarget } from '../pty/tmux-injector.js';
 import type { SessionDiscovery } from '../discovery/session-discovery.js';
 import type { CodexDiscovery, CodexSession } from '../discovery/codex-discovery.js';
 import { CodexObserver } from '../observers/codex-observer.js';
+import { passesAdoptionGuard, passesStandalonePidNewerPick } from './adoption-guards.js';
 import { logger } from '../logger.js';
 
 // ---------------------------------------------------------------------------
@@ -36,7 +57,20 @@ export interface ClaudeDiscoveryDeps {
     | 'observeSession'
     | 'removeSession'
     | 'markObservedSessionHistory'
-  >;
+  > & {
+    // Optional: only present once binding-journal wiring lands. Falsy on
+    // older callers / tests, in which case the orphan guard and standalone
+    // rescue degrade to legacy behavior.
+    getBindingJournal?: () => BindingJournal | null;
+    findByLastKnownPid?: (pid: number) => { sessionId: string; claudeSessionId?: string } | undefined;
+    rePromoteHistoryToObserved?: (
+      sessionId: string,
+      pid: number,
+      jsonlPath: string,
+      customTitle?: string,
+      terminalTarget?: TerminalTarget,
+    ) => boolean;
+  };
   /** Live reference — handler mutates with set/delete. */
   sessionIdMap: Map<string, string>;
   /** Live reference — handler mutates with add. */
@@ -60,6 +94,33 @@ export interface ClaudeDiscoveryDeps {
   nowFn?: () => number;
 }
 
+/**
+ * Anomaly A guard. A discovered JSONL file is safe to adopt onto an already
+ * observed `pid` only if the SessionStart hook ITSELF wrote that
+ * (sessionId, pid) pair into session-map.json. The hook is the single
+ * authoritative signal for /clear (and `--resume`), and Claude Code does NOT
+ * update `~/.claude/sessions/<pid>.json` on /clear, so PID JSON cannot be used
+ * as corroboration.
+ *
+ * The binding journal is intentionally NOT consulted here: it can be poisoned
+ * by an earlier (pre-fix) daemon run that mis-bound the same orphan JSONL
+ * onto this PID, and that misbind would then perpetuate across restarts.
+ *
+ * Degradation window: between daemon start and the first SessionStart hook
+ * delivery, session-map.json may not yet contain the post-/clear (sid, pid)
+ * pair. This guard returns false in that window; the standalone-PID branch
+ * (~line 360 below) will pick up the new sid via PID JSON instead, so the
+ * session is not lost — the user just sees a brief "old session ended → new
+ * session appeared" instead of a smooth in-place adoption. Acceptable UX
+ * cost for correctness.
+ *
+ * If session-map data is unavailable (legacy / test path), fall back to the
+ * permissive behavior so existing fixtures aren't disturbed.
+ *
+ * (Implementation lives in `./adoption-guards.ts` so unit tests can target
+ * it as public API.)
+ */
+
 export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Promise<void> {
   const stat = deps.statSyncFn ?? ((p: string) => fs.statSync(p));
   const kill = deps.killFn ?? ((pid: number, sig: number) => process.kill(pid, sig));
@@ -77,6 +138,14 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
     for (const cli of runningCli) {
       sessionIdsByPid.set(cli.sessionId, cli.pid);
     }
+
+    const sessionMapForGuard = (() => {
+      try {
+        return deps.readSessionMap();
+      } catch {
+        return null;
+      }
+    })();
 
     for (const session of observedSessions) {
       if (!session.observer || !session.terminalPid) continue;
@@ -103,7 +172,13 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         d.lastModified > (session.lastActivity || 0) &&
         d.filePath !== currentJsonlPath &&
         (!sessionIdsByPid.has(d.sessionId) || sessionIdsByPid.get(d.sessionId) === session.terminalPid) &&
-        !deps.replacedSessionIds.has(d.sessionId),
+        !deps.replacedSessionIds.has(d.sessionId) &&
+        // Anomaly A guard: only adopt if the SessionStart hook recorded this
+        // exact (sessionId, pid) pair in session-map.json. That's the
+        // authoritative /clear signal; without it, a fresh-mtime JSONL in the
+        // same project dir is just an orphan / graveyard file and adopting
+        // it produces the misbind reported in Anomaly A.
+        passesAdoptionGuard(d.sessionId, session.terminalPid!, sessionMapForGuard),
       );
 
       if (newerFile) {
@@ -111,7 +186,12 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         const cwd = session.workingDirectory;
         const target = session.terminalTarget;
 
-        logger.info('daemon', 'Detected /clear', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
+        logger.info('daemon', 'Adopted JSONL onto observed PID (verified)', { oldClaudeSessionId: session.claudeSessionId, newClaudeSessionId: newerFile.sessionId, pid });
+        deps.sessionManager.getBindingJournal?.()?.appendClear({
+          pid,
+          oldSessionId: session.claudeSessionId ?? '',
+          newSessionId: newerFile.sessionId,
+        });
 
         const oldInternalId = session.sessionId;
         const oldClaudeId = session.claudeSessionId;
@@ -126,7 +206,7 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
           deps.sendToPhone(endEvent);
         }
 
-        deps.sessionManager.markObservedSessionHistory(oldInternalId);
+        deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_replaced');
         deps.sessionIdMap.delete(oldInternalId);
         deps.sessionManager.removeSession(oldInternalId);
         if (oldClaudeId) deps.replacedSessionIds.add(oldClaudeId);
@@ -170,7 +250,7 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
           const oldInternalId = existingByPid.sessionId;
           const oldClaudeId = existingByPid.claudeSessionId;
 
-          deps.sessionManager.markObservedSessionHistory(oldInternalId);
+          deps.sessionManager.markObservedSessionHistory(oldInternalId, 'session_replaced');
           deps.sessionIdMap.delete(oldInternalId);
           deps.sessionManager.removeSession(oldInternalId);
           if (oldClaudeId) deps.replacedSessionIds.add(oldClaudeId);
@@ -240,7 +320,36 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
       }
 
       const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
-      if (!match) continue;
+      if (!match) {
+        // Standalone-PID rescue (Anomaly B): the CLI PID is alive but the
+        // JSONL discovery couldn't match it. Consult the binding journal —
+        // if we previously observed this PID and historified it (e.g. due
+        // to a transient zombie/suspended check), re-promote that record
+        // back to observed instead of leaving the PID invisible.
+        const journal = deps.sessionManager.getBindingJournal?.();
+        const lastObserve = journal?.lastObserveForPid(pidInfo.pid);
+        if (lastObserve) {
+          const historified = deps.sessionManager.findByLastKnownPid?.(pidInfo.pid);
+          if (historified && historified.claudeSessionId === lastObserve.claudeSessionId) {
+            const repromoted = deps.sessionManager.rePromoteHistoryToObserved?.(
+              historified.sessionId,
+              pidInfo.pid,
+              lastObserve.jsonlPath,
+              undefined,
+              pidInfo.terminalTarget,
+            );
+            if (repromoted) {
+              deps.sessionIdMap.set(historified.sessionId, lastObserve.claudeSessionId);
+              logger.info('daemon', 'Re-promoted historified session via binding journal', {
+                pid: pidInfo.pid,
+                claudeSessionId: lastObserve.claudeSessionId,
+              });
+              continue;
+            }
+          }
+        }
+        continue;
+      }
 
       let observeMatch = match;
       let observeSessionId = pidInfo.sessionId;
@@ -253,6 +362,12 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         .filter(d => !otherPidSids.has(d.sessionId))
         .filter(d => !deps.replacedSessionIds.has(d.sessionId))
         .filter(d => d.lastModified > match.lastModified)
+        .filter(d => passesStandalonePidNewerPick(
+          d,
+          pidInfo.pid,
+          runningCli,
+          deps.sessionManager.getBindingJournal?.(),
+        ))
         .sort((a, b) => b.lastModified - a.lastModified)[0];
       if (newer) {
         observeMatch = newer;
