@@ -4,7 +4,7 @@
 
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
-import type { RelayEnvelope, WakeBlobPayload } from 'agent-pocket-protocol';
+import type { RelayEnvelope, WakeBlobPayload, PeerHelloControlFrame } from 'agent-pocket-protocol';
 import { logger } from '../logger.js';
 import {
   RECONNECT_BASE_DELAY_MS,
@@ -13,6 +13,8 @@ import {
   OFFLINE_MESSAGE_MAX_COUNT,
   WIRE_VERSION_MIN,
   WIRE_VERSION_CURRENT,
+  RELAY_CONTROL_TYPE,
+  isPeerHelloControlFrame,
 } from 'agent-pocket-protocol';
 
 // ============================================================================
@@ -37,6 +39,7 @@ export interface RelayClientEvents {
   disconnected: [reason: string];
   message: [payload: unknown];
   error: [error: Error];
+  peer_hello: [hello: PeerHelloControlFrame];
 }
 
 // ============================================================================
@@ -211,6 +214,18 @@ export class RelayClient extends EventEmitter {
     this.ws.send(JSON.stringify({ type: '__peer_control', ...frame }));
   }
 
+  /**
+   * Send a `__relay_control` frame (cleartext, relay-visible) — used for
+   * actions the relay itself needs to inspect, e.g. `peer_hello` whose
+   * payload the relay caches and replays to the opposite peer on (re)connect.
+   * Distinct from `sendControlFrame()` which uses `__peer_control` and is
+   * forwarded by the relay opaquely to the other side.
+   */
+  sendRelayControlFrame(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: RELAY_CONTROL_TYPE, ...frame }));
+  }
+
   // --------------------------------------------------------------------------
   // Private
   // --------------------------------------------------------------------------
@@ -340,6 +355,22 @@ export class RelayClient extends EventEmitter {
             if (!wasOnline && this.phonePeerOnline) {
               this.emit('phone_online');
             }
+          }
+        }
+        if (parsed.action === 'peer_hello') {
+          const candidate = parsed as unknown as { type: typeof RELAY_CONTROL_TYPE; action: 'peer_hello' } & Record<string, unknown>;
+          if (isPeerHelloControlFrame(candidate)) {
+            logger.info('relay', 'Received peer_hello via relay control', {
+              product: candidate.product,
+              product_version: candidate.product_version,
+              wire: candidate.wire_version,
+              capabilities: candidate.capabilities,
+            });
+            this.emit('peer_hello', candidate);
+          } else {
+            logger.warn('relay', 'Malformed peer_hello control frame ignored', {
+              preview: JSON.stringify(parsed).slice(0, 200),
+            });
           }
         }
         return;

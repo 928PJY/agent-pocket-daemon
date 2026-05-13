@@ -129,12 +129,15 @@ test('decrypt_error: count === 3 fires sendE2EError exactly once', () => {
 // registerRelayConnectedHandler
 // ---------------------------------------------------------------------------
 
-test('relay_connected: emits connected callback', () => {
+test('relay_connected: sends peer_hello before emitting connected callback', () => {
   const t = makeTransport();
-  let n = 0;
-  registerRelayConnectedHandler(t, { emitConnected() { n++; } });
+  const order: string[] = [];
+  registerRelayConnectedHandler(t, {
+    sendPeerHello() { order.push('peer'); },
+    emitConnected() { order.push('connected'); },
+  });
   t.emit('connected');
-  assert.equal(n, 1);
+  assert.deepEqual(order, ['peer', 'connected']);
 });
 
 // ---------------------------------------------------------------------------
@@ -214,12 +217,14 @@ function makePhoneOnlineDeps(opts: {
   };
 }
 
-test('phone_online: with no pending entries, sends peer_hello + skips key_verify when fingerprint null', () => {
+test('phone_online: with no pending entries, sends no peer_hello + skips key_verify when fingerprint null', () => {
   const t = makeTransport();
   const { harness, deps } = makePhoneOnlineDeps({ fingerprint: null });
   registerPhoneOnlineHandler(t, deps);
   t.emit('phone_online');
-  assert.equal(harness.peerHellos, 1);
+  // peer_hello is no longer fired on phone_online — relay caches + replays
+  // it on the phone's connect, so re-emitting here would be redundant.
+  assert.equal(harness.peerHellos, 0);
   assert.equal(harness.controlFrames.length, 0);
   assert.equal(harness.resends.length, 0);
 });
