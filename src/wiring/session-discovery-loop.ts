@@ -20,7 +20,7 @@ import {
 import type { SessionManager } from '../sessions/session-manager.js';
 import type { BindingJournal } from '../persistence/binding-journal.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
-import type { SessionDiscovery } from '../discovery/session-discovery.js';
+import type { SessionDiscovery, DiscoveredSession, RunningCliSession } from '../discovery/session-discovery.js';
 import type { CodexDiscovery, CodexSession } from '../discovery/codex-discovery.js';
 import { CodexObserver } from '../observers/codex-observer.js';
 import { logger } from '../logger.js';
@@ -76,23 +76,60 @@ export interface ClaudeDiscoveryDeps {
 }
 
 /**
- * Anomaly A guard. A discovered JSONL file is safe to adopt onto `pid` only if
- * either (a) no other PID has ever observed it (journal silent), or
- * (b) the most-recent observer of that JSONL in the binding journal IS this
- * PID. Without the guard the discovery loop attaches whichever fresh JSONL
- * happens to share a project dir to whichever observed PID happens to be
- * present, producing the (pid, claudeSessionId) misbind reported in Anomaly A.
+ * Anomaly A guard. A discovered JSONL file is safe to adopt onto an already
+ * observed `pid` only if the SessionStart hook ITSELF wrote that
+ * (sessionId, pid) pair into session-map.json. The hook is the single
+ * authoritative signal for /clear (and `--resume`), and Claude Code does NOT
+ * update `~/.claude/sessions/<pid>.json` on /clear, so PID JSON cannot be used
+ * as corroboration.
+ *
+ * The binding journal is intentionally NOT consulted here: it can be poisoned
+ * by an earlier (pre-fix) daemon run that mis-bound the same orphan JSONL
+ * onto this PID, and that misbind would then perpetuate across restarts.
+ *
+ * If session-map data is unavailable (legacy / test path), fall back to the
+ * permissive behavior so existing fixtures aren't disturbed.
  */
-function passesOrphanAdoptionGuard(
-  jsonlPath: string,
+function passesAdoptionGuard(
+  jsonlSessionId: string,
   pid: number,
+  sessionMap: Record<string, { pid?: number }> | null | undefined,
+): boolean {
+  if (!sessionMap) return true;
+  const entry = sessionMap[jsonlSessionId];
+  return entry?.pid === pid;
+}
+
+/**
+ * Cold-start standalone-PID newer-pick guard. The newer-pick at the standalone
+ * branch happily promoted whichever fresh JSONL shared a project dir with the
+ * PID's primary JSONL — including orphan graveyard files left behind by dead
+ * `claude --resume <name>` invocations whose mtime got bumped by some other
+ * process. The journal-aware version refuses orphans and journal poisoning:
+ *
+ *  - Require live PID-JSON corroboration that THIS pid currently owns
+ *    `d.sessionId` (i.e. the candidate appears in `runningCli` for this PID).
+ *    The journal alone is not enough — a previous (buggy) daemon run can
+ *    have written observe events for an orphan JSONL onto this PID, and
+ *    blindly trusting that record perpetuates the misbind across restarts.
+ *  - When no journal is wired (legacy / test fallback), behave as before
+ *    (no extra check).
+ *
+ * The /clear case (PID JSON sessionId rotates to a brand-new sid) still
+ * passes: the new sid IS in `runningCli` for this PID by definition.
+ */
+function passesStandalonePidNewerPick(
+  d: DiscoveredSession,
+  pid: number,
+  runningCli: ReadonlyArray<RunningCliSession>,
   journal: BindingJournal | null | undefined,
 ): boolean {
   if (!journal) return true;
-  const last = journal.lastObserveForJsonl(jsonlPath);
-  if (!last) return true;
-  return last.pid === pid;
+  return runningCli.some(c => c.pid === pid && c.sessionId === d.sessionId);
 }
+
+// Exported for unit tests. The runtime path uses the local symbol.
+export const __test_passesStandalonePidNewerPick = passesStandalonePidNewerPick;
 
 export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Promise<void> {
   const stat = deps.statSyncFn ?? ((p: string) => fs.statSync(p));
@@ -111,6 +148,14 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
     for (const cli of runningCli) {
       sessionIdsByPid.set(cli.sessionId, cli.pid);
     }
+
+    const sessionMapForGuard = (() => {
+      try {
+        return deps.readSessionMap();
+      } catch {
+        return null;
+      }
+    })();
 
     for (const session of observedSessions) {
       if (!session.observer || !session.terminalPid) continue;
@@ -138,12 +183,12 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         d.filePath !== currentJsonlPath &&
         (!sessionIdsByPid.has(d.sessionId) || sessionIdsByPid.get(d.sessionId) === session.terminalPid) &&
         !deps.replacedSessionIds.has(d.sessionId) &&
-        // Three-state predicate (Anomaly A guard): only adopt an orphan JSONL
-        // onto this PID if either (a) no other PID has ever observed it, or
-        // (b) the most recent observer in the binding journal IS this PID.
-        // Without this, the daemon mis-binds a JSONL written by some other
-        // process to whichever observed PID happens to share the project dir.
-        passesOrphanAdoptionGuard(d.filePath, session.terminalPid!, deps.sessionManager.getBindingJournal?.()),
+        // Anomaly A guard: only adopt if the SessionStart hook recorded this
+        // exact (sessionId, pid) pair in session-map.json. That's the
+        // authoritative /clear signal; without it, a fresh-mtime JSONL in the
+        // same project dir is just an orphan / graveyard file and adopting
+        // it produces the misbind reported in Anomaly A.
+        passesAdoptionGuard(d.sessionId, session.terminalPid!, sessionMapForGuard),
       );
 
       if (newerFile) {
@@ -327,6 +372,12 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         .filter(d => !otherPidSids.has(d.sessionId))
         .filter(d => !deps.replacedSessionIds.has(d.sessionId))
         .filter(d => d.lastModified > match.lastModified)
+        .filter(d => passesStandalonePidNewerPick(
+          d,
+          pidInfo.pid,
+          runningCli,
+          deps.sessionManager.getBindingJournal?.(),
+        ))
         .sort((a, b) => b.lastModified - a.lastModified)[0];
       if (newer) {
         observeMatch = newer;
