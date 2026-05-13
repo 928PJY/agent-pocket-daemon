@@ -11,6 +11,7 @@ import type { EventEmitter } from 'node:events';
 import type {
   PcEvent,
   PeerHello,
+  PeerHelloControlFrame,
   PhoneCommand,
   ErrorEvent,
 } from 'agent-pocket-protocol';
@@ -109,11 +110,13 @@ export function registerDecryptErrorHandler(
 }
 
 // ---------------------------------------------------------------------------
-// Relay-only: 'connected' (no peer_hello — relay waits for 'phone_online')
+// Relay-only: 'connected' (also send our peer_hello so the relay caches it
+// for replay to the phone when it next reconnects)
 // ---------------------------------------------------------------------------
 
 export interface RelayConnectedDeps {
   emitConnected(): void;
+  sendPeerHello(): void;
 }
 
 export function registerRelayConnectedHandler(
@@ -123,6 +126,11 @@ export function registerRelayConnectedHandler(
   transport.on('connected', () => {
     logger.debug('daemon', '=== CONNECTED to relay ===');
     logger.info('daemon', 'Connected to relay');
+    // Push our hello as a relay-control frame; relay persists it and replays
+    // to the phone on its next connect. This makes capability negotiation a
+    // state the relay owns rather than something both sides re-emit on every
+    // online transition.
+    deps.sendPeerHello();
     deps.emitConnected();
   });
 }
@@ -175,7 +183,6 @@ export function registerDisconnectedHandler(
 export interface PhoneOnlineDeps {
   hookServer: Pick<HookServer, 'hasPendingPermission'>;
   sessionManager: Pick<SessionManager, 'getAllSessions'>;
-  sendPeerHello(): void;
   /** CryptoEngine.sendKeyFingerprint() — returns a fingerprint or null. */
   getKeyFingerprint(): string | null | undefined;
   /** Send a control frame on the relay (key_verify). */
@@ -206,7 +213,9 @@ export function registerPhoneOnlineHandler(
   transport.on('phone_online', () => {
     logger.debug('daemon', 'Phone online, resending pending requests', { count: deps.pendingBlockingRequests.size });
 
-    deps.sendPeerHello();
+    // peer_hello is no longer re-sent on phone_online — the relay caches our
+    // last hello and replays it to the phone immediately on its next connect,
+    // so reposting here would just be redundant traffic.
 
     const fp = deps.getKeyFingerprint();
     if (fp) {
@@ -272,6 +281,34 @@ export function registerPhoneOnlineHandler(
       }
     }
     logger.debug('daemon', `Resent ${resent} pending blocking requests`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Relay-only: 'peer_hello' (relay-control frame from the phone, replayed by
+// the relay from its Postgres cache or pushed live when the phone re-hellos)
+// ---------------------------------------------------------------------------
+
+export interface PeerHelloControlDeps {
+  handlePeerHello(payload: PeerHello): void;
+}
+
+export function registerPeerHelloControlHandler(
+  transport: TransportGateway,
+  deps: PeerHelloControlDeps,
+): void {
+  transport.on('peer_hello', (frame: PeerHelloControlFrame) => {
+    // The control-frame shape is a strict superset of the legacy PeerHello
+    // (action='peer_hello' lives only on the relay-control envelope), so we
+    // can hand it straight to the existing capability-merge logic.
+    deps.handlePeerHello({
+      type: 'peer_hello',
+      product: frame.product,
+      product_version: frame.product_version,
+      wire_version: frame.wire_version,
+      capabilities: frame.capabilities,
+      sent_at: frame.sent_at,
+    });
   });
 }
 

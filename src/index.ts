@@ -135,6 +135,7 @@ import {
   registerDisconnectedHandler,
   registerPhoneOnlineHandler,
   registerKeyVerifyHandler,
+  registerPeerHelloControlHandler,
 } from './wiring/transport-handlers.js';
 import {
   createNotificationBookkeeping,
@@ -185,6 +186,7 @@ import type {
   SyncCompleteEvent,
   ClaudeEvent,
   PeerHello,
+  PeerHelloControlFrame,
   SessionInfo,
   AgentType,
   WakeBlobPayload,
@@ -638,13 +640,17 @@ export class AgentPocketDaemon extends EventEmitter {
     });
 
     registerRelayConnectedHandler(relay, {
+      sendPeerHello: () => this.sendPeerHello(),
       emitConnected: () => this.emit('connected'),
+    });
+
+    registerPeerHelloControlHandler(relay, {
+      handlePeerHello: (p) => this.handlePeerHello(p),
     });
 
     registerPhoneOnlineHandler(relay, {
       hookServer: this.hookServer,
       sessionManager: this.sessionManager,
-      sendPeerHello: () => this.sendPeerHello(),
       getKeyFingerprint: () => this.cryptoEngine.sendKeyFingerprint(),
       sendControlFrame: (f) => relay.sendControlFrame(f),
       pendingBlockingRequests: this.pendingBlockingRequests,
@@ -1463,28 +1469,39 @@ export class AgentPocketDaemon extends EventEmitter {
   }
 
   /**
-   * Send our peer_hello over the active E2E channel. Caller must ensure the
-   * channel is up (relay phone_online or LAN connected). No-op otherwise.
+   * Send our peer_hello so the peer (and, for relay mode, the relay's per-pair
+   * cache) learns our current capabilities + version. On relay this is a
+   * cleartext `__relay_control` frame the relay persists and replays to the
+   * phone on its next connect; on LAN this stays a typed PeerHello event over
+   * the existing E2E channel since LAN has no relay to cache through.
    */
   private sendPeerHello(): void {
-    const hello: PeerHello = {
-      type: 'peer_hello',
-      product: 'daemon',
-      product_version: VERSION,
-      wire_version: WIRE_VERSION_CURRENT,
-      capabilities: [...CURRENT_PEER_CAPABILITIES],
-      sent_at: Date.now(),
-    };
-
     const mode = this.config.connectionMode ?? 'relay';
     if (mode === 'lan' && this.lanServer) {
+      const hello: PeerHello = {
+        type: 'peer_hello',
+        product: 'daemon',
+        product_version: VERSION,
+        wire_version: WIRE_VERSION_CURRENT,
+        capabilities: [...CURRENT_PEER_CAPABILITIES],
+        sent_at: Date.now(),
+      };
       this.lanServer.send(hello);
     } else if (this.relayClient) {
-      this.relayClient.send(hello);
+      const frame: PeerHelloControlFrame = {
+        type: '__relay_control',
+        action: 'peer_hello',
+        product: 'daemon',
+        product_version: VERSION,
+        wire_version: WIRE_VERSION_CURRENT,
+        capabilities: [...CURRENT_PEER_CAPABILITIES],
+        sent_at: Date.now(),
+      };
+      this.relayClient.sendRelayControlFrame(frame);
     } else {
       return;
     }
-    logger.debug('daemon', 'Sent peer_hello', { product_version: VERSION, wire: WIRE_VERSION_CURRENT, capabilities: [...CURRENT_PEER_CAPABILITIES] });
+    logger.debug('daemon', 'Sent peer_hello', { product_version: VERSION, wire: WIRE_VERSION_CURRENT, capabilities: [...CURRENT_PEER_CAPABILITIES], mode });
   }
 
   private handlePeerHello(hello: PeerHello): void {
