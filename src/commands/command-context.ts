@@ -56,5 +56,8 @@ export interface CommandContext {
 
   /** request_id -> internal session id (resolved when SDK assigns one). */
   readonly pendingSessionRequests: Map<string, string>;
+
+  /** Capability lookup against the *peer's* (phone's) advertised caps. */
+  hasPeerCapability(name: string): boolean;
 }
 

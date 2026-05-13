@@ -22,14 +22,17 @@ interface FakeSession { claudeSessionId?: string }
 function makeCtx(overrides: {
   sendSessionHistory?: (id: string, opts?: SendSessionHistoryOptions) => number | undefined;
   sessions?: FakeSession[];
+  capabilities?: Set<string>;
 } = {}) {
   const sentEvents: SentEvent[] = [];
   const sentErrors: SentError[] = [];
   const historyCalls: HistoryCall[] = [];
+  const caps = overrides.capabilities ?? new Set<string>();
   const ctx: CommandContext = {
     sendToPhone: (event) => { sentEvents.push({ event }); },
     sendError: (requestId, message, code) => { sentErrors.push({ requestId, message, code }); },
     resolveInternalSessionId: (id) => id,
+    resolveExternalSessionId: (id) => id,
     sendSessionHistory: (id, options) => {
       historyCalls.push({ sessionId: id, options });
       return overrides.sendSessionHistory ? overrides.sendSessionHistory(id, options) : undefined;
@@ -37,6 +40,9 @@ function makeCtx(overrides: {
     sessionManager: {
       getAllSessions: () => overrides.sessions ?? [],
     } as unknown as CommandContext['sessionManager'],
+    sessionIdMap: new Map(),
+    pendingSessionRequests: new Map(),
+    hasPeerCapability: (name) => caps.has(name),
   };
   return { ctx, sentEvents, sentErrors, historyCalls };
 }
@@ -253,4 +259,92 @@ test('handleSyncRequest filters out sessions without claudeSessionId', () => {
   handleSyncRequest(ctx, { type: 'sync_request', request_id: 'req-1' } as never);
   const ids = historyCalls.map((c) => c.sessionId);
   assert.deepEqual(ids, ['sess-a']);
+});
+
+test('handleSyncRequest with SYNC_SCOPED + mode=recent ignores daemon sessions not in cursors', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
+    sendSessionHistory: () => 99,
+    capabilities: new Set(['messages.sync_scoped']),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    mode: 'recent',
+    cursors: [{ session_id: 'sess-b', last_seq: 50 }],
+  } as never);
+
+  const ids = historyCalls.map((c) => c.sessionId);
+  // Only the cursored session is replayed; sess-a is dropped because the
+  // phone explicitly scoped its request and didn't include it.
+  assert.deepEqual(ids, ['sess-b']);
+});
+
+test('handleSyncRequest with SYNC_SCOPED but no mode=recent still unions with daemon sessions (back-compat)', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: () => 1,
+    capabilities: new Set(['messages.sync_scoped']),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    cursors: [{ session_id: 'sess-b', last_seq: 0 }],
+  } as never);
+
+  const ids = new Set(historyCalls.map((c) => c.sessionId));
+  // Without mode='recent', the cap alone doesn't change behavior — the
+  // daemon's own sessions are still unioned in. This protects old phones
+  // (or new phones explicitly asking for 'all') from losing data.
+  assert.ok(ids.has('sess-a'));
+  assert.ok(ids.has('sess-b'));
+});
+
+test('handleSyncRequest emits sync_ack and session_history_done when SYNC_ACK cap is present', () => {
+  const { ctx, sentEvents } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: (id) => (id === 'sess-a' ? 42 : undefined),
+    capabilities: new Set(['messages.sync_ack']),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    cursors: [{ session_id: 'sess-a', last_seq: 0 }],
+  } as never);
+
+  const types = sentEvents.map((e) => (e.event as unknown as { type: string }).type);
+  // Order matters: ack first, per-session done, then complete terminator.
+  assert.deepEqual(types, ['sync_ack', 'session_history_done', 'sync_complete']);
+
+  const ack = sentEvents[0].event as unknown as {
+    request_id: string;
+    sessions: Array<{ session_id: string; estimated_messages: number }>;
+  };
+  assert.equal(ack.request_id, 'req-1');
+  assert.equal(ack.sessions.length, 1);
+  assert.equal(ack.sessions[0].session_id, 'sess-a');
+
+  const done = sentEvents[1].event as unknown as {
+    request_id: string;
+    session_id: string;
+    last_seq: number;
+  };
+  assert.equal(done.request_id, 'req-1');
+  assert.equal(done.session_id, 'sess-a');
+  assert.equal(done.last_seq, 42);
+});
+
+test('handleSyncRequest without SYNC_ACK cap only emits sync_complete (back-compat)', () => {
+  const { ctx, sentEvents } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: () => 1,
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    cursors: [{ session_id: 'sess-a', last_seq: 0 }],
+  } as never);
+
+  const types = sentEvents.map((e) => (e.event as unknown as { type: string }).type);
+  assert.deepEqual(types, ['sync_complete']);
 });
