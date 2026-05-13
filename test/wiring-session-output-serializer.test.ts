@@ -111,7 +111,7 @@ test('flattenAgentEvent: agent_type propagates (codex)', () => {
 test('sendFlattenedSessionOutput: dispatches flattened event for non-codex', () => {
   const sent: PcEvent[] = [];
   sendFlattenedSessionOutput(
-    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e) },
+    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e), hasPeerCapability: () => true },
     's1',
     { type: 'assistant_message', message: 'hi' } as ClaudeEvent,
     'claude_code',
@@ -123,7 +123,7 @@ test('sendFlattenedSessionOutput: dispatches flattened event for non-codex', () 
 test('sendFlattenedSessionOutput: dispatches codex non-user_message events', () => {
   const sent: PcEvent[] = [];
   sendFlattenedSessionOutput(
-    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e) },
+    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e), hasPeerCapability: () => true },
     's1',
     { type: 'thinking', thinking: 't' } as ClaudeEvent,
     'codex',
@@ -136,7 +136,7 @@ test('sendFlattenedSessionOutput: codex user_message echo is consumed and not di
   const injected = new Map<string, Map<string, number>>();
   injected.set('s1', new Map([['echo!', 1]]));
   sendFlattenedSessionOutput(
-    { codexInjectedMessages: injected, sendToPhone: (e) => sent.push(e) },
+    { codexInjectedMessages: injected, sendToPhone: (e) => sent.push(e), hasPeerCapability: () => true },
     's1',
     { type: 'user_message', message: 'echo!' } as ClaudeEvent,
     'codex',
@@ -149,13 +149,52 @@ test('sendFlattenedSessionOutput: codex user_message echo is consumed and not di
 test('sendFlattenedSessionOutput: codex user_message dispatches when not in injected map', () => {
   const sent: PcEvent[] = [];
   sendFlattenedSessionOutput(
-    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e) },
+    { codexInjectedMessages: new Map(), sendToPhone: (e) => sent.push(e), hasPeerCapability: () => true },
     's1',
     { type: 'user_message', message: 'real' } as ClaudeEvent,
     'codex',
   );
   assert.equal(sent.length, 1);
   assert.equal((sent[0] as unknown as { content: string }).content, 'real');
+});
+
+test('sendFlattenedSessionOutput: drops local_command events when peer lacks LOCAL_COMMAND cap', () => {
+  const sent: PcEvent[] = [];
+  const deps = { codexInjectedMessages: new Map(), sendToPhone: (e: PcEvent) => sent.push(e), hasPeerCapability: () => false };
+  for (const ev of [
+    { type: 'local_command_invoke', name: 'cost', args: '' },
+    { type: 'local_command_output', stdout: 'Total: $0' },
+    { type: 'compact_boundary' },
+    { type: 'compact_summary', summary: '...' },
+  ] as const) {
+    sendFlattenedSessionOutput(deps, 's1', ev as ClaudeEvent, 'claude_code');
+  }
+  assert.equal(sent.length, 0);
+});
+
+test('sendFlattenedSessionOutput: forwards local_command events when peer has LOCAL_COMMAND cap', () => {
+  const sent: PcEvent[] = [];
+  const deps = { codexInjectedMessages: new Map(), sendToPhone: (e: PcEvent) => sent.push(e), hasPeerCapability: (n: string) => n === 'local.command' };
+  sendFlattenedSessionOutput(deps, 's1', { type: 'local_command_invoke', name: 'cost', args: '' } as ClaudeEvent, 'claude_code');
+  sendFlattenedSessionOutput(deps, 's1', { type: 'local_command_output', stdout: 'Total: $0' } as ClaudeEvent, 'claude_code');
+  sendFlattenedSessionOutput(deps, 's1', { type: 'compact_boundary' } as ClaudeEvent, 'claude_code');
+  sendFlattenedSessionOutput(deps, 's1', { type: 'compact_summary', summary: 'sum' } as ClaudeEvent, 'claude_code');
+  assert.equal(sent.length, 4);
+  assert.equal((sent[0] as unknown as { output_type: string }).output_type, 'local_command_invoke');
+  assert.equal((sent[1] as unknown as { output_type: string; stdout: string }).output_type, 'local_command_output');
+  assert.equal((sent[2] as unknown as { output_type: string }).output_type, 'compact_boundary');
+  assert.equal((sent[3] as unknown as { output_type: string; summary: string }).summary, 'sum');
+});
+
+test('sendFlattenedSessionOutput: non-local-command events flow through regardless of LOCAL_COMMAND cap', () => {
+  const sent: PcEvent[] = [];
+  sendFlattenedSessionOutput(
+    { codexInjectedMessages: new Map(), sendToPhone: (e: PcEvent) => sent.push(e), hasPeerCapability: () => false },
+    's1',
+    { type: 'assistant_message', message: 'hi' } as ClaudeEvent,
+    'claude_code',
+  );
+  assert.equal(sent.length, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -199,6 +238,8 @@ function makeDeps(opts: {
     },
     phonePreferences: { showToolUse: opts.showToolUse },
     sendToPhone: (e) => sent.push(e),
+    hasPeerCapability: () => true,
+    getControllerSlashSynthLog: () => [],
   };
   return { deps, sent, sd, cd };
 }

@@ -10,6 +10,7 @@ import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
 import { parseHistoryEntry } from './jsonl-parser.js';
 import { getSubagentHistory } from './subagent-history.js';
+import { PREFETCH_CWD } from '../sessions/observer-commands.js';
 import {
   getRunningCliSessions as scanRunningCliSessions,
   getRunningAllSessions as scanRunningAllSessions,
@@ -33,7 +34,17 @@ export interface DiscoveredSession {
 }
 
 export interface HistoryMessage {
-  role: 'user' | 'assistant' | 'tool_use' | 'tool_result' | 'subagent' | 'system';
+  role:
+    | 'user'
+    | 'assistant'
+    | 'tool_use'
+    | 'tool_result'
+    | 'subagent'
+    | 'system'
+    | 'local_command_invoke'
+    | 'local_command_output'
+    | 'compact_boundary'
+    | 'compact_summary';
   content: string;
   /**
    * For role='user' entries: the SDK transcript UUID from the JSONL row's
@@ -42,8 +53,20 @@ export interface HistoryMessage {
    * the SDK uuid, not our app-side ChatMessage.id (which is locally generated).
    * Older daemons won't set this; phone treats absence as "rewind unavailable
    * for this turn".
+   *
+   * Beyond rewind: when PEER_CAPABILITIES.STABLE_SDK_UUID is in effect this
+   * is the row's primary key for every replayed event (assistant, tool_use,
+   * tool_result, system, local_command_*, compact_*) so the phone keys
+   * `ChatMessage.id` off it and live + history collapse without fingerprint.
    */
   sdkUuid?: string;
+  /**
+   * Block index inside the source assistant row's `message.content[]`.
+   * Set on `assistant` and `tool_use` history rows produced from a multi-
+   * block JSONL entry; lets the phone disambiguate sibling blocks that
+   * share one `sdkUuid`.
+   */
+  sdkBlockIndex?: number;
   toolName?: string;
   toolId?: string;
   toolStatus?: 'success' | 'error';
@@ -64,6 +87,17 @@ export interface HistoryMessage {
   subagentToolUseCount?: number;
   /** Final cumulative token count from archive (only set when archive exists). */
   subagentTokenCount?: number;
+  /** local_command_invoke: command name without leading slash. */
+  localCommandName?: string;
+  /** local_command_invoke: raw `<command-args>` body if present. */
+  localCommandArgs?: string;
+  /** local_command_output: true when sourced from `<local-command-stderr>`. */
+  localCommandIsStderr?: boolean;
+  /** local_command_output: source row's `parentUuid` — points at the
+   *  matching `<command-name>` row's `uuid`. Lets the phone pair invoke
+   *  + output deterministically across non-monotonic ordering paths
+   *  (history backfill, multiple outputs interleaved). */
+  parentInvokeSdkUuid?: string;
   /**
    * Per-session monotonically increasing seq assigned in chronological
    * order when history is parsed from disk. Stable across calls (same
@@ -629,6 +663,13 @@ export class SessionDiscovery {
 
       // The encoded project path uses URL-safe encoding or hyphens for slashes
       const projectDir = this.decodeProjectPath(relativePath);
+
+      // Drop daemon's own SDK-prefetch sessions — they're internal-only
+      // (used to fetch supportedCommands once at startup) and must not
+      // surface to the phone or fire a session_completed notification.
+      if (projectDir === PREFETCH_CWD) {
+        return null;
+      }
 
       // Read the first few lines to extract custom-title
       const customTitle = this.extractCustomTitle(filePath);

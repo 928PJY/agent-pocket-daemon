@@ -93,6 +93,49 @@ function sendMessageAck(
 }
 
 // ---------------------------------------------------------------------------
+// observer-mode sdk_uuid backfill
+// ---------------------------------------------------------------------------
+
+// In observer mode, sendMessage returns synchronously without an sdkUuid —
+// the JSONL echo is what carries the row's uuid, and SessionManager fires a
+// `phone_origin_committed` event when the echo arrives. Wait once for that
+// event (matched by cid), then emit a second message_ack(committed) carrying
+// the sdk_uuid so iOS can backfill its phone-origin row's stable id.
+// iOS handleMessageAck is idempotent for committed, and only backfills
+// sdkUuid the first time it sees one — so this second ack is safe.
+//
+// Falls back silently if the event never fires (Claude refused the input,
+// terminal hung, etc). The optimistic in-memory row remains without a stable
+// sdk_uuid, which means cold-start may still show a duplicate for that one
+// message. Acceptable; the alternative is hanging the original ack.
+function attachPhoneOriginBackfill(
+  ctx: Pick<CommandContext, 'sessionManager' | 'sendToPhone'>,
+  clientMessageId: string,
+  publicSessionId: string,
+  internalSessionId: string,
+): void {
+  const TIMEOUT_MS = 30_000;
+  const onCommitted = (sid: string, cid: string, sdkUuid: string): void => {
+    if (sid !== internalSessionId || cid !== clientMessageId) return;
+    cleanup();
+    sendMessageAck(ctx, clientMessageId, publicSessionId, 'committed', undefined, sdkUuid);
+  };
+  const cleanup = (): void => {
+    ctx.sessionManager.off('phone_origin_committed', onCommitted);
+    clearTimeout(timer);
+  };
+  const timer = setTimeout(() => {
+    ctx.sessionManager.off('phone_origin_committed', onCommitted);
+    logger.debug('daemon', 'phone_origin_committed timeout', {
+      cid: clientMessageId.substring(0, 8),
+      sessionId: publicSessionId.substring(0, 8),
+    });
+  }, TIMEOUT_MS);
+  timer.unref();
+  ctx.sessionManager.on('phone_origin_committed', onCommitted);
+}
+
+// ---------------------------------------------------------------------------
 // send_message
 // ---------------------------------------------------------------------------
 
@@ -125,7 +168,10 @@ export async function handleSendMessage(
   try {
     const internalId = ctx.resolveInternalSessionId(command.session_id);
     if (internalId) {
-      const result = await ctx.sessionManager.sendMessage(internalId, command.message);
+      if (clientMessageId) {
+        attachPhoneOriginBackfill(ctx, clientMessageId, command.session_id, internalId);
+      }
+      const result = await ctx.sessionManager.sendMessage(internalId, command.message, clientMessageId);
       if (clientMessageId) {
         sendMessageAck(ctx, clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
       }
@@ -168,7 +214,10 @@ export async function handleSendMessage(
 
     ctx.sendSessionHistory(command.session_id);
 
-    const result = await ctx.sessionManager.sendMessage(sessionId, command.message);
+    if (clientMessageId) {
+      attachPhoneOriginBackfill(ctx, clientMessageId, command.session_id, sessionId);
+    }
+    const result = await ctx.sessionManager.sendMessage(sessionId, command.message, clientMessageId);
     if (clientMessageId) {
       sendMessageAck(ctx, clientMessageId, command.session_id, 'committed', undefined, result.sdkUuid);
     }

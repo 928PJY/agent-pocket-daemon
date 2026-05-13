@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { logger } from '../logger.js';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import type {
   SubagentEvent,
   ThinkingEvent,
@@ -67,10 +68,15 @@ export class SubagentObserver extends EventEmitter {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private activeAgents: Map<string, ActiveSubagent> = new Map();
   private knownFiles: Set<string> = new Set();
+  private getPeerCapability: (name: string) => boolean;
 
-  constructor(subagentsDir: string) {
+  constructor(
+    subagentsDir: string,
+    options?: { hasPeerCapability?: (name: string) => boolean },
+  ) {
     super();
     this.subagentsDir = subagentsDir;
+    this.getPeerCapability = options?.hasPeerCapability ?? (() => false);
   }
 
   start(): void {
@@ -407,6 +413,8 @@ export class SubagentObserver extends EventEmitter {
       agent.lastEmittedThinkingLength = 0;
       agent.emittedToolUseIds.clear();
 
+      const entryUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+
       // Check for tool_result blocks
       const message = entry.message as { content?: unknown } | undefined;
       if (Array.isArray(message?.content)) {
@@ -419,8 +427,9 @@ export class SubagentObserver extends EventEmitter {
               output: typeof block.content === 'string'
                 ? block.content
                 : JSON.stringify(block.content ?? ''),
+              ...(entryUuid ? { sdkUuid: entryUuid } : {}),
             };
-            this.emitSubagentEvent(agent, innerEvent);
+            this.emitSubagentEvent(agent, innerEvent, entryUuid);
           }
         }
       }
@@ -440,27 +449,39 @@ export class SubagentObserver extends EventEmitter {
       } | undefined;
       if (!message?.content || !Array.isArray(message.content)) return;
 
-      for (const block of message.content) {
+      const entryUuid = typeof entry.uuid === 'string' ? entry.uuid : undefined;
+      const fullTextEmit = this.getPeerCapability(PEER_CAPABILITIES.STABLE_SDK_UUID);
+
+      for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
+        const block = message.content[blockIndex];
         switch (block.type) {
           case 'thinking': {
             const fullText = block.thinking ?? '';
-            const delta = fullText.slice(agent.lastEmittedThinkingLength);
+            if (fullText.length <= agent.lastEmittedThinkingLength) break;
+            const payload = fullTextEmit ? fullText : fullText.slice(agent.lastEmittedThinkingLength);
             agent.lastEmittedThinkingLength = fullText.length;
-            if (delta.length > 0) {
-              const innerEvent: ThinkingEvent = { type: 'thinking', thinking: delta };
-              this.emitSubagentEvent(agent, innerEvent);
-            }
+            if (payload.length === 0) break;
+            const innerEvent: ThinkingEvent = {
+              type: 'thinking',
+              thinking: payload,
+              ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
+            };
+            this.emitSubagentEvent(agent, innerEvent, entryUuid, blockIndex);
             break;
           }
 
           case 'text': {
             const fullText = block.text ?? '';
-            const delta = fullText.slice(agent.lastEmittedTextLength);
+            if (fullText.length <= agent.lastEmittedTextLength) break;
+            const payload = fullTextEmit ? fullText : fullText.slice(agent.lastEmittedTextLength);
             agent.lastEmittedTextLength = fullText.length;
-            if (delta.length > 0) {
-              const innerEvent: AssistantMessageEvent = { type: 'assistant_message', message: delta };
-              this.emitSubagentEvent(agent, innerEvent);
-            }
+            if (payload.length === 0) break;
+            const innerEvent: AssistantMessageEvent = {
+              type: 'assistant_message',
+              message: payload,
+              ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
+            };
+            this.emitSubagentEvent(agent, innerEvent, entryUuid, blockIndex);
             break;
           }
 
@@ -474,8 +495,9 @@ export class SubagentObserver extends EventEmitter {
               tool_id: toolId,
               tool_name: block.name ?? 'unknown',
               tool_input: (block.input as Record<string, unknown>) ?? {},
+              ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
             };
-            this.emitSubagentEvent(agent, innerEvent);
+            this.emitSubagentEvent(agent, innerEvent, entryUuid, blockIndex);
             break;
           }
         }
@@ -486,6 +508,8 @@ export class SubagentObserver extends EventEmitter {
   private emitSubagentEvent(
     agent: ActiveSubagent,
     innerEvent: ThinkingEvent | AssistantMessageEvent | ToolUseEvent | ToolResultEvent,
+    sdkUuid?: string,
+    sdkBlockIndex?: number,
   ): void {
     const event: SubagentEvent = {
       type: 'subagent_event',
@@ -496,6 +520,8 @@ export class SubagentObserver extends EventEmitter {
       tool_use_count: agent.toolUseCount,
       token_count: agent.tokenCount,
       agent_status: agent.status,
+      ...(sdkUuid ? { sdkUuid } : {}),
+      ...(sdkBlockIndex !== undefined ? { sdkBlockIndex } : {}),
     };
     this.emit('output', event);
   }

@@ -133,18 +133,30 @@ test('SessionObserver maps queue, user, assistant, and tool result entries', () 
     (observer as SessionObserverInternals).readNewEntries();
 
     assert.deepEqual(titles, [['Generated', false]]);
-    assert.deepEqual(statuses, ['running', 'running', 'running', 'running', 'ready', 'running']);
-    assert.deepEqual(outputs, [
-      { type: 'user_message', message: 'queued user text' },
-      { type: 'user_message', message: 'plain user' },
-      { type: 'thinking', thinking: 'think' },
-      { type: 'assistant_message', message: 'hello' },
-      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Read', tool_input: { file_path: 'a.ts' } },
-      { type: 'thinking', thinking: 'ing more' },
-      { type: 'assistant_message', message: ' world' },
-      { type: 'user_message', message: 'block user' },
-      { type: 'tool_result', tool_id: 'tool-1', status: 'success', output: '{"ok":true}' },
+    // local_command_invoke entries don't flip status (the command wasn't an
+    // SDK turn — the next stdout/stderr will flip to ready). 5 status flips:
+    // user 'plain user' → running; assistant #1 → running; assistant #2 →
+    // running + ready (end_turn); user with tool_result → running.
+    assert.deepEqual(statuses, ['running', 'running', 'running', 'ready', 'running']);
+    assert.equal(outputs.length, 10);
+    // Spot-check shape — full equality is fragile across optional sdkUuid /
+    // sdkBlockIndex fields that depend on whether the source entry had a uuid.
+    const types = outputs.map((e) => (e as { type: string }).type);
+    assert.deepEqual(types, [
+      'user_message',          // queued user text (queue stableEventId sdkUuid)
+      'user_message',          // plain user
+      'local_command_invoke',  // <command-name>skip
+      'thinking',              // assistant #1 thinking
+      'assistant_message',     // assistant #1 text
+      'tool_use',              // assistant #1 tool_use
+      'thinking',              // assistant #2 thinking delta
+      'assistant_message',     // assistant #2 text delta
+      'user_message',          // 'block user' inside user with tool_result
+      'tool_result',           // tool_result
     ]);
+    // Queue-operation rows have no source uuid → daemon synthesizes a
+    // deterministic id so live + history-replay collapse to one row.
+    assert.equal(typeof (outputs[0] as { sdkUuid?: unknown }).sdkUuid, 'string');
   } finally {
     observer.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -182,11 +194,21 @@ test('SessionObserver emits interrupted system message and closes pending tools'
 
     assert.deepEqual(statuses, ['running']);
     assert.deepEqual(interrupted, ['streaming']);
-    assert.deepEqual(outputs, [
-      { type: 'tool_use', tool_id: 'tool-1', tool_name: 'Bash', tool_input: {} },
-      { type: 'tool_result', tool_id: 'tool-1', status: 'error', output: '[Tool use interrupted]' },
-      { type: 'system_message', message: 'Interrupted by user.' },
-    ]);
+    assert.equal(outputs.length, 3);
+    const [toolUseEvent, toolResultEvent, systemEvent] = outputs as Array<Record<string, unknown>>;
+    assert.deepEqual(toolUseEvent, {
+      type: 'tool_use', tool_id: 'tool-1', tool_name: 'Bash', tool_input: {},
+    });
+    // Synthesized interrupt artifacts get deterministic ids derived from
+    // session + entry-context so live emit and history replay collapse.
+    assert.equal(toolResultEvent.type, 'tool_result');
+    assert.equal(toolResultEvent.tool_id, 'tool-1');
+    assert.equal(toolResultEvent.status, 'error');
+    assert.equal(toolResultEvent.output, '[Tool use interrupted]');
+    assert.equal(typeof toolResultEvent.sdkUuid, 'string');
+    assert.equal(systemEvent.type, 'system_message');
+    assert.equal(systemEvent.message, 'Interrupted by user.');
+    assert.equal(typeof systemEvent.sdkUuid, 'string');
   } finally {
     observer.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -283,7 +305,7 @@ test('SessionManager bridges observed output and suppresses injected message ech
     const sessionId = manager.observeSession('claude-session-1', jsonlPath, dir, 12345);
     const session = manager.getSession(sessionId)!;
 
-    session.injectedMessages.add('already-rendered');
+    session.injectedMessages.set('already-rendered', '');
     session.observer!.emit('output', { type: 'user_message', message: 'already-rendered' });
     session.observer!.emit('output', { type: 'assistant_message', message: 'visible' });
 

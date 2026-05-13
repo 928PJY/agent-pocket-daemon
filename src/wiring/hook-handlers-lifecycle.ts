@@ -39,6 +39,7 @@ import { truncateUtf8 } from '../utils/truncate-utf8.js';
 import { formatCompletionSubtitle } from '../utils/completion-subtitle.js';
 import { readLastTurnSummary } from '../utils/transcript-reader.js';
 import { readSessionMap } from '../utils/session-map.js';
+import { PREFETCH_CWD } from '../sessions/observer-commands.js';
 import type { CryptoSigner, MessageSeqRef, PendingBlockingEntry } from './hook-handlers-codex.js';
 
 /** Narrowed HookServer surface used by these registrars. */
@@ -64,6 +65,13 @@ export interface SessionStopDeps {
   resolveExternalSessionId(internalId: string): string;
   /** Live reference to the daemon's pending-blocking-request map. */
   pendingBlockingRequests: Map<string, PendingBlockingEntry>;
+  /**
+   * Live reference to the set of Claude session ids the daemon spun up
+   * internally as SDK-prefetch sessions. Stop hooks for these must be
+   * suppressed — otherwise phone gets a noop session_completed
+   * notification with no chat content behind it.
+   */
+  prefetchClaudeSessionIds: Set<string>;
   clearNotificationDelivery(eventType: string, sessionId: string, requestId: string): void;
   nextCompletionRequestId(sessionId: string, timestamp: number): string;
   sendNotificationEventToPhone(
@@ -89,6 +97,18 @@ export function registerSessionStopHandler(
   const setTimeoutFn = deps.setTimeoutFn ?? setTimeout;
   const readSummaryFn = deps.readLastTurnSummaryFn ?? readLastTurnSummary;
   hooks.on('session_stop', async (claudeSessionId: string, transcriptPath?: string) => {
+    // Daemon's own SDK-prefetch session (used to fetch supportedCommands once
+    // at startup) reuses the real Claude SDK and therefore fires real Stop
+    // hooks. Suppress before any logging or downstream emit — phone would
+    // otherwise surface a noop notification with no chat content behind it.
+    if (deps.prefetchClaudeSessionIds.has(claudeSessionId)) {
+      deps.prefetchClaudeSessionIds.delete(claudeSessionId);
+      logger.debug('daemon', 'Suppressing Stop hook for SDK-prefetch session', {
+        claudeSessionId: claudeSessionId?.substring(0, 8),
+      });
+      return;
+    }
+
     const firedAt = Date.now();
     const session = deps.sessionManager.findByClaudeSessionId(claudeSessionId);
     const externalId = session
@@ -317,6 +337,9 @@ export interface SessionStartDeps {
   pendingClearInfo: Map<string, PendingClearInfo>;
   sessionIdMap: Map<string, string>;
   replacedSessionIds: Set<string>;
+  /** Shared with SessionStopDeps. Populated when SessionStart hook fires for
+   *  the daemon's own SDK-prefetch cwd; consumed by Stop hook to suppress. */
+  prefetchClaudeSessionIds: Set<string>;
   sendToPhone(event: PcEvent): void;
   /** Read live so the discovery warm-up phase still suppresses replays. */
   isInitialDiscoveryDone(): boolean;
@@ -331,6 +354,14 @@ export function registerSessionStartHandler(
 ): void {
   const readSessionMapFn = deps.readSessionMapFn ?? readSessionMap;
   hooks.on('session_start', (claudeSessionId: string, source: string, cwd: string, transcriptPath: string) => {
+    if (cwd === PREFETCH_CWD) {
+      deps.prefetchClaudeSessionIds.add(claudeSessionId);
+      logger.debug('daemon', 'Tagged SDK-prefetch session for Stop suppression', {
+        claudeSessionId: claudeSessionId?.substring(0, 8),
+      });
+      return;
+    }
+
     logger.info('daemon', 'SessionStart hook', { claudeSessionId, source });
 
     if (source !== 'clear') return;
