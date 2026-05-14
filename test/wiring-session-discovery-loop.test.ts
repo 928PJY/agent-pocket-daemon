@@ -63,6 +63,7 @@ interface ClaudeFixture {
   observeCalls: ObserveCall[];
   removeCalls: string[];
   markedHistory: string[];
+  repromoteCalls: Array<{ sessionId: string; pid: number; jsonlPath: string }>;
   sessions: FakeSession[];
   sessionIdMap: Map<string, string>;
   replacedSessionIds: Set<string>;
@@ -94,6 +95,7 @@ function makeClaudeFixture(opts: {
   const observeCalls: ObserveCall[] = [];
   const removeCalls: string[] = [];
   const markedHistory: string[] = [];
+  const repromoteCalls: Array<{ sessionId: string; pid: number; jsonlPath: string }> = [];
   const sessions: FakeSession[] = opts.sessions ?? [];
   const sessionIdMap = new Map<string, string>(opts.sessionIdMap ?? []);
   const replacedSessionIds = new Set<string>(opts.replacedSessionIds ?? []);
@@ -150,6 +152,17 @@ function makeClaudeFixture(opts: {
         if (idx >= 0) sessions.splice(idx, 1);
       },
       markObservedSessionHistory: (id: string) => { markedHistory.push(id); },
+      rePromoteHistoryToObserved: ((sessionId: string, pid: number, jsonlPath: string, customTitle, terminalTarget) => {
+        const s = sessions.find(x => x.sessionId === sessionId);
+        if (!s || s.isObserved || !s.claudeSessionId) return false;
+        s.isObserved = true;
+        s.terminalPid = pid;
+        s.observer = { jsonlPath };
+        s.terminalTarget = terminalTarget as never;
+        if (customTitle) (s as { customTitle?: string }).customTitle = customTitle;
+        repromoteCalls.push({ sessionId, pid, jsonlPath });
+        return true;
+      }) as never,
     },
     sessionIdMap,
     replacedSessionIds,
@@ -179,7 +192,7 @@ function makeClaudeFixture(opts: {
   };
 
   return {
-    deps, sentEvents, historyCalls, observeCalls, removeCalls, markedHistory,
+    deps, sentEvents, historyCalls, observeCalls, removeCalls, markedHistory, repromoteCalls,
     sessions, sessionIdMap, replacedSessionIds, sessionMap, removedMapEntries,
     fakeStat, alivePids,
     get initialDone() { return initialDone; },
@@ -233,9 +246,47 @@ test('claude discovery: skips already-observed (same claudeSessionId)', async ()
   const f = makeClaudeFixture({
     runningCli: [{ pid: 1234, sessionId: 'claude-uuid-1', cwd: '/proj', entrypoint: 'claude' }],
     discovered: [{ sessionId: 'claude-uuid-1', projectDir: '/proj', lastModified: 100, filePath: '/proj/.claude/abc.jsonl' }],
-    sessions: [{ sessionId: 'internal-existing', claudeSessionId: 'claude-uuid-1' }],
+    sessions: [{ sessionId: 'internal-existing', claudeSessionId: 'claude-uuid-1', isObserved: true, terminalPid: 1234 }],
   });
   await discoverAndObserveSessions(f.deps);
+  assert.equal(f.observeCalls.length, 0);
+  assert.equal(f.repromoteCalls.length, 0);
+});
+
+test('claude discovery (resume): historified sid + new PID alive → re-promote, not skip', async () => {
+  const f = makeClaudeFixture({
+    runningCli: [{ pid: 9999, sessionId: 'claude-resumed', cwd: '/proj', entrypoint: 'claude' }],
+    discovered: [{ sessionId: 'claude-resumed', projectDir: '/proj', lastModified: 200, filePath: '/proj/.claude/r.jsonl' }],
+    sessions: [{
+      sessionId: 'internal-historified',
+      claudeSessionId: 'claude-resumed',
+      isObserved: false,
+      terminalPid: undefined,
+    }],
+    alivePids: [9999],
+    initialDone: true,
+  });
+  await discoverAndObserveSessions(f.deps);
+  assert.equal(f.observeCalls.length, 0, 'should re-promote, not observe a fresh session');
+  assert.deepEqual(f.repromoteCalls, [{ sessionId: 'internal-historified', pid: 9999, jsonlPath: '/proj/.claude/r.jsonl' }]);
+  assert.equal(f.sessionIdMap.get('internal-historified'), 'claude-resumed');
+  assert.deepEqual(f.historyCalls, ['claude-resumed']);
+});
+
+test('claude discovery (resume): historified sid but no JSONL match → no re-promote', async () => {
+  const f = makeClaudeFixture({
+    runningCli: [{ pid: 9999, sessionId: 'claude-resumed', cwd: '/proj', entrypoint: 'claude' }],
+    discovered: [],
+    sessions: [{
+      sessionId: 'internal-historified',
+      claudeSessionId: 'claude-resumed',
+      isObserved: false,
+    }],
+    alivePids: [9999],
+    initialDone: true,
+  });
+  await discoverAndObserveSessions(f.deps);
+  assert.equal(f.repromoteCalls.length, 0);
   assert.equal(f.observeCalls.length, 0);
 });
 

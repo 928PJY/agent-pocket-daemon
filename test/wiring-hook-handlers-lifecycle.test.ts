@@ -712,6 +712,99 @@ test('session_start: non-prefetch cwd does not tag', () => {
   assert.equal(tagged.size, 0);
 });
 
+test('session_start(resume): historified session is re-promoted via session-map PID', () => {
+  const hooks = makeHooks();
+  const repromoteCalls: Array<{ sessionId: string; pid: number; jsonlPath: string }> = [];
+  const historyCalls: string[] = [];
+  const sessionIdMap = new Map<string, string>();
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() {
+        return { sessionId: 'int-1', isObserved: false, terminalTarget: undefined } as never;
+      },
+      findByTerminalPid() { return undefined as never; },
+      observeSession() { throw new Error('should not observe — re-promote path'); },
+      markObservedSessionHistory() {},
+      removeSession() {},
+      rePromoteHistoryToObserved(sessionId: string, pid: number, jsonlPath: string) {
+        repromoteCalls.push({ sessionId, pid, jsonlPath });
+        return true;
+      },
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap,
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: new Set(),
+    sendToPhone() {},
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory(sid: string) { historyCalls.push(sid); return 0; },
+    readSessionMapFn() {
+      return { 'claude-resumed': { pid: 4242, cwd: '/proj', timestamp: 1 } };
+    },
+  });
+  hooks.emit('session_start', 'claude-resumed', 'resume', '/proj', '/proj/claude-resumed.jsonl');
+  assert.deepEqual(repromoteCalls, [{ sessionId: 'int-1', pid: 4242, jsonlPath: '/proj/claude-resumed.jsonl' }]);
+  assert.equal(sessionIdMap.get('int-1'), 'claude-resumed');
+  assert.deepEqual(historyCalls, ['claude-resumed']);
+});
+
+test('session_start(resume): observed session is left alone', () => {
+  const hooks = makeHooks();
+  let repromoted = false;
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() {
+        return { sessionId: 'int-1', isObserved: true, terminalTarget: undefined } as never;
+      },
+      findByTerminalPid() { return undefined as never; },
+      observeSession() { throw new Error('no-op'); },
+      markObservedSessionHistory() {},
+      removeSession() {},
+      rePromoteHistoryToObserved() { repromoted = true; return true; },
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap: new Map(),
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: new Set(),
+    sendToPhone() {},
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory() { return 0; },
+    readSessionMapFn() { return {}; },
+  });
+  hooks.emit('session_start', 'claude-resumed', 'resume', '/proj', '/t');
+  assert.equal(repromoted, false);
+});
+
+test('session_start(resume): no PID in session-map → defers to polling', () => {
+  const hooks = makeHooks();
+  let repromoted = false;
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() {
+        return { sessionId: 'int-1', isObserved: false, terminalTarget: undefined } as never;
+      },
+      findByTerminalPid() { return undefined as never; },
+      observeSession() { throw new Error('no-op'); },
+      markObservedSessionHistory() {},
+      removeSession() {},
+      rePromoteHistoryToObserved() { repromoted = true; return true; },
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap: new Map(),
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: new Set(),
+    sendToPhone() {},
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory() { return 0; },
+    readSessionMapFn() { return {}; },
+  });
+  hooks.emit('session_start', 'claude-resumed', 'resume', '/proj', '/t');
+  assert.equal(repromoted, false);
+});
+
 // ---------------------------------------------------------------------------
 // permission_dismissed
 // ---------------------------------------------------------------------------
