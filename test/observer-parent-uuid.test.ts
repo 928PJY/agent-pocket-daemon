@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -14,6 +14,17 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
   }
 }
 
+// `fs.watchFile` (used by SessionObserver) polls and compares mtime — when the
+// initial empty write and the subsequent appendFileSync land in the same
+// mtime tick on CI filesystems, the watcher never fires and the test times
+// out. Forcing the seed file's mtime into the past guarantees the first
+// append produces a distinct mtime.
+function seedJsonl(path: string): void {
+  writeFileSync(path, '');
+  const past = new Date(Date.now() - 5_000);
+  utimesSync(path, past, past);
+}
+
 // ---------------------------------------------------------------------------
 // String content local_command_output with parentUuid
 // ---------------------------------------------------------------------------
@@ -21,7 +32,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
 test('observer emits parent_invoke_sdk_uuid on string-content local_command_output', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'obs-parent-'));
   const jsonl = join(dir, 'test.jsonl');
-  writeFileSync(jsonl, '');
+  seedJsonl(jsonl);
   const observer = new SessionObserver('sess-1', jsonl, { hasPeerCapability: () => true });
   const outputs: ClaudeEvent[] = [];
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
@@ -53,7 +64,7 @@ test('observer emits parent_invoke_sdk_uuid on string-content local_command_outp
 test('observer emits parent_invoke_sdk_uuid on array-block local_command_output', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'obs-parent-arr-'));
   const jsonl = join(dir, 'test.jsonl');
-  writeFileSync(jsonl, '');
+  seedJsonl(jsonl);
   const observer = new SessionObserver('sess-2', jsonl, { hasPeerCapability: () => true });
   const outputs: ClaudeEvent[] = [];
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
@@ -87,7 +98,7 @@ test('observer emits parent_invoke_sdk_uuid on array-block local_command_output'
 test('observer emits parent_invoke_sdk_uuid on system local_command subtype', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'obs-parent-sys-'));
   const jsonl = join(dir, 'test.jsonl');
-  writeFileSync(jsonl, '');
+  seedJsonl(jsonl);
   const observer = new SessionObserver('sess-3', jsonl, { hasPeerCapability: () => true });
   const outputs: ClaudeEvent[] = [];
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
@@ -120,7 +131,7 @@ test('observer emits parent_invoke_sdk_uuid on system local_command subtype', as
 test('observer: local_command_invoke does NOT carry parent_invoke_sdk_uuid even if parentUuid is set', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'obs-parent-neg-'));
   const jsonl = join(dir, 'test.jsonl');
-  writeFileSync(jsonl, '');
+  seedJsonl(jsonl);
   const observer = new SessionObserver('sess-4', jsonl, { hasPeerCapability: () => true });
   const outputs: ClaudeEvent[] = [];
   observer.on('output', (event: ClaudeEvent) => outputs.push(event));
