@@ -276,6 +276,52 @@ test('handleVerifyHistory tolerates count divergence when phone reports max_coun
   assert.equal(sentEvents.length, 0);
 });
 
+test('handleVerifyHistory tolerates count divergence when phone holds a partial window (scoped sync)', () => {
+  // Daemon has 100 messages with seqs 1..100. Phone — after a scoped sync
+  // that only delivered messages after_seq=96 — holds only the last 4.
+  const messages: Partial<HistoryMessage>[] = Array.from({ length: 100 }, (_, i) => ({
+    role: 'assistant' as const,
+    content: `m${i + 1}`,
+    seq: i + 1,
+  }));
+  const page = makeHistoryPage(messages, 100);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-1',
+    count: 4,
+    head_seq: 97,   // phone's earliest seq > daemon's earliest seq (1)
+    tail_seq: 100,
+    max_count: 1000,
+  } as never);
+  // Phone explicitly tells us it holds the [97, 100] window. tail_seq matches
+  // so the window is in sync; do not flag count divergence.
+  assert.equal(sentEvents.length, 0);
+});
+
+test('handleVerifyHistory still flags real loss even when head_seq > daemon head (tail divergence wins)', () => {
+  // Phone holds a partial window claim (head_seq=97) but its tail_seq is
+  // behind the daemon — that's a real loss, not an intentional window.
+  const messages: Partial<HistoryMessage>[] = Array.from({ length: 100 }, (_, i) => ({
+    role: 'assistant' as const,
+    content: `m${i + 1}`,
+    seq: i + 1,
+  }));
+  const page = makeHistoryPage(messages, 100);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-1',
+    count: 2,
+    head_seq: 97,
+    tail_seq: 98,   // phone is missing the last 2
+    max_count: 1000,
+  } as never);
+  assert.equal(sentEvents.length, 1);
+  const ev = sentEvents[0].event as unknown as { reason: string };
+  assert.equal(ev.reason, 'tail_seq_mismatch');
+});
+
 test('handleVerifyHistory drops empty user / blank assistant / unknown-role messages from the expected count', () => {
   const page = makeHistoryPage([
     { role: 'user', content: '' },         // dropped
