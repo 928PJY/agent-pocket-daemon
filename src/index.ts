@@ -31,7 +31,6 @@ import {
   cleanSessionMap,
   removeSessionMapEntries,
 } from './utils/session-map.js';
-export { mergeSyncSessionIds } from './utils/session-map.js';
 import {
   CodexStopHookDeduper,
   findCodexHookRolloutPath,

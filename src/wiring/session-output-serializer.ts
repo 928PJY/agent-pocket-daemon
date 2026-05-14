@@ -136,25 +136,46 @@ export interface SendSessionHistoryDeps {
   sendToPhone(event: PcEvent): void;
 }
 
+/**
+ * Hard upper bound for a single session_history page. Phones can request more
+ * via paginated `get_history` calls, but no single send may exceed this — a
+ * defensive guard against accidental "full history" pulls that previously
+ * caused #250's 30s sync_complete timeouts.
+ */
+export const MAX_SESSION_HISTORY_LIMIT = 200;
+
+/**
+ * Default page size when the caller doesn't specify `limit`. Picked to cover
+ * a fresh chat's first screen (~10–20 messages) with headroom. The phone can
+ * always ask for more via paginated `get_history`.
+ */
+export const DEFAULT_SESSION_HISTORY_LIMIT = 30;
+
 export function sendSessionHistory(
   deps: SendSessionHistoryDeps,
   claudeSessionId: string,
   options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
 ): number | undefined {
   const incremental = options?.since !== undefined || options?.sinceSeq !== undefined;
-  const defaultLimit = incremental ? 200 : 2000;
-  const isFullHistory = !incremental && !options?.offset;
+  // Incremental backfill may legitimately need more (a long-running session
+  // between phone disconnects), but we still cap it. For first-look / tail
+  // reads we ship a short window and let the phone paginate.
+  const incrementalDefault = MAX_SESSION_HISTORY_LIMIT;
+  const tailDefault = DEFAULT_SESSION_HISTORY_LIMIT;
+  const rawLimit = options?.limit ?? (incremental ? incrementalDefault : tailDefault);
+  const limit = Math.min(rawLimit, MAX_SESSION_HISTORY_LIMIT);
+  const isFullHistory = !incremental && !options?.offset && limit >= MAX_SESSION_HISTORY_LIMIT;
 
   const result = isCodexSessionId(claudeSessionId)
     ? deps.codexDiscovery.getSessionHistory(claudeSessionId, {
         offset: options?.offset ?? 0,
-        limit: options?.limit ?? defaultLimit,
+        limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
       })
     : deps.sessionDiscovery.getSessionHistory(claudeSessionId, {
         offset: options?.offset ?? 0,
-        limit: options?.limit ?? defaultLimit,
+        limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
       });

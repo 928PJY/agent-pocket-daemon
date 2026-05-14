@@ -284,14 +284,25 @@ test('sendSessionHistory: truncates content longer than 5000 chars', () => {
   assert.equal(msgs[0].content.length, 5000);
 });
 
-test('sendSessionHistory: full history (no since/sinceSeq/offset) → defaultLimit=2000, isFullHistory=true', () => {
+test('sendSessionHistory: no options → defaults to a small tail window (DEFAULT_SESSION_HISTORY_LIMIT=30, isFullHistory=false)', () => {
   const { deps, sent, sd } = makeDeps({
     showToolUse: true,
     sessionDiscoveryResult: { messages: [], totalCount: 0, offset: 0, hasMore: false, tailSeq: 0 },
   });
   sendSessionHistory(deps, 'claude-uuid');
-  assert.equal((sd.calls[0].opts as { limit: number }).limit, 2000);
-  assert.equal((sent[0] as unknown as { is_full_history: boolean }).is_full_history, true);
+  // Default page size is intentionally small — preventing accidental
+  // full-history pulls is the #250 round-2 invariant.
+  assert.equal((sd.calls[0].opts as { limit: number }).limit, 30);
+  assert.equal((sent[0] as unknown as { is_full_history: boolean }).is_full_history, false);
+});
+
+test('sendSessionHistory: limit explicitly above MAX_SESSION_HISTORY_LIMIT is clamped to 200', () => {
+  const { deps, sd } = makeDeps({
+    showToolUse: true,
+    sessionDiscoveryResult: { messages: [], totalCount: 0, offset: 0, hasMore: false, tailSeq: 0 },
+  });
+  sendSessionHistory(deps, 'claude-uuid', { limit: 10000 });
+  assert.equal((sd.calls[0].opts as { limit: number }).limit, 200);
 });
 
 test('sendSessionHistory: incremental (since) → defaultLimit=200, isFullHistory=false', () => {
