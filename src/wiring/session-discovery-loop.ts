@@ -238,7 +238,37 @@ export async function discoverAndObserveSessions(deps: ClaudeDiscoveryDeps): Pro
         pidInfo.cwd = mapEntry.cwd;
       }
 
-      if (deps.sessionManager.findByClaudeSessionId(pidInfo.sessionId)) continue;
+      const existingBySid = deps.sessionManager.findByClaudeSessionId(pidInfo.sessionId);
+      if (existingBySid) {
+        // If observed: nothing to do.
+        if (existingBySid.isObserved) continue;
+
+        // Historified record with same sid: a `claude --resume <sid>` (or
+        // similar) revived it under a new PID. Re-promote in place rather
+        // than skipping — otherwise the session stays invisible to the
+        // phone until the user manually kicks the daemon.
+        const match = discovered.find((s) => s.sessionId === pidInfo.sessionId);
+        if (!match) continue;
+
+        const repromoted = deps.sessionManager.rePromoteHistoryToObserved?.(
+          existingBySid.sessionId,
+          pidInfo.pid,
+          match.filePath,
+          match.customTitle,
+          pidInfo.terminalTarget,
+        );
+        if (repromoted) {
+          deps.sessionIdMap.set(existingBySid.sessionId, pidInfo.sessionId);
+          if (deps.isInitialDiscoveryDone()) {
+            deps.sendSessionHistory(pidInfo.sessionId);
+          }
+          logger.info('daemon', 'Re-promoted historified session on resume (polling)', {
+            claudeSessionId: pidInfo.sessionId,
+            pid: pidInfo.pid,
+          });
+        }
+        continue;
+      }
 
       const existingByPid = deps.sessionManager.findByTerminalPid(pidInfo.pid);
       if (existingByPid && existingByPid.claudeSessionId !== pidInfo.sessionId

@@ -331,7 +331,7 @@ export function registerSessionEndHandler(
 export interface SessionStartDeps {
   sessionManager: Pick<
     SessionManager,
-    'findByClaudeSessionId' | 'findByTerminalPid' | 'observeSession' | 'markObservedSessionHistory' | 'removeSession'
+    'findByClaudeSessionId' | 'findByTerminalPid' | 'observeSession' | 'markObservedSessionHistory' | 'removeSession' | 'rePromoteHistoryToObserved'
   >;
   resolveExternalSessionId(internalId: string): string;
   pendingClearInfo: Map<string, PendingClearInfo>;
@@ -363,6 +363,40 @@ export function registerSessionStartHandler(
     }
 
     logger.info('daemon', 'SessionStart hook', { claudeSessionId, source });
+
+    if (source === 'resume') {
+      const existing = deps.sessionManager.findByClaudeSessionId(claudeSessionId);
+      // Already observed (e.g. resume in a fresh terminal but daemon never
+      // historified): nothing to do, polling will keep it consistent.
+      if (!existing || existing.isObserved) return;
+
+      // Historified record + new resume process. session-map.json is written
+      // synchronously by the hook script before this POST, so the new PID is
+      // available now.
+      const mapped = readSessionMapFn();
+      const pid = mapped[claudeSessionId]?.pid;
+      if (!pid) {
+        logger.info('daemon', 'SessionStart(resume): no PID in session-map yet, leaving for polling', { claudeSessionId });
+        return;
+      }
+
+      const jsonlPath = transcriptPath || path.join(path.dirname(cwd), `${claudeSessionId}.jsonl`);
+      const repromoted = deps.sessionManager.rePromoteHistoryToObserved(
+        existing.sessionId,
+        pid,
+        jsonlPath,
+        undefined,
+        existing.terminalTarget,
+      );
+      if (repromoted) {
+        deps.sessionIdMap.set(existing.sessionId, claudeSessionId);
+        if (deps.isInitialDiscoveryDone()) {
+          deps.sendSessionHistory(claudeSessionId);
+        }
+        logger.info('daemon', 'Re-promoted historified session on resume (hook)', { claudeSessionId, pid });
+      }
+      return;
+    }
 
     if (source !== 'clear') return;
 
