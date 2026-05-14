@@ -15,12 +15,14 @@ import type {
   ClaudeEvent,
   AgentType,
 } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import {
   isCodexSessionId,
   type CodexDiscovery,
 } from '../discovery/codex-discovery.js';
 import type { SessionDiscovery } from '../discovery/session-discovery.js';
 import { consumeInjectedMessage } from '../codex/codex-handler.js';
+import { logger } from '../logger.js';
 import type { PhonePreferences } from '../commands/handlers/preferences-and-peer.js';
 
 // ---------------------------------------------------------------------------
@@ -69,7 +71,6 @@ export function flattenAgentEvent(
     case 'user_message':
       flat.output_type = 'user_message';
       flat.content = agentEvent.message;
-      if (agentEvent.sdkUuid) flat.sdk_uuid = agentEvent.sdkUuid;
       break;
 
     case 'system_message':
@@ -88,10 +89,48 @@ export function flattenAgentEvent(
       flat.agent_status = agentEvent.agent_status;
       break;
 
+    case 'local_command_invoke':
+      flat.output_type = 'local_command_invoke';
+      flat.name = agentEvent.name;
+      flat.args = agentEvent.args;
+      if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
+      break;
+
+    case 'local_command_output':
+      flat.output_type = 'local_command_output';
+      flat.stdout = agentEvent.stdout;
+      if (agentEvent.is_stderr) flat.is_stderr = true;
+      if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
+      if (agentEvent.parent_invoke_sdk_uuid) flat.parent_invoke_sdk_uuid = agentEvent.parent_invoke_sdk_uuid;
+      break;
+
+    case 'compact_boundary':
+      flat.output_type = 'compact_boundary';
+      if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
+      break;
+
+    case 'compact_summary':
+      flat.output_type = 'compact_summary';
+      flat.summary = agentEvent.summary;
+      if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
+      break;
+
     default:
       flat.output_type = (agentEvent as { type: string }).type;
       flat.content = JSON.stringify(agentEvent);
       break;
+  }
+
+  // Mirror sdkUuid + sdkBlockIndex onto the flattened wire envelope so the
+  // phone can read them at the top level without unwrapping the discriminated
+  // event union. Set on every variant that carries them (user_message,
+  // thinking, assistant_message, tool_use, tool_result, system_message,
+  // subagent_event, local_command_*, compact_*).
+  if ('sdkUuid' in agentEvent && typeof agentEvent.sdkUuid === 'string') {
+    flat.sdk_uuid = agentEvent.sdkUuid;
+  }
+  if ('sdkBlockIndex' in agentEvent && typeof agentEvent.sdkBlockIndex === 'number') {
+    flat.sdk_block_index = agentEvent.sdkBlockIndex;
   }
 
   return flat;
@@ -105,7 +144,21 @@ export interface SendFlattenedSessionOutputDeps {
   /** Live reference to per-session injected-message counters (codex echoes). */
   codexInjectedMessages: Map<string, Map<string, number>>;
   sendToPhone(event: PcEvent): void;
+  /**
+   * Returns true when the phone peer has announced support for the named
+   * capability. Used here to gate `local_command_*` / `compact_*` events on
+   * `PEER_CAPABILITIES.LOCAL_COMMAND` so old iOS builds continue to receive
+   * nothing for these (matches today's silent-drop behavior).
+   */
+  hasPeerCapability(name: string): boolean;
 }
+
+const LOCAL_COMMAND_EVENT_TYPES = new Set([
+  'local_command_invoke',
+  'local_command_output',
+  'compact_boundary',
+  'compact_summary',
+]);
 
 export function sendFlattenedSessionOutput(
   deps: SendFlattenedSessionOutputDeps,
@@ -118,6 +171,16 @@ export function sendFlattenedSessionOutput(
     if (consumeInjectedMessage(injected, agentEvent.message)) {
       return;
     }
+  }
+
+  if (LOCAL_COMMAND_EVENT_TYPES.has(agentEvent.type)) {
+    const has = deps.hasPeerCapability(PEER_CAPABILITIES.LOCAL_COMMAND);
+    logger.info('serializer-debug', 'local_command event reached serializer', {
+      type: agentEvent.type,
+      hasCap: has,
+      sessionId,
+    });
+    if (!has) return;
   }
 
   const flat = flattenAgentEvent(sessionId, agentEvent, agentType);
@@ -134,6 +197,11 @@ export interface SendSessionHistoryDeps {
   /** Live reference — read at call time so showToolUse stays current. */
   phonePreferences: Pick<PhonePreferences, 'showToolUse'>;
   sendToPhone(event: PcEvent): void;
+  hasPeerCapability(name: string): boolean;
+  /** Recent controller-mode slash command synths (live-emitted invoke +
+   *  output pairs that JSONL will also contain as `<command-name>` echoes).
+   *  Empty array means no suppression for this session. */
+  getControllerSlashSynthLog(claudeSessionId: string): Array<{ name: string; args: string; syntheticAtMs: number }>;
 }
 
 /**
@@ -150,6 +218,19 @@ export const MAX_SESSION_HISTORY_LIMIT = 200;
  * always ask for more via paginated `get_history`.
  */
 export const DEFAULT_SESSION_HISTORY_LIMIT = 30;
+
+const LOCAL_COMMAND_HISTORY_ROLES = new Set([
+  'local_command_invoke',
+  'local_command_output',
+  'compact_boundary',
+  'compact_summary',
+]);
+
+/** Window between a controller-mode synth and its JSONL echo. Wide enough to
+ *  absorb SDK-side write delay; narrow enough that two real `/cost` calls a
+ *  few seconds apart still each surface (the consume-once semantics handles
+ *  pairing within the window). */
+const SYNTH_SUPPRESS_WINDOW_MS = 10_000;
 
 export function sendSessionHistory(
   deps: SendSessionHistoryDeps,
@@ -185,9 +266,68 @@ export function sendSessionHistory(
     content: m.content.slice(0, 5000),
   }));
 
-  const filtered = deps.phonePreferences.showToolUse
-    ? truncated
-    : truncated.filter(m => m.role !== 'tool_use' && m.role !== 'tool_result');
+  const hasLocalCommandCap = deps.hasPeerCapability(PEER_CAPABILITIES.LOCAL_COMMAND);
+
+  // Build a per-call set of JSONL invoke uuids that are echoes of a
+  // controller-mode synthesis we already pushed live. We then drop those
+  // invokes plus any output rows whose parentInvokeSdkUuid points at a
+  // suppressed invoke. The synth log uses (name, args, ms) — we consume
+  // each entry once, so two real /cost calls 200ms apart still both
+  // surface (one suppressed, the next allowed through).
+  const synthLog = deps.getControllerSlashSynthLog(claudeSessionId).map((s) => ({ ...s, used: false }));
+  const suppressedInvokeUuids = new Set<string>();
+  for (const m of truncated) {
+    if (m.role !== 'local_command_invoke' || !m.sdkUuid) continue;
+    const ts = typeof m.timestamp === 'string' ? Date.parse(m.timestamp) : Number(m.timestamp ?? 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    const match = synthLog.find((s) => !s.used
+      && s.name === m.localCommandName
+      && (s.args ?? '') === (m.localCommandArgs ?? '')
+      && Math.abs(ts - s.syntheticAtMs) <= SYNTH_SUPPRESS_WINDOW_MS);
+    if (match) {
+      match.used = true;
+      suppressedInvokeUuids.add(m.sdkUuid);
+      logger.info('history-debug', 'suppressing JSONL invoke echo of controller synth', {
+        sessionId: claudeSessionId,
+        name: m.localCommandName,
+        args: m.localCommandArgs ?? '',
+        deltaMs: ts - match.syntheticAtMs,
+        sdkUuid: m.sdkUuid,
+      });
+    }
+  }
+
+  const filtered = truncated.filter((m) => {
+    if (!deps.phonePreferences.showToolUse && (m.role === 'tool_use' || m.role === 'tool_result')) {
+      return false;
+    }
+    if (!hasLocalCommandCap && LOCAL_COMMAND_HISTORY_ROLES.has(m.role)) {
+      return false;
+    }
+    if (m.role === 'local_command_invoke' && m.sdkUuid && suppressedInvokeUuids.has(m.sdkUuid)) {
+      return false;
+    }
+    if (m.role === 'local_command_output' && m.parentInvokeSdkUuid && suppressedInvokeUuids.has(m.parentInvokeSdkUuid)) {
+      return false;
+    }
+    return true;
+  });
+
+  const rawCounts: Record<string, number> = {};
+  for (const m of truncated) rawCounts[m.role] = (rawCounts[m.role] || 0) + 1;
+  const filteredCounts: Record<string, number> = {};
+  for (const m of filtered) filteredCounts[m.role] = (filteredCounts[m.role] || 0) + 1;
+  logger.info('history-debug', 'sendSessionHistory', {
+    sessionId: claudeSessionId,
+    incremental,
+    hasLocalCommandCap,
+    rawTotal: truncated.length,
+    filteredTotal: filtered.length,
+    rawInvoke: rawCounts['local_command_invoke'] || 0,
+    rawOutput: rawCounts['local_command_output'] || 0,
+    filteredInvoke: filteredCounts['local_command_invoke'] || 0,
+    filteredOutput: filteredCounts['local_command_output'] || 0,
+  });
 
   const event = {
     type: 'session_history',

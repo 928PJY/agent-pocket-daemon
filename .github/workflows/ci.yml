@@ -14,6 +14,7 @@ jobs:
   build:
     name: Build & Test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -34,10 +35,12 @@ jobs:
         run: npm run build
 
       - name: Run tests
+        timeout-minutes: 3
         run: npm test
 
       - name: Coverage report
         id: coverage
+        timeout-minutes: 5
         run: |
           set -o pipefail
           npm run test:coverage 2>&1 | tee coverage.txt
@@ -53,9 +56,13 @@ jobs:
           path: coverage.md
 
       - name: Generate lcov for Codecov
+        id: lcov
+        timeout-minutes: 5
         run: npm run test:coverage:lcov
+        continue-on-error: true
 
       - name: Upload coverage to Codecov
+        if: steps.lcov.outcome == 'success'
         uses: codecov/codecov-action@v5
         with:
           files: coverage/lcov.info

@@ -38,11 +38,14 @@ import type {
   PermissionMode,
 } from 'agent-pocket-protocol';
 import { PermissionDecision, SessionStatus } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import { SessionObserver } from '../observers/session-observer.js';
 import { sendMessage as terminalSendMessage, sendInterrupt as terminalSendInterrupt, sendQuit as terminalSendQuit } from '../pty/tmux-injector.js';
 import type { TerminalTarget } from '../pty/tmux-injector.js';
 import { killProcessGraceful, waitForPidExit } from '../utils/kill-process-graceful.js';
 import { logger } from '../logger.js';
+import { getObserverCommands } from './observer-commands.js';
+import { parseLocalCommandUserText } from '../utils/local-command-parse.js';
 import { BindingJournal, type HistorifyReason } from '../persistence/binding-journal.js';
 
 export type { HistorifyReason } from '../persistence/binding-journal.js';
@@ -92,8 +95,11 @@ export interface SessionState {
   /** Config used to create this session, needed for respawning */
   config?: SessionConfig;
   messageQueue: string[];
-  /** Messages injected via terminal — used to suppress duplicate echo back to phone */
-  injectedMessages: Set<string>;
+  /** Messages injected via terminal — used to suppress the duplicate JSONL
+   *  echo back to phone, AND to backfill sdk_uuid into message_ack(committed)
+   *  once the echo arrives. Key is the message text; value is the originating
+   *  clientMessageId so we can correlate the echo with the in-flight ack. */
+  injectedMessages: Map<string, string>;
   /** Whether session_started has been emitted at least once */
   hasEmittedStarted: boolean;
   /** Whether the current title was set by the user (custom-title) — locks out
@@ -104,6 +110,33 @@ export interface SessionState {
   lastEmittedThinkingLength: number;
   /** Track emitted tool_use IDs to avoid duplicates */
   emittedToolUseIds: Set<string>;
+  /** Controller mode: a slash command pushed to the SDK whose first reply we
+   *  want to synthesize as local_command_invoke + local_command_output (for
+   *  SDK-internal commands like /cost /status /context that the SDK renders
+   *  as a plain assistant text block instead of wrapping in
+   *  `<local-command-stdout>`). Cleared once consumed, or when thinking/
+   *  tool_use arrives first (signals the command was actually routed to the
+   *  model, e.g. a custom plugin command). */
+  pendingControllerSlash?: {
+    name: string;
+    args: string;
+    sdkUuid: string;
+    pushedAt: number;
+    clientMessageId?: string;
+  };
+  /** Ring of recent controller-mode slash commands the daemon has already
+   *  surfaced to iOS via synthesis (consumed-as-text or latch-cleared). The
+   *  SDK still writes a `<command-name>` row to JSONL for each push, so on
+   *  history-replay the same logical invoke would appear a second time as
+   *  `local_command_invoke` + (optionally) `local_command_output`. The
+   *  serializer consults this list to drop those JSONL echoes within a
+   *  short time window. Bounded to the last 50 entries so it can't grow
+   *  unbounded over long-lived sessions. */
+  controllerSlashSynthLog?: Array<{
+    name: string;
+    args: string;
+    syntheticAtMs: number;
+  }>;
   /** Whether this session is observed (tailing JSONL) rather than controlled (SDK) */
   isObserved: boolean;
   /** Current SDK permission mode for controller-mode sessions. Undefined for observed. */
@@ -133,6 +166,13 @@ export interface SessionManagerConfig {
   /** Override the SDK query() factory. Used by tests to inject a fake Query
    *  without spawning the Claude binary. */
   queryFactory?: QueryFactory;
+  /**
+   * Returns true when the phone announces a peer capability. Used by
+   * `handleSDKMessage` to gate the delta→full-text switch on
+   * PEER_CAPABILITIES.STABLE_SDK_UUID, and propagated to per-session
+   * SessionObservers so the observer makes the same decision.
+   */
+  hasPeerCapability?: (name: string) => boolean;
   /** Optional binding journal for tracking (pid, claudeSessionId, jsonlPath)
    *  state transitions. Defaults to a journal at ~/.agent-pocket/binding.jsonl
    *  unless `bindingJournal: null` is passed (tests). */
@@ -147,6 +187,11 @@ export interface SessionManagerEvents {
   session_interrupted: [sessionId: string, reason: 'streaming' | 'tool_use', source: 'sdk' | 'observer'];
   permission_request: [sessionId: string, requestId: string, toolName: string, toolInput: Record<string, unknown>];
   permission_mode_changed: [sessionId: string, mode: PermissionMode];
+  /** Observer-mode echo of a phone-injected message landed in the JSONL.
+   *  Carries the entry uuid back to the send_message handler so it can
+   *  emit message_ack(committed) with sdk_uuid set, giving iOS the stable
+   *  id it needs to dedup phone-origin user rows on cold start. */
+  phone_origin_committed: [sessionId: string, clientMessageId: string, sdkUuid: string];
   error: [sessionId: string, error: Error];
 }
 
@@ -262,7 +307,7 @@ export class SessionManager extends EventEmitter {
       lastActivity: Date.now(),
       config,
       messageQueue: [],
-      injectedMessages: new Set(),
+      injectedMessages: new Map(),
       hasEmittedStarted: false,
       customTitle: config.name,
       titleIsCustom: config.name ? true : false,
@@ -320,7 +365,7 @@ export class SessionManager extends EventEmitter {
       claudeSessionId,
       config,
       messageQueue: [],
-      injectedMessages: new Set(),
+      injectedMessages: new Map(),
       hasEmittedStarted: false,
       customTitle: config.name,
       titleIsCustom: config.name ? true : false,
@@ -351,7 +396,7 @@ export class SessionManager extends EventEmitter {
   /**
    * Send a user message to an active session.
    */
-  async sendMessage(sessionId: string, message: string): Promise<{ sdkUuid?: string }> {
+  async sendMessage(sessionId: string, message: string, clientMessageId?: string): Promise<{ sdkUuid?: string }> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -392,12 +437,16 @@ export class SessionManager extends EventEmitter {
       });
 
       // Track this message so the JSONL echo can be suppressed (the phone
-      // already rendered it locally). Then inject once via tmux/iTerm2.
-      // We do NOT block ack on JSONL confirmation: when Claude is in
-      // pending_actions or otherwise not in input mode, the keystrokes are
-      // buffered into Claude's own input queue and won't appear in JSONL until
-      // accepted. Retrying would cause duplicate messages.
-      session.injectedMessages.add(message);
+      // already rendered it locally) AND so the echo's entry.uuid can be
+      // backfilled into message_ack(committed). Then inject once via
+      // tmux/iTerm2. We do NOT block ack on JSONL confirmation: when Claude
+      // is in pending_actions or otherwise not in input mode, the keystrokes
+      // are buffered into Claude's own input queue and won't appear in JSONL
+      // until accepted. Retrying would cause duplicate messages. The empty
+      // string is used as a sentinel cid when send_message had no cid (rare;
+      // pre-cap clients) — the suppressor still runs but no backfill ack
+      // fires.
+      session.injectedMessages.set(message, clientMessageId ?? '');
       try {
         terminalSendMessage(session.terminalTarget, message);
       } catch (err) {
@@ -420,8 +469,8 @@ export class SessionManager extends EventEmitter {
           });
         }
       }, probeTimeoutMs).unref();
-      // Observed-mode echo carries sdkUuid via session_output user_message;
-      // no need to wait for it here.
+      // Observed-mode sdkUuid is delivered later via the
+      // phone_origin_committed event when the JSONL echo arrives.
       return {};
     }
 
@@ -433,6 +482,25 @@ export class SessionManager extends EventEmitter {
 
     // If the query is still alive, push directly
     if (session.queryHandle && !session.inputController.closed) {
+      // Latch slash commands so the SDK's first assistant text reply (which
+      // for builtin commands like /cost is the rendered output, not a model
+      // turn) gets synthesized into local_command_invoke + local_command_output.
+      // See pendingControllerSlash docs on SessionState.
+      if (message.startsWith('/') && message.length > 1) {
+        const body = message.slice(1);
+        const spaceIdx = body.indexOf(' ');
+        const name = spaceIdx === -1 ? body : body.slice(0, spaceIdx);
+        const args = spaceIdx === -1 ? '' : body.slice(spaceIdx + 1).trim();
+        if (name) {
+          session.pendingControllerSlash = {
+            name,
+            args,
+            sdkUuid,
+            pushedAt: Date.now(),
+            clientMessageId,
+          };
+        }
+      }
       session.inputController.push({
         type: 'user',
         uuid: sdkUuid,
@@ -542,7 +610,9 @@ export class SessionManager extends EventEmitter {
     const inputController = new StreamInputController();
     inputController.ownerSessionId = sessionId;
 
-    const observer = new SessionObserver(claudeSessionId, jsonlPath);
+    const observer = new SessionObserver(claudeSessionId, jsonlPath, {
+      hasPeerCapability: this.config.hasPeerCapability,
+    });
 
     // Use the JSONL file's mtime as initial lastActivity (more accurate than Date.now())
     let initialLastActivity = Date.now();
@@ -567,7 +637,7 @@ export class SessionManager extends EventEmitter {
       lastActivity: initialLastActivity,
       claudeSessionId,
       messageQueue: [],
-      injectedMessages: new Set(),
+      injectedMessages: new Map(),
       hasEmittedStarted: false,
       titleIsCustom: false,
       lastEmittedTextLength: 0,
@@ -646,9 +716,38 @@ export class SessionManager extends EventEmitter {
       state.hasReceivedEvents = true;
 
       // Suppress user_message events for messages we injected from the phone
-      // (the phone already shows them locally — echoing causes duplicates)
-      if (event.type === 'user_message' && state.injectedMessages.delete(event.message)) {
-        return;
+      // (the phone already shows them locally — echoing causes duplicates).
+      // Before suppressing, backfill the JSONL row's sdk_uuid into the
+      // pending message_ack(committed) so iOS can use it as the stable id.
+      if (event.type === 'user_message') {
+        const cid = state.injectedMessages.get(event.message);
+        if (cid !== undefined) {
+          state.injectedMessages.delete(event.message);
+          const sdkUuid = (event as { sdkUuid?: string }).sdkUuid;
+          if (cid && sdkUuid) {
+            this.emit('phone_origin_committed', sessionId, cid, sdkUuid);
+          }
+          return;
+        }
+      }
+
+      // Same suppress + backfill path for slash commands sent from the phone.
+      // Phone sends "/cost" via send_message; injectedMessages keys on raw text.
+      // Claude Code parses it into a `<command-name>` JSONL row → observer
+      // emits local_command_invoke with name="cost", args="". Reconstruct the
+      // injected text ("/cost" or "/effort medium") and consume the entry,
+      // backfilling the invoke row's sdkUuid as the ack's stable id.
+      if (event.type === 'local_command_invoke') {
+        const reconstructed = event.args ? `/${event.name} ${event.args}` : `/${event.name}`;
+        const cid = state.injectedMessages.get(reconstructed);
+        if (cid !== undefined) {
+          state.injectedMessages.delete(reconstructed);
+          const sdkUuid = (event as { sdkUuid?: string }).sdkUuid;
+          if (cid && sdkUuid) {
+            this.emit('phone_origin_committed', sessionId, cid, sdkUuid);
+          }
+          return;
+        }
       }
 
       this.emit('session_output', sessionId, event);
@@ -729,6 +828,28 @@ export class SessionManager extends EventEmitter {
       if (session.claudeSessionId === claudeSessionId) return session;
     }
     return undefined;
+  }
+
+  /**
+   * Read-only snapshot of recent controller-mode slash command synths for a
+   * Claude session. The serializer's history-replay path uses this to drop
+   * the JSONL `<command-name>` echoes that mirror events we already
+   * surfaced live. Empty array when the session is unknown or has none.
+   */
+  getControllerSlashSynthLog(claudeSessionId: string): Array<{ name: string; args: string; syntheticAtMs: number }> {
+    const session = this.findByClaudeSessionId(claudeSessionId);
+    return session?.controllerSlashSynthLog ?? [];
+  }
+
+  /**
+   * Append a synth entry and prune the ring to its last 50.
+   */
+  private recordControllerSlashSynth(state: SessionState, name: string, args: string): void {
+    if (!state.controllerSlashSynthLog) state.controllerSlashSynthLog = [];
+    state.controllerSlashSynthLog.push({ name, args, syntheticAtMs: Date.now() });
+    if (state.controllerSlashSynthLog.length > 50) {
+      state.controllerSlashSynthLog.splice(0, state.controllerSlashSynthLog.length - 50);
+    }
   }
 
   /**
@@ -1049,7 +1170,7 @@ export class SessionManager extends EventEmitter {
   async getSupportedCommands(sessionId: string): Promise<Awaited<ReturnType<NonNullable<SessionState['queryHandle']>['supportedCommands']>>> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
-    if (session.isObserved) throw new Error('not_supported: observed sessions cannot query supported commands');
+    if (session.isObserved) return await getObserverCommands();
     if (!session.queryHandle) throw new Error('No live query — session is not currently controllable');
     return await session.queryHandle.supportedCommands();
   }
@@ -1416,30 +1537,109 @@ export class SessionManager extends EventEmitter {
 
       case 'assistant': {
         const betaMessage = (message as { message?: { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }> } }).message;
+        const sdkUuid = (message as { uuid?: string }).uuid;
+        const fullTextEmit = this.config.hasPeerCapability?.(PEER_CAPABILITIES.STABLE_SDK_UUID) ?? false;
+
+        // Controller-mode slash-command synthesis: SDK builtin commands like
+        // /cost render their output as a single assistant text block within
+        // ~10ms of the push, never going through `<local-command-stdout>`.
+        // Wrap that first reply into invoke + output events so iOS shows
+        // the same card as observer mode. If the SDK actually invoked the
+        // model (thinking or tool_use first), drop the latch and fall
+        // through — it was a real model turn.
+        const slash = state.pendingControllerSlash;
+        if (slash && betaMessage?.content && betaMessage.content.length > 0) {
+          const firstBlock = betaMessage.content[0];
+          const elapsed = Date.now() - slash.pushedAt;
+          if (firstBlock.type === 'text' && elapsed < 1000) {
+            state.pendingControllerSlash = undefined;
+            const invokeUuid = slash.sdkUuid;
+            const outputUuid = sdkUuid ?? `${invokeUuid}:output`;
+            this.recordControllerSlashSynth(state, slash.name, slash.args);
+            this.emit('session_output', sessionId, {
+              type: 'local_command_invoke',
+              name: slash.name,
+              args: slash.args,
+              sdkUuid: invokeUuid,
+            });
+            this.emit('session_output', sessionId, {
+              type: 'local_command_output',
+              stdout: firstBlock.text ?? '',
+              sdkUuid: outputUuid,
+              parentInvokeSdkUuid: invokeUuid,
+            });
+            if (slash.clientMessageId) {
+              this.emit('phone_origin_committed', sessionId, slash.clientMessageId, invokeUuid);
+            }
+            // Mark the text length as consumed so the rest of this assistant
+            // message (if any) doesn't double-emit.
+            state.lastEmittedTextLength = (firstBlock.text ?? '').length;
+            state.status = SessionStatus.RUNNING;
+            break;
+          }
+          // Real model turn (plugin command like /simplify): there will be
+          // no `<local-command-stdout>` to bind sdk_uuid to, so the
+          // phone-origin invoke card would otherwise sit in .delivered
+          // forever. Emit phone_origin_committed with the slash sdkUuid so
+          // iOS backfills sdk_uuid into the optimistic invoke row and the
+          // card moves to .sent.
+          this.recordControllerSlashSynth(state, slash.name, slash.args);
+          if (slash.clientMessageId) {
+            this.emit('phone_origin_committed', sessionId, slash.clientMessageId, slash.sdkUuid);
+          }
+          state.pendingControllerSlash = undefined;
+        }
+
         if (betaMessage?.content) {
-          for (const block of betaMessage.content) {
+          for (let blockIndex = 0; blockIndex < betaMessage.content.length; blockIndex++) {
+            const block = betaMessage.content[blockIndex];
             switch (block.type) {
               case 'thinking': {
                 const fullText = block.thinking ?? '';
-                // SDK sends full accumulated text; emit only the new delta
-                const delta = fullText.slice(state.lastEmittedThinkingLength);
+                if (fullText.length <= state.lastEmittedThinkingLength) break;
+                const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedThinkingLength);
                 state.lastEmittedThinkingLength = fullText.length;
-                if (delta.length > 0) {
-                  const event: ThinkingEvent = { type: 'thinking', thinking: delta };
-                  state.status = SessionStatus.RUNNING;
-                  this.emit('session_output', sessionId, event);
-                }
+                if (payload.length === 0) break;
+                const event: ThinkingEvent = {
+                  type: 'thinking',
+                  thinking: payload,
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                };
+                state.status = SessionStatus.RUNNING;
+                this.emit('session_output', sessionId, event);
                 break;
               }
               case 'text': {
                 const fullText = block.text ?? '';
-                const delta = fullText.slice(state.lastEmittedTextLength);
-                state.lastEmittedTextLength = fullText.length;
-                if (delta.length > 0) {
-                  const event: AssistantMessageEvent = { type: 'assistant_message', message: delta };
-                  state.status = SessionStatus.RUNNING;
-                  this.emit('session_output', sessionId, event);
+                if (fullText.length <= state.lastEmittedTextLength) break;
+
+                if (fullTextEmit) {
+                  const localCmd = parseLocalCommandUserText(fullText);
+                  if (localCmd === 'drop') {
+                    state.lastEmittedTextLength = fullText.length;
+                    break;
+                  }
+                  if (localCmd) {
+                    state.lastEmittedTextLength = fullText.length;
+                    state.status = SessionStatus.RUNNING;
+                    this.emit('session_output', sessionId, {
+                      ...localCmd,
+                      ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                    });
+                    break;
+                  }
                 }
+
+                const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedTextLength);
+                state.lastEmittedTextLength = fullText.length;
+                if (payload.length === 0) break;
+                const event: AssistantMessageEvent = {
+                  type: 'assistant_message',
+                  message: payload,
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                };
+                state.status = SessionStatus.RUNNING;
+                this.emit('session_output', sessionId, event);
                 break;
               }
               case 'tool_use': {
@@ -1452,6 +1652,7 @@ export class SessionManager extends EventEmitter {
                   tool_id: toolId,
                   tool_name: block.name ?? 'unknown',
                   tool_input: (block.input as Record<string, unknown>) ?? {},
+                  ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
                 };
                 state.status = SessionStatus.RUNNING;
                 this.emit('session_output', sessionId, event);
@@ -1470,6 +1671,7 @@ export class SessionManager extends EventEmitter {
         state.emittedToolUseIds.clear();
 
         const userMessage = (message as { message?: { content?: unknown } }).message;
+        const sdkUuid = (message as { uuid?: string }).uuid;
         const content = userMessage?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -1479,6 +1681,7 @@ export class SessionManager extends EventEmitter {
                 tool_id: block.tool_use_id,
                 status: block.is_error ? 'error' : 'success',
                 output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? ''),
+                ...(sdkUuid ? { sdkUuid } : {}),
               };
               state.status = SessionStatus.RUNNING;
               this.emit('session_output', sessionId, event);

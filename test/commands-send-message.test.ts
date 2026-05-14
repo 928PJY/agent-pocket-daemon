@@ -18,7 +18,7 @@ import type { RunningCliSession, DiscoveredSession } from '../src/discovery/sess
 interface SentError { requestId?: string; message: string; code: string; }
 
 interface SessionManagerStub {
-  sendMessage?: (id: string, message: string) => Promise<{ sdkUuid?: string }>;
+  sendMessage?: (id: string, message: string, clientMessageId?: string) => Promise<{ sdkUuid?: string }>;
   observeSession?: (
     sessionId: string,
     filePath: string,
@@ -28,6 +28,8 @@ interface SessionManagerStub {
     terminalTarget?: TerminalTarget,
     entrypoint?: string,
   ) => string;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  off?: (event: string, listener: (...args: unknown[]) => void) => void;
 }
 
 function makeCtx(overrides: {
@@ -43,7 +45,7 @@ function makeCtx(overrides: {
     resolveInternalSessionId: overrides.resolveInternalSessionId ?? (() => undefined),
     resolveExternalSessionId: (id) => id,
     sendSessionHistory: (id) => { historyCalls.push(id); },
-    sessionManager: (overrides.sessionManager ?? {}) as unknown as CommandContext['sessionManager'],
+    sessionManager: ({ on: () => {}, off: () => {}, ...overrides.sessionManager } ?? {}) as unknown as CommandContext['sessionManager'],
     sessionIdMap: new Map(),
     pendingSessionRequests: new Map(),
   };
