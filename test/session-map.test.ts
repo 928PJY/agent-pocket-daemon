@@ -9,7 +9,6 @@ import {
   gcSessionMap,
   cleanSessionMap,
   removeSessionMapEntries,
-  mergeSyncSessionIds,
   type SessionMap,
 } from '../src/utils/session-map.js';
 
@@ -239,16 +238,4 @@ test('removeSessionMapEntries does not rewrite when nothing matches', () => {
   const removed = removeSessionMapEntries(['missing'], file);
   assert.deepEqual(removed, []);
   assert.equal(fs.statSync(file).mtimeMs, mtimeBefore);
-});
-
-// ---------------------------------------------------------------------------
-// mergeSyncSessionIds (re-exported from utils/session-map.ts)
-// ---------------------------------------------------------------------------
-
-test('mergeSyncSessionIds merges cursors and daemon-known ids without duplicates', () => {
-  const merged = mergeSyncSessionIds(
-    new Map([['x', 1], ['y', 2]]),
-    ['y', 'z'],
-  );
-  assert.deepEqual([...merged].sort(), ['x', 'y', 'z']);
 });

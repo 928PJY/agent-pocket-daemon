@@ -16,9 +16,11 @@ import type {
   SyncRequestCommand,
   FileContentEvent,
   SyncCompleteEvent,
+  SyncAckEvent,
+  SessionHistoryDoneEvent,
 } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES, SessionStatus } from 'agent-pocket-protocol';
 import type { CommandContext } from '../command-context.js';
-import { mergeSyncSessionIds } from '../../utils/session-map.js';
 import { logger } from '../../logger.js';
 
 // ---------------------------------------------------------------------------
@@ -121,40 +123,79 @@ export function handleGetHistory(
 // ---------------------------------------------------------------------------
 
 export function handleSyncRequest(
-  ctx: Pick<CommandContext, 'sendSessionHistory' | 'sendToPhone' | 'sessionManager'>,
+  ctx: Pick<
+    CommandContext,
+    'sendSessionHistory' | 'sendToPhone' | 'sessionManager' | 'hasPeerCapability'
+  >,
   command: SyncRequestCommand,
 ): void {
   const t0 = Date.now();
-  const cursorMap = new Map<string, number>();
-  for (const cursor of command.cursors ?? []) {
-    cursorMap.set(cursor.session_id, cursor.last_seq);
-  }
+  const knownSeqs = command.known_seqs ?? {};
 
-  const known = mergeSyncSessionIds(
-    cursorMap,
-    ctx.sessionManager
-      .getAllSessions()
-      .map((s) => s.claudeSessionId)
-      .filter((id): id is string => typeof id === 'string'),
-  );
+  // The daemon, not the phone, decides which sessions to backfill: every
+  // active session (status != history) currently tracked by SessionManager.
+  // The phone's `known_seqs` map is a *hint* — it tells us which messages
+  // to skip — not a scope filter. This closes the agent-pocket #250 round-2
+  // gap where phones using stale local `lastActivity` rankings missed
+  // sessions newly active during phone-offline windows.
+  const activeSessionIds = ctx.sessionManager
+    .getAllSessions()
+    .filter((s) => s.status !== SessionStatus.HISTORY)
+    .map((s) => s.claudeSessionId)
+    .filter((id): id is string => typeof id === 'string');
+  const targets = new Set<string>(activeSessionIds);
 
   logger.info('daemon', 'sync_request received', {
     requestId: command.request_id,
-    cursors: cursorMap.size,
-    knownSessions: known.size,
+    knownSessions: Object.keys(knownSeqs).length,
+    activeSessions: targets.size,
   });
+
+  // SYNC_ACK: tell the phone immediately that the request landed and how
+  // many sessions are about to be backfilled so the phone can show a
+  // determinate progress signal and shrink its sync_complete watchdog.
+  // Old phones (no SYNC_ACK cap) still see the legacy single sync_complete
+  // terminator.
+  const ackCapable = ctx.hasPeerCapability(PEER_CAPABILITIES.SYNC_ACK);
+  if (ackCapable) {
+    const ack: SyncAckEvent = {
+      type: 'sync_ack',
+      request_id: command.request_id,
+      sessions: Array.from(targets).map((session_id) => ({
+        session_id,
+        // SessionManager doesn't expose per-session message counts cheaply;
+        // 0 is a placeholder that signals "unknown — daemon will still
+        // stream". The phone treats 0 as "no estimate".
+        estimated_messages: 0,
+      })),
+    };
+    ctx.sendToPhone(ack);
+  }
 
   const delivered: SyncCompleteEvent['delivered'] = [];
   const perSessionMs: Record<string, number> = {};
-  for (const sessionId of known) {
+  for (const sessionId of targets) {
     const sessionStart = Date.now();
-    const lastSeq = cursorMap.get(sessionId);
+    const lastSeq = knownSeqs[sessionId];
+    // Phone has seen this session before → ship only the increment.
+    // Phone has never seen it → ship the most-recent tail window
+    // (sendSessionHistory's DEFAULT_SESSION_HISTORY_LIMIT). Older history
+    // is reachable via paginated `get_history` once the user opens the chat.
     const tail = ctx.sendSessionHistory(sessionId, {
-      sinceSeq: lastSeq !== undefined && lastSeq >= 0 ? lastSeq : undefined,
+      sinceSeq: typeof lastSeq === 'number' && lastSeq >= 0 ? lastSeq : undefined,
     });
     perSessionMs[sessionId.slice(0, 8)] = Date.now() - sessionStart;
     if (tail !== undefined) {
       delivered.push({ session_id: sessionId, last_seq: tail });
+      if (ackCapable) {
+        const done: SessionHistoryDoneEvent = {
+          type: 'session_history_done',
+          request_id: command.request_id,
+          session_id: sessionId,
+          last_seq: tail,
+        };
+        ctx.sendToPhone(done);
+      }
     }
   }
 

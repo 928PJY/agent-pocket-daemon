@@ -164,7 +164,19 @@ export function handleVerifyHistory(
     // expected.
     const maxCount = (command as unknown as Record<string, unknown>).max_count;
     const phoneAtMax = maxCount !== undefined && command.count === maxCount;
-    if (!phoneAtMax) {
+
+    // Phone holds a partial window (e.g. after scoped sync only delivered
+    // messages after some after_seq cursor). When phone's head_seq is
+    // strictly greater than the earliest seq we'd expect it to see, phone
+    // is intentionally missing the prefix. tail_seq match above already
+    // proved the window is in sync, so count divergence is expected.
+    const expectedHeadSeq = phoneVisible[0]?.seq;
+    const phoneHoldsPartialWindow =
+      typeof command.head_seq === 'number'
+      && typeof expectedHeadSeq === 'number'
+      && command.head_seq > expectedHeadSeq;
+
+    if (!phoneAtMax && !phoneHoldsPartialWindow) {
       reason = 'count_mismatch';
     }
   }

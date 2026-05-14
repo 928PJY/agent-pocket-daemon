@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { PcEvent } from 'agent-pocket-protocol';
+import { SessionStatus } from 'agent-pocket-protocol';
 import type { CommandContext, SendSessionHistoryOptions } from '../src/commands/command-context.js';
 import {
   detectLanguageFromExtension,
@@ -17,26 +18,37 @@ interface SentEvent { event: PcEvent; }
 interface SentError { requestId?: string; message: string; code: string; }
 interface HistoryCall { sessionId: string; options?: SendSessionHistoryOptions; }
 
-interface FakeSession { claudeSessionId?: string }
+interface FakeSession { claudeSessionId?: string; status?: SessionStatus }
 
 function makeCtx(overrides: {
   sendSessionHistory?: (id: string, opts?: SendSessionHistoryOptions) => number | undefined;
   sessions?: FakeSession[];
+  capabilities?: Set<string>;
 } = {}) {
   const sentEvents: SentEvent[] = [];
   const sentErrors: SentError[] = [];
   const historyCalls: HistoryCall[] = [];
+  const caps = overrides.capabilities ?? new Set<string>();
+  // Default sessions to READY status so existing tests stay simple — they only
+  // exercise the "phone has known seqs" path, not the history-filter behavior.
+  const sessionsWithStatus: FakeSession[] = (overrides.sessions ?? []).map(
+    (s) => ({ status: SessionStatus.READY, ...s }),
+  );
   const ctx: CommandContext = {
     sendToPhone: (event) => { sentEvents.push({ event }); },
     sendError: (requestId, message, code) => { sentErrors.push({ requestId, message, code }); },
     resolveInternalSessionId: (id) => id,
+    resolveExternalSessionId: (id) => id,
     sendSessionHistory: (id, options) => {
       historyCalls.push({ sessionId: id, options });
       return overrides.sendSessionHistory ? overrides.sendSessionHistory(id, options) : undefined;
     },
     sessionManager: {
-      getAllSessions: () => overrides.sessions ?? [],
+      getAllSessions: () => sessionsWithStatus,
     } as unknown as CommandContext['sessionManager'],
+    sessionIdMap: new Map(),
+    pendingSessionRequests: new Map(),
+    hasPeerCapability: (name) => caps.has(name),
   };
   return { ctx, sentEvents, sentErrors, historyCalls };
 }
@@ -167,38 +179,36 @@ test('handleGetHistory passes undefined options through unchanged', () => {
 // handleSyncRequest
 // ---------------------------------------------------------------------------
 
-test('handleSyncRequest replays history for daemon sessions and phone-cursored sessions', () => {
+test('handleSyncRequest backfills every active daemon session, using known_seqs as a hint', () => {
   const { ctx, sentEvents, historyCalls } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
     sendSessionHistory: () => 99,
   });
+  // Phone has only seen sess-b. sess-a is active on the daemon but unknown
+  // to the phone — daemon should still ship it (as a tail window, sinceSeq
+  // undefined). sess-c appears in known_seqs but is NOT active on the
+  // daemon, so it should be ignored (no spurious backfill, no
+  // "0 messages" empty event).
   handleSyncRequest(ctx, {
     type: 'sync_request',
     request_id: 'req-1',
-    cursors: [
-      { session_id: 'sess-b', last_seq: 50 },
-      { session_id: 'sess-c', last_seq: 0 },
-    ],
+    known_seqs: { 'sess-b': 50, 'sess-c': 12 },
   } as never);
 
-  // sessions union: a (daemon), b (both), c (phone)
   const replayedIds = new Set(historyCalls.map((c) => c.sessionId));
-  assert.equal(replayedIds.size, 3);
+  assert.equal(replayedIds.size, 2);
   assert.ok(replayedIds.has('sess-a'));
   assert.ok(replayedIds.has('sess-b'));
-  assert.ok(replayedIds.has('sess-c'));
+  assert.ok(!replayedIds.has('sess-c'));
 
-  // 'sess-b' had a cursor of 50 -> sinceSeq 50; others have no cursor -> sinceSeq undefined
+  // sess-b had a known_seq of 50 → daemon ships incremental from seq 50.
   const callForB = historyCalls.find((c) => c.sessionId === 'sess-b');
   assert.equal(callForB?.options?.sinceSeq, 50);
+  // sess-a was unknown to the phone → daemon ships a tail window (no
+  // sinceSeq), which sendSessionHistory caps via its default limit.
   const callForA = historyCalls.find((c) => c.sessionId === 'sess-a');
   assert.equal(callForA?.options?.sinceSeq, undefined);
 
-  // 'sess-c' last_seq is 0 (>=0) -> sinceSeq 0
-  const callForC = historyCalls.find((c) => c.sessionId === 'sess-c');
-  assert.equal(callForC?.options?.sinceSeq, 0);
-
-  // sync_complete event includes one delivery per session (all returned 99)
   assert.equal(sentEvents.length, 1);
   const ev = sentEvents[0].event as unknown as {
     type: string;
@@ -207,33 +217,57 @@ test('handleSyncRequest replays history for daemon sessions and phone-cursored s
   };
   assert.equal(ev.type, 'sync_complete');
   assert.equal(ev.request_id, 'req-1');
-  assert.equal(ev.delivered.length, 3);
+  assert.equal(ev.delivered.length, 2);
   for (const d of ev.delivered) assert.equal(d.last_seq, 99);
+});
+
+test('handleSyncRequest skips sessions with HISTORY status (archived; phone must use get_history)', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [
+      { claudeSessionId: 'sess-active', status: SessionStatus.READY },
+      { claudeSessionId: 'sess-archived', status: SessionStatus.HISTORY },
+    ],
+    sendSessionHistory: () => 1,
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+  } as never);
+
+  const ids = historyCalls.map((c) => c.sessionId);
+  // Only the active session is shipped; the archived one is silently
+  // skipped on the assumption the user will use get_history if they open it.
+  assert.deepEqual(ids, ['sess-active']);
 });
 
 test('handleSyncRequest excludes sessions whose sendSessionHistory returns undefined', () => {
   const { ctx, sentEvents } = makeCtx({
-    sessions: [{ claudeSessionId: 'sess-a' }],
+    sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
     sendSessionHistory: (id) => (id === 'sess-a' ? undefined : 7),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',
     request_id: 'req-1',
-    cursors: [{ session_id: 'sess-b', last_seq: 0 }],
+    known_seqs: {},
   } as never);
 
   const ev = sentEvents[0].event as unknown as {
     delivered: Array<{ session_id: string; last_seq: number }>;
   };
-  // sess-a returned undefined -> skipped; sess-b returned 7 -> kept
+  // sess-a returned undefined → skipped; sess-b returned 7 → kept.
   assert.equal(ev.delivered.length, 1);
   assert.equal(ev.delivered[0].session_id, 'sess-b');
   assert.equal(ev.delivered[0].last_seq, 7);
 });
 
-test('handleSyncRequest tolerates an empty cursors array and an empty session list', () => {
+test('handleSyncRequest tolerates an empty known_seqs and an empty session list', () => {
   const { ctx, sentEvents, historyCalls } = makeCtx({ sessions: [] });
-  handleSyncRequest(ctx, { type: 'sync_request', request_id: 'req-1' } as never);
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+  } as never);
   assert.equal(historyCalls.length, 0);
   assert.equal(sentEvents.length, 1);
   const ev = sentEvents[0].event as unknown as { type: string; delivered: unknown[] };
@@ -250,7 +284,76 @@ test('handleSyncRequest filters out sessions without claudeSessionId', () => {
     ],
     sendSessionHistory: () => 1,
   });
-  handleSyncRequest(ctx, { type: 'sync_request', request_id: 'req-1' } as never);
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+  } as never);
   const ids = historyCalls.map((c) => c.sessionId);
   assert.deepEqual(ids, ['sess-a']);
+});
+
+test('handleSyncRequest known_seq=0 is treated as a valid cursor (sinceSeq=0 → ship from seq 1)', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: () => 5,
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: { 'sess-a': 0 },
+  } as never);
+  // 0 is a valid lower bound — phone has "seen nothing yet" but is still
+  // doing incremental, not tail-window.
+  const call = historyCalls.find((c) => c.sessionId === 'sess-a');
+  assert.equal(call?.options?.sinceSeq, 0);
+});
+
+test('handleSyncRequest emits sync_ack and session_history_done when SYNC_ACK cap is present', () => {
+  const { ctx, sentEvents } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: (id) => (id === 'sess-a' ? 42 : undefined),
+    capabilities: new Set(['messages.sync_ack']),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: { 'sess-a': 0 },
+  } as never);
+
+  const types = sentEvents.map((e) => (e.event as unknown as { type: string }).type);
+  // Order matters: ack first, per-session done, then complete terminator.
+  assert.deepEqual(types, ['sync_ack', 'session_history_done', 'sync_complete']);
+
+  const ack = sentEvents[0].event as unknown as {
+    request_id: string;
+    sessions: Array<{ session_id: string; estimated_messages: number }>;
+  };
+  assert.equal(ack.request_id, 'req-1');
+  assert.equal(ack.sessions.length, 1);
+  assert.equal(ack.sessions[0].session_id, 'sess-a');
+
+  const done = sentEvents[1].event as unknown as {
+    request_id: string;
+    session_id: string;
+    last_seq: number;
+  };
+  assert.equal(done.request_id, 'req-1');
+  assert.equal(done.session_id, 'sess-a');
+  assert.equal(done.last_seq, 42);
+});
+
+test('handleSyncRequest without SYNC_ACK cap only emits sync_complete (back-compat)', () => {
+  const { ctx, sentEvents } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }],
+    sendSessionHistory: () => 1,
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: { 'sess-a': 0 },
+  } as never);
+
+  const types = sentEvents.map((e) => (e.event as unknown as { type: string }).type);
+  assert.deepEqual(types, ['sync_complete']);
 });

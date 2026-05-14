@@ -204,25 +204,6 @@ export function removeSessionMapEntries(
   }
 }
 
-/**
- * Build the set of session ids to replay during a sync_request: every
- * session the phone declared a cursor for plus every session the daemon
- * currently knows about. Exported for unit testing.
- */
-export function mergeSyncSessionIds(
-  cursorMap: Map<string, number>,
-  daemonKnownSessionIds: Iterable<string>,
-): Set<string> {
-  const merged = new Set<string>();
-  for (const sessionId of cursorMap.keys()) {
-    merged.add(sessionId);
-  }
-  for (const sessionId of daemonKnownSessionIds) {
-    merged.add(sessionId);
-  }
-  return merged;
-}
-
 function defaultIsPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

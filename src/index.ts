@@ -32,7 +32,6 @@ import {
   cleanSessionMap,
   removeSessionMapEntries,
 } from './utils/session-map.js';
-export { mergeSyncSessionIds } from './utils/session-map.js';
 import {
   CodexStopHookDeduper,
   findCodexHookRolloutPath,
@@ -1473,6 +1472,7 @@ export class AgentPocketDaemon extends EventEmitter {
       sessionManager: this.sessionManager,
       sessionIdMap: this.sessionIdMap,
       pendingSessionRequests: this.pendingSessionRequests,
+      hasPeerCapability: (name) => this.hasPeerCapability(name),
     };
   }
 
