@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { SessionDiscovery } from '../src/discovery/session-discovery.js';
+import { SessionSeqAllocatorManager } from '../src/discovery/seq-allocator.js';
 
 test('SessionDiscovery scans recent project sessions with titles and sorted mtimes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-session-discovery-'));
@@ -174,4 +175,57 @@ test('SessionDiscovery reads PID metadata and tolerates malformed files', () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('getSessionHistory: tailSeq tracks max(m.seq) — not the allocator counter (issue #74)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-tail-seq-'));
+  const claudeDir = join(dir, '.claude');
+  const projectDir = join(claudeDir, 'projects', 'project');
+  mkdirSync(projectDir, { recursive: true });
+  const sessionPath = join(projectDir, 'tail-seq.jsonl');
+  // Both rows carry `uuid` so JSONL parsing assigns seq via getOrAssign
+  // (stable, sdk_uuid-keyed) — NOT allocAnonymous. That mirrors the real
+  // session shape where the bug manifests: live emits have already burned
+  // anonymous slots, while every JSONL row has a uuid.
+  writeFileSync(sessionPath, [
+    JSON.stringify({ uuid: 'uuid-1', type: 'user', timestamp: '2026-05-04T00:00:00.000Z', message: { content: 'hi' } }),
+    JSON.stringify({ uuid: 'uuid-2', type: 'assistant', timestamp: '2026-05-04T00:00:01.000Z', message: { content: [{ type: 'text', text: 'ok' }] } }),
+  ].join('\n') + '\n');
+
+  const seqAllocators = new SessionSeqAllocatorManager(join(claudeDir, 'sessions'));
+  const discovery = new SessionDiscovery(claudeDir, seqAllocators);
+  await discovery.discoverSessions();
+
+  // First parse: JSONL rows get seq 1, 2 via getOrAssign(uuid). Caches.
+  const initial = discovery.getSessionHistory('tail-seq', { limit: 10 });
+  assert.equal(initial.tailSeq, 2, 'initial tailSeq matches max parsed seq');
+
+  // Now simulate live-emit path: notification-bookkeeping calls
+  // allocAnonymous() for every session_output without sdk_uuid. This
+  // bumps the allocator counter past every JSONL-derived m.seq.
+  const allocator = seqAllocators.for('tail-seq');
+  for (let i = 0; i < 50; i += 1) allocator.allocAnonymous();
+  assert.ok(allocator.tail() >= 50, 'precondition: allocator counter advanced past parsed max');
+
+  // Second call: hits historyCache (mtime unchanged), so reads tailSeq
+  // without re-parsing. Pre-fix this returned allocator.tail() (≥52),
+  // unreachable through (m.seq) > sinceSeq. Post-fix it returns
+  // max(m.seq) = 2.
+  const history = discovery.getSessionHistory('tail-seq', { limit: 10 });
+  const maxParsedSeq = Math.max(0, ...history.messages.map((m) => m.seq ?? 0));
+
+  assert.equal(history.tailSeq, maxParsedSeq, 'tailSeq must equal the highest seq actually present on a parsed message');
+  assert.ok(history.tailSeq! < allocator.tail(), 'tailSeq must NOT inherit allocator counter (would be unreachable through (m.seq) > sinceSeq)');
+
+  // Phone follow-up gap-fill: since_seq = phone's disk_tail (= our tail).
+  // With the bug, this returned [] because the allocator counter was the
+  // unreachable target. With the fix, since_seq=tail returns 0 messages
+  // legitimately (nothing past max(m.seq) exists), and since_seq=tail-1
+  // returns exactly the trailing message.
+  const empty = discovery.getSessionHistory('tail-seq', { sinceSeq: history.tailSeq });
+  assert.equal(empty.messages.length, 0, 'no messages above the tail');
+  const oneBack = discovery.getSessionHistory('tail-seq', { sinceSeq: (history.tailSeq ?? 1) - 1 });
+  assert.equal(oneBack.messages.length, 1, 'exactly the trailing message is reachable via since_seq=tail-1');
+
+  rmSync(dir, { recursive: true, force: true });
 });

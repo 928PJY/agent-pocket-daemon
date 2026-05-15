@@ -235,12 +235,21 @@ export class CodexDiscovery {
       const total = filtered.length;
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
+      // tailSeq must reflect what the JSONL filter can actually serve, not
+      // the allocator counter — see issue #74. Anonymous live emits bump
+      // the counter without ever appearing on a parsed history row, so a
+      // counter-derived tail produces unreachable gap-fill targets.
+      let maxSeq = 0;
+      for (const m of allMessages) {
+        const s = m.seq ?? 0;
+        if (s > maxSeq) maxSeq = s;
+      }
       return {
         messages: filtered.slice(start, end),
         totalCount: total,
         offset,
         hasMore: start > 0,
-        tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
+        tailSeq: maxSeq > 0 ? maxSeq : undefined,
       };
     } catch (err) {
       logger.warn('codex-discovery', `Codex history read failed: ${(err as Error).message}`, { sessionId });
