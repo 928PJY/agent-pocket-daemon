@@ -1,6 +1,6 @@
 {
   "name": "agent-pocket",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Daemon that bridges Claude Code sessions on your Mac to the Agent Pocket iOS app — remote control, permission approvals, and session monitoring with end-to-end encryption.",
   "type": "module",
   "main": "./dist/index.js",
