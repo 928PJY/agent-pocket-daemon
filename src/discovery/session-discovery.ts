@@ -412,6 +412,18 @@ export class SessionDiscovery {
           msg.session_seq = seq;
         }
 
+        // Re-sort by seq so the array order matches the canonical seq order.
+        // Why: allocator hands out seq in *chronological* order on first parse,
+        // but on subsequent re-parses (JSONL grew) any row whose timestamp is
+        // older than the current allocator tail (subagent backfill, late
+        // arrivals, codex injected echoes) gets a *fresh* high seq — its
+        // timestamp says "old" but its seq says "newest". Without this re-sort,
+        // the array order disagrees with seq order, and the phone — which
+        // sorts by seq — sees a different sequence than the daemon's history
+        // page reports. ChatMessage.less is seq-primary, so phone-side dump
+        // and daemon-side dump must agree.
+        allMessages.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+
         // Cache the parsed history
         this.historyCache.set(sessionId, { messages: allMessages, mtime });
       }
