@@ -56,6 +56,7 @@ function makeDeps(overrides: Partial<ListSessionsDeps> = {}): ListSessionsDeps {
     pendingBlockingRequests: new Map(),
     replacedSessionIds: new Set(),
     claudeAgentVersion: '4.0.0',
+    getSeqTail: () => undefined,
     ...overrides,
   };
 }
@@ -515,4 +516,64 @@ test('handleListSessions emits LIST_SESSIONS_ERROR when discovery throws', async
   assert.equal(sentErrors[0].code, 'LIST_SESSIONS_ERROR');
   assert.ok(sentErrors[0].message.includes('disk dead'));
   assert.equal(sentErrors[0].requestId, 'req-1');
+});
+
+// ---------------------------------------------------------------------------
+// tail_seq carry — MESSAGES_PRECISE_DIVERGENCE
+// ---------------------------------------------------------------------------
+//
+// Each session_list item must carry the daemon's allocator high-water mark
+// for that session as `tail_seq`. The phone uses it to skip a network
+// round-trip when its disk-cache tail already matches: see
+// AppState+SessionHistory.swift `loadInitialMessages` once protocol 0.8.0
+// support lands. Without this carry, the phone has no way to know whether
+// its cache is up to date, and is forced to request the daemon's tail
+// window on every session open — which is precisely the bug that drove the
+// `messages.precise_divergence` capability.
+
+test('handleListSessions stamps tail_seq from getSeqTail onto each tracked session', async () => {
+  const { ctx, sentEvents } = makeCtx();
+  const tracked = makeTracked({ claudeSessionId: 'claude-A' });
+  await handleListSessions(
+    ctx,
+    makeDeps({
+      getAllTrackedSessions: () => [tracked],
+      getSeqTail: (id) => (id === 'claude-A' ? 466 : undefined),
+    }),
+    baseCmd(),
+  );
+  const list = lastSessionListEvent(sentEvents);
+  assert.equal(list.sessions.length, 1);
+  assert.equal(list.sessions[0].tail_seq, 466);
+});
+
+test('handleListSessions omits tail_seq when allocator has no entry yet (brand-new session)', async () => {
+  const { ctx, sentEvents } = makeCtx();
+  const tracked = makeTracked({ claudeSessionId: 'claude-fresh' });
+  await handleListSessions(
+    ctx,
+    makeDeps({
+      getAllTrackedSessions: () => [tracked],
+      getSeqTail: () => undefined,
+    }),
+    baseCmd(),
+  );
+  const list = lastSessionListEvent(sentEvents);
+  assert.equal(list.sessions[0].tail_seq, undefined);
+});
+
+test('handleListSessions stamps tail_seq onto Codex sessions too', async () => {
+  const { ctx, sentEvents } = makeCtx();
+  await handleListSessions(
+    ctx,
+    makeDeps({
+      discoverCodexSessions: () => [makeCodex()],
+      getSeqTail: (id) => (id === 'codex:thread-1' ? 12 : undefined),
+    }),
+    baseCmd(),
+  );
+  const list = lastSessionListEvent(sentEvents);
+  const codex = list.sessions.find((s) => s.session_id === 'codex:thread-1');
+  assert.ok(codex);
+  assert.equal(codex.tail_seq, 12);
 });

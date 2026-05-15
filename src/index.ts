@@ -300,8 +300,11 @@ export class AgentPocketDaemon extends EventEmitter {
     peek: () => this.messageSeq,
     getAndIncrement: () => this.messageSeq++,
   };
-  // Per-session monotonic seq for session_output events (for phone gap detection)
-  private sessionSeqCounters: Map<string, number> = new Map();
+  // Per-session sdk_uuid → session_seq allocator (persisted to disk).
+  // Shared with sessionDiscovery so history parse and live session_output
+  // emission draw from the same monotonic counter.
+  // Initialized once sessionDiscovery is constructed.
+  private seqAllocators!: import('./discovery/seq-allocator.js').SessionSeqAllocatorManager;
   // Last seq the phone has acked per session (best-effort telemetry)
   private lastAckedSeqs: Map<string, number> = new Map();
   // Phone preferences (sent via set_preferences command)
@@ -390,7 +393,9 @@ export class AgentPocketDaemon extends EventEmitter {
     }
 
     this.sessionDiscovery = new SessionDiscovery();
-    this.codexDiscovery = new CodexDiscovery();
+    this.seqAllocators = this.sessionDiscovery.getSeqAllocators();
+    this.seqAllocators.preloadAllFromDisk();
+    this.codexDiscovery = new CodexDiscovery(undefined, this.seqAllocators);
     this.claudeAgentVersion = detectClaudeVersion();
     this.hookServer = new HookServer(HOOK_SERVER_PORT);
     this.hookServer.setControllerSessionPredicate((claudeSessionId) => {
@@ -399,7 +404,7 @@ export class AgentPocketDaemon extends EventEmitter {
     });
 
     this.bookkeeping = createNotificationBookkeeping({
-      sessionSeqCounters: this.sessionSeqCounters,
+      seqAllocators: this.seqAllocators,
       pendingBlockingRequests: this.pendingBlockingRequests as unknown as Map<string, PendingBlockingRequestEntry>,
       pendingNotificationDeliveries: this.pendingNotificationDeliveries as unknown as Map<string, PendingNotificationDeliveryEntry>,
       getConnectionMode: () => this.config.connectionMode,
@@ -522,6 +527,7 @@ export class AgentPocketDaemon extends EventEmitter {
     }
     this.codexObservers.clear();
     await this.sessionManager.shutdown();
+    this.seqAllocators.flushAllSync();
   }
 
   /**
@@ -1334,6 +1340,7 @@ export class AgentPocketDaemon extends EventEmitter {
       replacedSessionIds: this.replacedSessionIds,
       claudeAgentVersion: this.claudeAgentVersion,
       getBindingJournal: () => this.sessionManager.getBindingJournal(),
+      getSeqTail: (id) => this.seqAllocators.peekTail(id),
     };
   }
 

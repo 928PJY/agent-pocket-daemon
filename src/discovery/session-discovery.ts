@@ -11,6 +11,7 @@ import { logger } from '../logger.js';
 import { parseHistoryEntry } from './jsonl-parser.js';
 import { getSubagentHistory } from './subagent-history.js';
 import { PREFETCH_CWD } from '../sessions/observer-commands.js';
+import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import {
   getRunningCliSessions as scanRunningCliSessions,
   getRunningAllSessions as scanRunningAllSessions,
@@ -99,12 +100,19 @@ export interface HistoryMessage {
    *  (history backfill, multiple outputs interleaved). */
   parentInvokeSdkUuid?: string;
   /**
-   * Per-session monotonically increasing seq assigned in chronological
-   * order when history is parsed from disk. Stable across calls (same
-   * mtime → same seq), so phone can use it as the canonical ordering /
-   * gap-detection key. Starts at 1.
+   * Per-session monotonic seq assigned by the SessionSeqAllocator. Legacy
+   * field name kept for back-compat with old phones; new code should use
+   * `session_seq` (mirrored value). Always populated when the daemon has
+   * a non-empty seq allocator for this session.
    */
   seq?: number;
+  /**
+   * Same value as `seq` but with the seq-authoritative contract attached:
+   * stable across daemon restarts and JSONL re-parses, shared with the
+   * live `SessionOutputEvent.session_seq` allocator. Always set when the
+   * daemon announces PEER_CAPABILITIES.MESSAGES_SEQ_AUTHORITATIVE.
+   */
+  session_seq?: number;
 }
 
 export interface HistoryPage {
@@ -150,9 +158,19 @@ export class SessionDiscovery {
   private claudeDir: string;
   private cachedSessions: DiscoveredSession[] | null = null;
   private historyCache: Map<string, { messages: HistoryMessage[]; mtime: number }> = new Map();
+  private readonly seqAllocators: SessionSeqAllocatorManager;
 
-  constructor(claudeDir?: string) {
+  constructor(claudeDir?: string, seqAllocators?: SessionSeqAllocatorManager) {
     this.claudeDir = claudeDir ?? path.join(os.homedir(), '.claude');
+    this.seqAllocators = seqAllocators ?? new SessionSeqAllocatorManager(
+      path.join(this.claudeDir, 'sessions'),
+    );
+  }
+
+  /** Expose the allocator manager so live wire paths (notification-bookkeeping)
+   *  can share the same per-session allocators used during history parse. */
+  getSeqAllocators(): SessionSeqAllocatorManager {
+    return this.seqAllocators;
   }
 
   /**
@@ -375,10 +393,23 @@ export class SessionDiscovery {
           });
         }
 
-        // Assign per-session monotonic seq in final chronological order.
-        // Same mtime → same parse → same seq, so phone can rely on it.
-        for (let i = 0; i < allMessages.length; i++) {
-          allMessages[i].seq = i + 1;
+        // Assign per-session monotonic seq via the persistent allocator.
+        // Iteration order = chronological (we just sorted), so the first
+        // time we see a sdk_uuid it gets the next free seq; subsequent
+        // parses (same uuid) reuse the persisted seq → stable across
+        // daemon restarts and JSONL re-parses. Rows missing sdk_uuid
+        // (rare; some legacy JSONL fragments) get an anonymous seq drawn
+        // from the same counter so order stays monotonic.
+        const allocator = this.seqAllocators.for(sessionId);
+        for (const msg of allMessages) {
+          let seq: number;
+          if (msg.sdkUuid) {
+            seq = allocator.getOrAssign(msg.sdkUuid, msg.sdkBlockIndex);
+          } else {
+            seq = allocator.allocAnonymous();
+          }
+          msg.seq = seq;
+          msg.session_seq = seq;
         }
 
         // Cache the parsed history
@@ -411,7 +442,12 @@ export class SessionDiscovery {
       const total = parentMsgs.length;
       const parentEnd = Math.max(total - offset, 0);
       const parentStart = Math.max(parentEnd - limit, 0);
-      const tailSeq = allMessages.length > 0 ? allMessages[allMessages.length - 1].seq : undefined;
+      // Authoritative tail comes from the allocator: every seq it ever
+      // assigned is < nextSeq. The last element of `allMessages` may
+      // have an older (re-used) seq when newer rows happen to be older
+      // sdk_uuids, so reading from the array tail is unsafe.
+      const allocatorTail = this.seqAllocators.for(sessionId).tail();
+      const tailSeq = allocatorTail > 0 ? allocatorTail : undefined;
 
       let pageMessages: HistoryMessage[] = [];
       if (parentStart < parentEnd) {

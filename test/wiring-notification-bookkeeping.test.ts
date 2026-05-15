@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   createNotificationBookkeeping,
   type NotificationBookkeepingDeps,
@@ -9,6 +12,7 @@ import {
   type LanSink,
   type RekeyController,
 } from '../src/wiring/notification-bookkeeping.js';
+import { SessionSeqAllocatorManager } from '../src/discovery/seq-allocator.js';
 import {
   PEER_CAPABILITIES,
   BLOCKING_RETRY_INTERVAL_MS,
@@ -72,7 +76,7 @@ interface Fixture {
   rekey: FakeRekey;
   blocking: Map<string, PendingBlockingRequestEntry>;
   notif: Map<string, PendingNotificationDeliveryEntry>;
-  seq: Map<string, number>;
+  seq: SessionSeqAllocatorManager;
   capabilities: Set<string>;
   sessions: Array<{ sessionId: string; claudeSessionId?: string; status?: SessionStatus; pendingPermissions?: Map<string, unknown> }>;
   pendingPermissionIds: Set<string>;
@@ -86,7 +90,7 @@ function makeFixture(opts: { mode?: 'relay' | 'lan'; capabilities?: string[]; ph
   const rekey = makeRekey();
   const blocking = new Map<string, PendingBlockingRequestEntry>();
   const notif = new Map<string, PendingNotificationDeliveryEntry>();
-  const seq = new Map<string, number>();
+  const seq = new SessionSeqAllocatorManager(fs.mkdtempSync(path.join(os.tmpdir(), 'seqmap-test-')));
   const capabilities = new Set(opts.capabilities ?? []);
   const sessions: Fixture['sessions'] = [];
   const pendingPermissionIds = new Set<string>();
@@ -94,7 +98,7 @@ function makeFixture(opts: { mode?: 'relay' | 'lan'; capabilities?: string[]; ph
   let mode: 'relay' | 'lan' | undefined = opts.mode ?? 'relay';
 
   const deps: NotificationBookkeepingDeps = {
-    sessionSeqCounters: seq,
+    seqAllocators: seq,
     pendingBlockingRequests: blocking,
     pendingNotificationDeliveries: notif,
     getConnectionMode: () => mode,
@@ -157,7 +161,7 @@ test('sendToPhone: stamps session_seq on session_output events', () => {
   f.bk.sendToPhone(e2);
   assert.equal((e1 as unknown as { session_seq: number }).session_seq, 1);
   assert.equal((e2 as unknown as { session_seq: number }).session_seq, 2);
-  assert.equal(f.seq.get('s1'), 2);
+  assert.equal(f.seq.for('s1').tail(), 2);
 });
 
 test('sendToPhone: does not overwrite an existing session_seq', () => {
@@ -165,7 +169,7 @@ test('sendToPhone: does not overwrite an existing session_seq', () => {
   const e = { type: 'session_output', session_id: 's1', session_seq: 42 } as unknown as PcEvent;
   f.bk.sendToPhone(e);
   assert.equal((e as unknown as { session_seq: number }).session_seq, 42);
-  assert.equal(f.seq.has('s1'), false);
+  assert.equal(f.seq.for('s1').tail(), 0);
 });
 
 test('sendToPhone: skips session_seq stamping when session_id is missing', () => {
@@ -173,7 +177,6 @@ test('sendToPhone: skips session_seq stamping when session_id is missing', () =>
   const e = { type: 'session_output' } as unknown as PcEvent;
   f.bk.sendToPhone(e);
   assert.equal((e as unknown as { session_seq?: number }).session_seq, undefined);
-  assert.equal(f.seq.size, 0);
 });
 
 test('sendToPhone: triggers rekey reset when crypto needs rekey', () => {
