@@ -18,6 +18,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { readlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import {
   findTerminalForPid as defaultFindTerminalForPid,
@@ -41,6 +42,29 @@ export function isProcessSuspendedOrZombie(pid: number): boolean {
   }
 }
 
+export function getLiveProcessCwd(pid: number): string | undefined {
+  if (pid <= 0) return undefined;
+
+  if (process.platform === 'linux') {
+    try {
+      return readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  try {
+    const output = execFileSync('lsof', ['-a', '-d', 'cwd', '-Fn', '-p', String(pid)], {
+      encoding: 'utf-8',
+      timeout: 2000,
+    });
+    const line = output.split('\n').find((part) => part.startsWith('n'));
+    return line && line.length > 1 ? line.slice(1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface RunningCliSession {
   pid: number;
   sessionId: string;
@@ -55,6 +79,7 @@ export interface PidScannerDeps {
   killFn?: (pid: number, signal: 0) => void;
   findTerminalForPid?: (pid: number) => TerminalTarget | null;
   isProcessSuspendedOrZombie?: (pid: number) => boolean;
+  getLiveProcessCwd?: (pid: number) => string | undefined;
 }
 
 interface PidFileRow {
@@ -105,6 +130,7 @@ function projectRunning(
 ): RunningCliSession[] {
   const findTerm = deps.findTerminalForPid ?? defaultFindTerminalForPid;
   const isSusp = deps.isProcessSuspendedOrZombie ?? isProcessSuspendedOrZombie;
+  const liveCwd = deps.getLiveProcessCwd ?? getLiveProcessCwd;
 
   const out: RunningCliSession[] = [];
   for (const { data, pid } of rows) {
@@ -118,7 +144,7 @@ function projectRunning(
     out.push({
       pid,
       sessionId: (data.sessionId as string) ?? '',
-      cwd: (data.cwd as string) ?? '',
+      cwd: liveCwd(pid) ?? (data.cwd as string) ?? '',
       terminalTarget: entrypoint === 'cli' ? (findTerm(pid) ?? undefined) : undefined,
       entrypoint,
       name: typeof data.name === 'string' ? (data.name as string) : undefined,

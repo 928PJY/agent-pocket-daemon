@@ -16,8 +16,10 @@ import {
   getRunningCliSessions as scanRunningCliSessions,
   getRunningAllSessions as scanRunningAllSessions,
   getRunningSessionEntrypoints as scanRunningSessionEntrypoints,
+  isProcessSuspendedOrZombie,
+  getLiveProcessCwd,
 } from './pid-scanner.js';
-export { isProcessSuspendedOrZombie } from './pid-scanner.js';
+export { isProcessSuspendedOrZombie, getLiveProcessCwd };
 
 // Cap individual tool_output strings when shipping history to the phone.
 const HISTORY_TOOL_OUTPUT_CAP = 5000;
@@ -241,7 +243,7 @@ export class SessionDiscovery {
           return {
             pid,
             sessionId: data.sessionId as string,
-            cwd: (data.cwd as string) ?? '',
+            cwd: getLiveProcessCwd(pid) ?? (data.cwd as string) ?? '',
             entrypoint: (data.entrypoint as string) ?? 'unknown',
             isAlive,
             name: typeof data.name === 'string' ? (data.name as string) : undefined,
