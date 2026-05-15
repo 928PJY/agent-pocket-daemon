@@ -215,6 +215,11 @@ export class CodexDiscovery {
           msg.seq = seq;
           msg.session_seq = seq;
         }
+        // Re-sort by seq so array order matches canonical seq order. See
+        // session-discovery.ts for the full rationale — same reasoning here:
+        // late-arriving rows on JSONL re-parse get fresh high seq, breaking
+        // chronological array order vs seq order otherwise.
+        allMessages.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
         this.historyCache.set(session.threadId, { messages: allMessages, mtime: stat.mtimeMs });
       }
 
