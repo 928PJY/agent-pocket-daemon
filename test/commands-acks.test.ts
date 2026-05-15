@@ -378,3 +378,58 @@ test('handleVerifyHistory ignores tail_seq mismatch when the daemon has no tailS
   // Match on count, no tail to compare against -> silent.
   assert.equal(sentEvents.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Regression: long sessions where daemon's full history exceeds the wire
+// tail-window. #250 round 2 dropped the default tail window from 200 to 30
+// to bound first-look fan-out, which created a class of bug: phones whose
+// in-memory window had been trimmed reported in-memory count + tail to
+// `verify_history`, daemon read it as "phone is missing 200+ messages",
+// fired `history_divergence`, phone re-fetched a 30-message window that
+// couldn't close the gap, repeat. iOS-side fix is to report DISK count/tail
+// (PEER_CAPABILITIES.MESSAGES_PRECISE_DIVERGENCE). The contract this test
+// pins down: when the phone's report matches daemon's full history,
+// `handleVerifyHistory` MUST stay silent — no matter how big the session.
+// Without this regression test future refactors of the daemon's tail-window
+// default could silently re-introduce the divergence loop.
+test('handleVerifyHistory is silent when phone reports full disk truth (337-msg session)', () => {
+  // 337 visible messages, tail_seq=466 (matches the production scenario
+  // captured in the daemon log that motivated this fix).
+  const messages = Array.from({ length: 337 }, (_, i) => ({
+    role: 'user' as const,
+    content: `m${i}`,
+    seq: i + 130,
+  }));
+  const page = makeHistoryPage(messages, 466);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-long',
+    count: 337,
+    head_seq: 130,
+    tail_seq: 466,
+  } as never);
+  assert.equal(sentEvents.length, 0,
+    'phone reporting disk-truth count/tail must converge — divergence here re-creates the iOS refetch loop');
+});
+
+test('handleVerifyHistory still flags real loss in long sessions (phone behind by 1 tail msg)', () => {
+  const messages = Array.from({ length: 337 }, (_, i) => ({
+    role: 'user' as const,
+    content: `m${i}`,
+    seq: i + 130,
+  }));
+  const page = makeHistoryPage(messages, 466);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-long',
+    count: 336,
+    head_seq: 130,
+    tail_seq: 465,
+  } as never);
+  assert.equal(sentEvents.length, 1, 'genuine 1-msg loss must still trigger divergence');
+  const ev = sentEvents[0].event as unknown as { reason: string; expected_tail_seq?: number };
+  assert.equal(ev.reason, 'tail_seq_mismatch');
+  assert.equal(ev.expected_tail_seq, 466);
+});

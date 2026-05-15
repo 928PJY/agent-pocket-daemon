@@ -67,6 +67,12 @@ export interface ListSessionsDeps {
   // suppress phantom Phase-2 rows whose JSONL has been adopted by a
   // different live PID (Anomaly B's `528fcedd-104` ghost).
   getBindingJournal?: () => { lastObserveForJsonl: (jsonlPath: string) => { pid: number } | undefined } | null;
+  /** Highest seq the persistent allocator has ever assigned for `sessionId`,
+   *  or `undefined` for sessions that don't yet have an allocator state on
+   *  disk. Stamped onto each `SessionInfo.tail_seq` so the phone can skip
+   *  network roundtrips when its own disk-cache tail already matches.
+   *  See PEER_CAPABILITIES.MESSAGES_PRECISE_DIVERGENCE. */
+  getSeqTail: (sessionId: string) => number | undefined;
 }
 
 const CLAUDE_CODE_CAPABILITIES = [
@@ -140,8 +146,10 @@ export async function handleListSessions(
       const historyPage = isCodexSessionId(historyKey)
         ? deps.getCodexHistory(historyKey, { limit: 3 })
         : deps.getSessionHistory(historyKey, { limit: 3 });
+      const tailSeq = deps.getSeqTail(historyKey);
       return {
         ...entry,
+        ...(tailSeq !== undefined ? { tail_seq: tailSeq } : {}),
         recent_messages: historyPage.messages.map((m) => ({
           role: m.role,
           content: m.content.slice(0, 200),

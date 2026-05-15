@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { ClaudeEvent } from 'agent-pocket-protocol';
 import type { HistoryMessage, HistoryPage } from './session-discovery.js';
+import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
 
@@ -53,9 +54,15 @@ export class CodexDiscovery {
   private cachedSessions: CodexSession[] | null = null;
   private registeredSessions: Map<string, CodexSession> = new Map();
   private historyCache: Map<string, { messages: HistoryMessage[]; mtime: number }> = new Map();
+  private readonly seqAllocators: SessionSeqAllocatorManager;
 
-  constructor(codexDir?: string) {
+  constructor(codexDir?: string, seqAllocators?: SessionSeqAllocatorManager) {
     this.codexDir = codexDir ?? path.join(os.homedir(), '.codex');
+    this.seqAllocators = seqAllocators ?? new SessionSeqAllocatorManager();
+  }
+
+  getSeqAllocators(): SessionSeqAllocatorManager {
+    return this.seqAllocators;
   }
 
   discoverSessions(limit = 200): CodexSession[] {
@@ -198,8 +205,15 @@ export class CodexDiscovery {
             // Ignore malformed or partial lines.
           }
         }
-        for (let i = 0; i < allMessages.length; i++) {
-          allMessages[i].seq = i + 1;
+        for (const msg of allMessages) {
+          let seq: number;
+          if (msg.sdkUuid) {
+            seq = this.seqAllocators.for(session.threadId).getOrAssign(msg.sdkUuid, msg.sdkBlockIndex);
+          } else {
+            seq = this.seqAllocators.for(session.threadId).allocAnonymous();
+          }
+          msg.seq = seq;
+          msg.session_seq = seq;
         }
         this.historyCache.set(session.threadId, { messages: allMessages, mtime: stat.mtimeMs });
       }
@@ -226,7 +240,7 @@ export class CodexDiscovery {
         totalCount: total,
         offset,
         hasMore: start > 0,
-        tailSeq: allMessages.length > 0 ? allMessages[allMessages.length - 1].seq : undefined,
+        tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
       };
     } catch (err) {
       logger.warn('codex-discovery', `Codex history read failed: ${(err as Error).message}`, { sessionId });

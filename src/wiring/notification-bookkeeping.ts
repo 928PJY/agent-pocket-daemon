@@ -30,6 +30,7 @@ import { notificationDeliveryKey as buildNotificationDeliveryKey } from '../comm
 import { logger } from '../logger.js';
 import type { HookServer } from '../hooks/hook-server.js';
 import type { SessionManager } from '../sessions/session-manager.js';
+import type { SessionSeqAllocatorManager } from '../discovery/seq-allocator.js';
 
 // ---------------------------------------------------------------------------
 // Live entry shapes (mirror the in-class Map values in src/index.ts)
@@ -82,8 +83,11 @@ export interface RekeyController {
 // ---------------------------------------------------------------------------
 
 export interface NotificationBookkeepingDeps {
-  /** Live reference to the daemon's per-session monotonic seq map. */
-  sessionSeqCounters: Map<string, number>;
+  /** Persistent per-session seq allocator. Live `session_output` events
+   *  draw their `session_seq` from the same allocator the JSONL parser
+   *  uses, so seq values are consistent across history backfill and live
+   *  emission and stable across daemon restarts. */
+  seqAllocators: SessionSeqAllocatorManager;
   /** Live reference to the daemon's pending blocking-request map. */
   pendingBlockingRequests: Map<string, PendingBlockingRequestEntry>;
   /** Live reference to the daemon's pending notification-delivery map. */
@@ -168,9 +172,16 @@ export function createNotificationBookkeeping(
     if ((event as { type?: string })?.type === 'session_output') {
       const out = event as SessionOutputEvent;
       if (out.session_id && out.session_seq === undefined) {
-        const next = (deps.sessionSeqCounters.get(out.session_id) ?? 0) + 1;
-        deps.sessionSeqCounters.set(out.session_id, next);
-        out.session_seq = next;
+        const allocator = deps.seqAllocators.for(out.session_id);
+        // Prefer stable allocation keyed on the row uuid so the same
+        // assistant block keeps its seq across daemon restarts and
+        // history re-parses. Fallback to anonymous when the daemon
+        // synthesizes an event with no transcript backing (rare).
+        if (out.sdk_uuid) {
+          out.session_seq = allocator.getOrAssign(out.sdk_uuid, out.sdk_block_index);
+        } else {
+          out.session_seq = allocator.allocAnonymous();
+        }
       }
     }
 
