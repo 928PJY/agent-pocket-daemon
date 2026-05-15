@@ -442,12 +442,22 @@ export class SessionDiscovery {
       const total = parentMsgs.length;
       const parentEnd = Math.max(total - offset, 0);
       const parentStart = Math.max(parentEnd - limit, 0);
-      // Authoritative tail comes from the allocator: every seq it ever
-      // assigned is < nextSeq. The last element of `allMessages` may
-      // have an older (re-used) seq when newer rows happen to be older
-      // sdk_uuids, so reading from the array tail is unsafe.
-      const allocatorTail = this.seqAllocators.for(sessionId).tail();
-      const tailSeq = allocatorTail > 0 ? allocatorTail : undefined;
+      // Authoritative tail must reflect what the JSONL-derived `m.seq` filter
+      // can actually serve — not the allocator's internal counter. The
+      // counter is bumped by every live `allocAnonymous()` (no sdk_uuid),
+      // and those increments never appear on a parsed history row, so a
+      // counter-derived tail is unreachable through `(m.seq) > sinceSeq`
+      // and phone's gap-fill request against it returns 0 messages
+      // (issue #74). Use the highest seq actually present on a parsed
+      // message instead. `m.seq` is monotonic per row but may not be
+      // strictly increasing across the array (older sdk_uuids re-bind to
+      // their original seq), so we take a max rather than the tail element.
+      let maxSeq = 0;
+      for (const m of allMessages) {
+        const s = m.seq ?? 0;
+        if (s > maxSeq) maxSeq = s;
+      }
+      const tailSeq = maxSeq > 0 ? maxSeq : undefined;
 
       let pageMessages: HistoryMessage[] = [];
       if (parentStart < parentEnd) {
