@@ -331,11 +331,22 @@ export function sendSessionHistory(
     filteredOutput: filteredCounts['local_command_output'] || 0,
   });
 
+  // Strip daemon-internal normalization fields before shipping the wire
+  // event. tsMs / parseIndex are bookkeeping for the (tsMs, parseIndex)
+  // sort and the since_ms filter — wire timestamp is already re-encoded
+  // from tsMs so the phone doesn't need either field. Without this the
+  // phone sees opaque numeric fields it doesn't model and old phones
+  // running stricter codable parsers may reject the row.
+  const wireMessages = filtered.map((m) => {
+    const { tsMs: _ts, parseIndex: _pi, ...rest } = m as { tsMs?: number; parseIndex?: number } & Record<string, unknown>;
+    return rest;
+  });
+
   const event = {
     type: 'session_history',
     session_id: claudeSessionId,
     agent_type: isCodexSessionId(claudeSessionId) ? 'codex' : 'claude_code',
-    messages: filtered,
+    messages: wireMessages,
     total_count: result.totalCount,
     offset: result.offset,
     has_more: result.hasMore,

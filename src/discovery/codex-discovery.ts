@@ -243,6 +243,12 @@ export class CodexDiscovery {
           return (a.parseIndex ?? 0) - (b.parseIndex ?? 0);
         });
         for (let i = 0; i < allMessages.length; i++) allMessages[i].parseIndex = i;
+        let cursorTs = 0;
+        for (const msg of allMessages) {
+          const ts = msg.tsMs ?? 0;
+          cursorTs = Math.max(ts, cursorTs + 1);
+          msg.tsMs = cursorTs;
+        }
         for (const msg of allMessages) {
           if (msg.tsMs !== undefined) {
             msg.timestamp = new Date(msg.tsMs).toISOString();

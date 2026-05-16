@@ -187,13 +187,14 @@ test('handleNotificationDeliveryAck is a no-op for an untracked event', () => {
 // handleVerifyHistory
 // ---------------------------------------------------------------------------
 
-function makeHistoryPage(messages: Partial<HistoryMessage>[], tailSeq?: number): HistoryPage {
+function makeHistoryPage(messages: Partial<HistoryMessage>[], tailSeq?: number, tailMs?: number): HistoryPage {
   return {
     messages: messages as HistoryMessage[],
     totalCount: messages.length,
     offset: 0,
     hasMore: false,
     tailSeq,
+    tailMs,
   };
 }
 
@@ -243,6 +244,40 @@ test('handleVerifyHistory emits history_divergence on tail_seq mismatch', () => 
   assert.equal(ev.reason, 'tail_seq_mismatch');
   assert.equal(ev.expected_count, 1);
   assert.equal(ev.expected_tail_seq, 42);
+});
+
+test('handleVerifyHistory tolerates phone tail_ms ahead of daemon tail_ms', () => {
+  const page = makeHistoryPage([
+    { role: 'user', content: 'hi' },
+  ], 42, 1_778_912_805_691);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-1',
+    count: 1,
+    tail_ms: 1_778_912_806_000,
+  } as never);
+  assert.equal(sentEvents.length, 0);
+});
+
+test('handleVerifyHistory emits history_divergence when phone tail_ms is behind daemon tail_ms', () => {
+  const page = makeHistoryPage([
+    { role: 'user', content: 'hi' },
+  ], 42, 1_778_912_805_691);
+  const { ctx, sentEvents } = makeCtx();
+  handleVerifyHistory(ctx, makeVerifyDeps(page), {
+    type: 'verify_history',
+    session_id: 'sess-1',
+    count: 1,
+    tail_ms: 1_778_912_805_000,
+  } as never);
+  assert.equal(sentEvents.length, 1);
+  const ev = sentEvents[0].event as unknown as {
+    type: string; reason: string; expected_tail_ms?: number;
+  };
+  assert.equal(ev.type, 'history_divergence');
+  assert.equal(ev.reason, 'tail_ms_mismatch');
+  assert.equal(ev.expected_tail_ms, 1_778_912_805_691);
 });
 
 test('handleVerifyHistory emits history_divergence on count mismatch', () => {

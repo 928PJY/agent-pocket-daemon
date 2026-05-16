@@ -1019,21 +1019,30 @@ async function cmdSessions(flags: Record<string, string>): Promise<void> {
 async function cmdDumpHistory(args: string[]): Promise<void> {
   const sessionId = args[0];
   if (!sessionId) {
-    console.error('Usage: agent-pocket dump-history <sessionId>');
+    console.error('Usage: agent-pocket dump-history <sessionId> [--limit N] [--offset N] [--since-ms MS]');
     process.exit(1);
   }
+  const limitArg = args.indexOf('--limit');
+  const offsetArg = args.indexOf('--offset');
+  const sinceMsArg = args.indexOf('--since-ms');
+  const limit = limitArg >= 0 ? parseInt(args[limitArg + 1], 10) : 10000;
+  const offset = offsetArg >= 0 ? parseInt(args[offsetArg + 1], 10) : 0;
+  const sinceMs = sinceMsArg >= 0 ? parseInt(args[sinceMsArg + 1], 10) : undefined;
 
   const discovery = isCodexSessionId(sessionId) ? new CodexDiscovery() : new SessionDiscovery();
   await discovery.discoverSessions();
-  const page = discovery.getSessionHistory(sessionId, { offset: 0, limit: 10000 });
+  const page = discovery.getSessionHistory(sessionId, { offset, limit, sinceMs });
 
-  console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} BEGIN n=${page.messages.length} totalCount=${page.totalCount} tailSeq=${page.tailSeq ?? 'nil'}`);
+  console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} BEGIN n=${page.messages.length} totalCount=${page.totalCount} tailSeq=${page.tailSeq ?? 'nil'} tailMs=${page.tailMs ?? 'nil'}`);
   page.messages.forEach((m, i) => {
     const seq = m.seq ?? m.session_seq;
     const seqStr = seq !== undefined ? String(seq) : 'nil';
+    const ts = m.timestamp ? Date.parse(m.timestamp) : 0;
     const uuid = m.sdkUuid ? m.sdkUuid.slice(0, 8) : 'nil';
+    const tool = m.toolName ? ` tool=${m.toolName}` : '';
+    const aid = m.agentId ? ` aid=${m.agentId.slice(0, 8)}` : '';
     const preview = (m.content ?? '').replace(/\n/g, ' ').slice(0, 40);
-    console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} [${i}] seq=${seqStr} t=${m.role} uuid=${uuid} c="${preview}"`);
+    console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} [${i}] seq=${seqStr} ts=${ts} t=${m.role}${tool}${aid} uuid=${uuid} c="${preview}"`);
   });
   console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} END`);
 }

@@ -402,9 +402,61 @@ export class SessionDiscovery {
           }
         }
 
-        // Include subagent history interleaved by timestamp
+        // Include subagent history. Anchor each subagent agent's rows to the
+        // ts of the corresponding Task tool_use on the main thread, so the
+        // panel sorts adjacent to where it was spawned (subagent's own JSONL
+        // ts records when the subagent ran internally — often minutes/hours
+        // before the main thread received the tool_result, which would push
+        // the panel far back in time once we sort by ts).
+        //
+        // Pairing: walk main-thread Task tool_uses in JSONL order, and walk
+        // distinct subagent agentIds in first-seen order from the subagent
+        // file load — the Claude Agent SDK spawns these 1:1, so the Nth Task
+        // pairs with the Nth subagent agent. If counts don't match (e.g. a
+        // Task that crashed before producing a subagent file, or an orphan
+        // subagent file), unpaired subagent rows fall through and keep their
+        // original ts.
         const subagentMessages = this.getSubagentHistory(filePath);
         if (subagentMessages.length > 0) {
+          const taskToolUseTs: number[] = [];
+          const SUBAGENT_SPAWN_TOOLS = new Set(['Task', 'Agent', 'dispatch_agent', 'Subagent']);
+          for (const m of allMessages) {
+            if (m.role === 'tool_use' && m.toolName && SUBAGENT_SPAWN_TOOLS.has(m.toolName) && m.timestamp) {
+              const ts = Date.parse(m.timestamp);
+              if (Number.isFinite(ts)) taskToolUseTs.push(ts);
+            }
+          }
+          const distinctAgentIds: string[] = [];
+          const seenAgentIds = new Set<string>();
+          for (const sm of subagentMessages) {
+            const aid = sm.agentId;
+            if (aid && !seenAgentIds.has(aid)) {
+              seenAgentIds.add(aid);
+              distinctAgentIds.push(aid);
+            }
+          }
+          const agentIdToAnchorTs = new Map<string, number>();
+          const pairCount = Math.min(taskToolUseTs.length, distinctAgentIds.length);
+          for (let i = 0; i < pairCount; i++) {
+            agentIdToAnchorTs.set(distinctAgentIds[i], taskToolUseTs[i]);
+          }
+          let anchored = 0;
+          for (const sm of subagentMessages) {
+            const anchorTs = sm.agentId ? agentIdToAnchorTs.get(sm.agentId) : undefined;
+            if (anchorTs !== undefined) {
+              sm.timestamp = new Date(anchorTs).toISOString();
+              anchored++;
+            }
+          }
+          logger.info('history-debug', 'subagent ts anchoring', {
+            sessionId,
+            taskToolUses: taskToolUseTs.length,
+            distinctAgents: distinctAgentIds.length,
+            paired: pairCount,
+            anchoredRows: anchored,
+            subagentRowsTotal: subagentMessages.length,
+          });
+
           allMessages.push(...subagentMessages);
           allMessages.sort((a, b) => {
             const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
@@ -486,6 +538,17 @@ export class SessionDiscovery {
         // Reassign parseIndex to reflect the final order (so future re-sorts
         // and the wire-level "second key" agree even after sort shuffles).
         for (let i = 0; i < allMessages.length; i++) allMessages[i].parseIndex = i;
+        // The phone's cursor is currently a single `since_ms` and daemon-side
+        // filtering is strictly greater than that cursor. If two rows share
+        // the same ms, the second row can be skipped after the phone receives
+        // the first. Make the wire/cursor timestamp strictly increasing while
+        // preserving the already-computed (tsMs, parseIndex) order.
+        let cursorTs = 0;
+        for (const msg of allMessages) {
+          const ts = msg.tsMs ?? 0;
+          cursorTs = Math.max(ts, cursorTs + 1);
+          msg.tsMs = cursorTs;
+        }
         // Re-encode wire timestamp from normalised ms.
         for (const msg of allMessages) {
           if (msg.tsMs !== undefined) {
@@ -545,39 +608,34 @@ export class SessionDiscovery {
       // (role === 'subagent') are absorbed into a panel anchored on a parent
       // Task tool_use, so a chatty subagent should not eat the page budget for
       // the main thread. We pick `limit` parent messages from the tail
-      // (offset-aware), then re-include every subagent message whose seq falls
-      // between the first and last parent in that window.
+      // (offset-aware), then re-include every subagent message whose tsMs
+      // falls within [first parent tsMs, last parent tsMs] — this keeps each
+      // panel adjacent to its anchor Agent tool_use after ts-anchoring (where
+      // subagent rows share the Agent tool_use's tsMs but their seqs may be
+      // much higher, so seq-based windowing would either miss or over-include).
       const parentMsgs = filtered.filter((m) => m.role !== 'subagent');
       const total = parentMsgs.length;
       const parentEnd = Math.max(total - offset, 0);
       const parentStart = Math.max(parentEnd - limit, 0);
-      // Authoritative tail comes from the allocator: every seq it ever
-      // assigned is < nextSeq. The last element of `allMessages` may
-      // have an older (re-used) seq when newer rows happen to be older
-      // sdk_uuids, so reading from the array tail is unsafe.
       const allocatorTail = this.seqAllocators.for(sessionId).tail();
       const tailSeq = allocatorTail > 0 ? allocatorTail : undefined;
 
       let pageMessages: HistoryMessage[] = [];
       if (parentStart < parentEnd) {
         const parentSlice = parentMsgs.slice(parentStart, parentEnd);
-        const lo = parentSlice[0].seq ?? 0;
-        // Extend `hi` forward through any trailing subagent run so a panel
-        // anchored on a Task at the page tail keeps its messages. We stop at
-        // the next parent message after the window.
-        const lastParentSeq = parentSlice[parentSlice.length - 1].seq ?? Number.MAX_SAFE_INTEGER;
-        const nextParentIdx = parentEnd; // index in parentMsgs
-        const nextParentSeq = nextParentIdx < parentMsgs.length
-          ? (parentMsgs[nextParentIdx].seq ?? Number.MAX_SAFE_INTEGER)
+        const loTs = parentSlice[0].tsMs ?? 0;
+        const hiTs = parentSlice[parentSlice.length - 1].tsMs ?? Number.MAX_SAFE_INTEGER;
+        const nextParentTs = parentEnd < parentMsgs.length
+          ? (parentMsgs[parentEnd].tsMs ?? Number.MAX_SAFE_INTEGER)
           : Number.MAX_SAFE_INTEGER;
         pageMessages = filtered.filter((m) => {
-          const s = m.seq ?? 0;
-          if (s < lo) return false;
-          if (s <= lastParentSeq) return true;
-          // Past the last parent in window: only keep subagent messages that
-          // belong to a panel still inside the window (i.e. before the next
-          // parent message).
-          return m.role === 'subagent' && s < nextParentSeq;
+          const t = m.tsMs ?? 0;
+          if (t < loTs) return false;
+          if (t <= hiTs) return true;
+          // Past the window's last parent: only keep subagent rows that belong
+          // to a panel still inside the window (anchored before the next
+          // parent's tsMs).
+          return m.role === 'subagent' && t < nextParentTs;
         });
       }
 
