@@ -1679,8 +1679,8 @@ export class AgentPocketDaemon extends EventEmitter {
    */
   private sendSessionHistory(
     claudeSessionId: string,
-    options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
-  ): number | undefined {
+    options?: { since?: string; sinceSeq?: number; sinceMs?: number; offset?: number; limit?: number },
+  ): { tailSeq?: number; tailMs?: number } {
     return sendSessionHistoryExternal(
       {
         sessionDiscovery: this.sessionDiscovery,

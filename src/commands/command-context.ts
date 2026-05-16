@@ -16,8 +16,14 @@ import type { SessionManager } from '../sessions/session-manager.js';
 export interface SendSessionHistoryOptions {
   since?: string;
   sinceSeq?: number;
+  sinceMs?: number;
   offset?: number;
   limit?: number;
+}
+
+export interface SendSessionHistoryResult {
+  tailSeq?: number;
+  tailMs?: number;
 }
 
 export interface CommandContext {
@@ -46,7 +52,7 @@ export interface CommandContext {
    * tail seq of the last message delivered (or undefined when nothing was
    * sent — empty session, missing session, etc.).
    */
-  sendSessionHistory(claudeSessionId: string, options?: SendSessionHistoryOptions): number | undefined;
+  sendSessionHistory(claudeSessionId: string, options?: SendSessionHistoryOptions): SendSessionHistoryResult;
 
   /** The session manager the daemon owns. */
   readonly sessionManager: SessionManager;

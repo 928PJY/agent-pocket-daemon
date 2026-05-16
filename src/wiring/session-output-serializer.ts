@@ -235,9 +235,9 @@ const SYNTH_SUPPRESS_WINDOW_MS = 10_000;
 export function sendSessionHistory(
   deps: SendSessionHistoryDeps,
   claudeSessionId: string,
-  options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
-): number | undefined {
-  const incremental = options?.since !== undefined || options?.sinceSeq !== undefined;
+  options?: { since?: string; sinceSeq?: number; sinceMs?: number; offset?: number; limit?: number },
+): { tailSeq?: number; tailMs?: number } {
+  const incremental = options?.since !== undefined || options?.sinceSeq !== undefined || options?.sinceMs !== undefined;
   // Incremental backfill may legitimately need more (a long-running session
   // between phone disconnects), but we still cap it. For first-look / tail
   // reads we ship a short window and let the phone paginate.
@@ -253,12 +253,14 @@ export function sendSessionHistory(
         limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
+        sinceMs: options?.sinceMs,
       })
     : deps.sessionDiscovery.getSessionHistory(claudeSessionId, {
         offset: options?.offset ?? 0,
         limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
+        sinceMs: options?.sinceMs,
       });
 
   const truncated = result.messages.map((m) => ({
@@ -339,8 +341,9 @@ export function sendSessionHistory(
     has_more: result.hasMore,
     is_full_history: isFullHistory,
     tail_seq: result.tailSeq,
+    tail_ms: result.tailMs,
   };
 
   deps.sendToPhone(event as unknown as PcEvent);
-  return result.tailSeq;
+  return { tailSeq: result.tailSeq, tailMs: result.tailMs };
 }

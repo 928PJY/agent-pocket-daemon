@@ -113,6 +113,20 @@ export interface HistoryMessage {
    * daemon announces PEER_CAPABILITIES.MESSAGES_SEQ_AUTHORITATIVE.
    */
   session_seq?: number;
+  /**
+   * Normalised daemon timestamp (epoch ms). Always set when the daemon
+   * announces PEER_CAPABILITIES.HISTORY_CURSOR_MS. Same value the wire
+   * `timestamp` ISO string decodes to. Rows missing a source timestamp
+   * are filled with `prev_row_ts_ms + 1` so the page sorts stably.
+   */
+  tsMs?: number;
+  /**
+   * 0-based index into the parsed-JSONL order for this session. Acts as
+   * the secondary sort key under PEER_CAPABILITIES.HISTORY_CURSOR_MS so
+   * same-ms clusters resolve in SDK happens-before order. Not sent on
+   * the wire — internal only.
+   */
+  parseIndex?: number;
 }
 
 export interface HistoryPage {
@@ -122,6 +136,11 @@ export interface HistoryPage {
   hasMore: boolean;
   /** Max seq across the entire on-disk history (independent of pagination/filter). */
   tailSeq?: number;
+  /**
+   * Daemon timestamp (epoch ms) of the last message in `messages` after
+   * filtering. Sent on the wire as `tail_ms` under HISTORY_CURSOR_MS.
+   */
+  tailMs?: number;
 }
 
 export interface RunningCliSession {
@@ -261,11 +280,12 @@ export class SessionDiscovery {
    * `offset` counts from the end (0 = most recent page).
    * `limit` is the page size (default 30).
    */
-  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number }): HistoryPage {
+  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number; sinceMs?: number }): HistoryPage {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 30;
     const since = options?.since;
     const sinceSeq = options?.sinceSeq;
+    const sinceMs = options?.sinceMs;
 
     // Find the JSONL file for this session
     const cached = this.cachedSessions;
@@ -424,14 +444,91 @@ export class SessionDiscovery {
         // and daemon-side dump must agree.
         allMessages.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
 
+        // HISTORY_CURSOR_MS: assign tsMs + parseIndex, then re-sort by
+        // (tsMs ASC, parseIndex ASC). This is the authoritative order the
+        // phone trusts verbatim under the cap. Rows missing a source
+        // timestamp inherit `prev_ts_ms + 1` so they sort adjacent to
+        // their parse-neighbour instead of drifting to either end of the
+        // page. Wire `timestamp` is re-encoded from the normalised ms so
+        // phone's next `since_ms` = normalised tsMs of the last received row.
+        let prevTs = 0;
+        let missingTs = 0;
+        let sameMsClusters = 0;
+        let lastTs = -1;
+        let lastTsCount = 0;
+        for (let i = 0; i < allMessages.length; i++) {
+          const msg = allMessages[i];
+          msg.parseIndex = i;
+          const srcMs = msg.timestamp ? Date.parse(msg.timestamp) : NaN;
+          if (Number.isFinite(srcMs)) {
+            msg.tsMs = srcMs;
+            prevTs = srcMs;
+          } else {
+            missingTs++;
+            msg.tsMs = (prevTs > 0 ? prevTs : 0) + 1;
+            prevTs = msg.tsMs;
+          }
+          if (msg.tsMs === lastTs) {
+            lastTsCount++;
+          } else {
+            if (lastTsCount > 1) sameMsClusters++;
+            lastTs = msg.tsMs;
+            lastTsCount = 1;
+          }
+        }
+        if (lastTsCount > 1) sameMsClusters++;
+
+        allMessages.sort((a, b) => {
+          const da = (a.tsMs ?? 0) - (b.tsMs ?? 0);
+          if (da !== 0) return da;
+          return (a.parseIndex ?? 0) - (b.parseIndex ?? 0);
+        });
+        // Reassign parseIndex to reflect the final order (so future re-sorts
+        // and the wire-level "second key" agree even after sort shuffles).
+        for (let i = 0; i < allMessages.length; i++) allMessages[i].parseIndex = i;
+        // Re-encode wire timestamp from normalised ms.
+        for (const msg of allMessages) {
+          if (msg.tsMs !== undefined) {
+            msg.timestamp = new Date(msg.tsMs).toISOString();
+          }
+        }
+
+        logger.info('history-debug', 'timestamp normalization', {
+          sessionId,
+          totalRows: allMessages.length,
+          missingTs,
+          sameMsClusters,
+          headTsMs: allMessages[0]?.tsMs,
+          tailTsMs: allMessages[allMessages.length - 1]?.tsMs,
+        });
+
+        // Diagnostic: confirm whether tool_use rows actually carry sdkUuid in
+        // the parsed history. Phone-side dedup keys on sdkUuid; if the daemon
+        // ships them without one, live + history fingerprints diverge and the
+        // same logical tool_use renders twice. Logged once per session per
+        // re-parse (cache miss/mtime change); not in steady-state hot path.
+        const toolUses = allMessages.filter((m) => m.role === 'tool_use');
+        const toolUseWithUuid = toolUses.filter((m) => !!m.sdkUuid).length;
+        const toolUseWithToolId = toolUses.filter((m) => !!m.toolId).length;
+        logger.info('history-debug', 'parsed history sdkUuid coverage', {
+          sessionId,
+          totalRows: allMessages.length,
+          toolUseTotal: toolUses.length,
+          toolUseWithSdkUuid: toolUseWithUuid,
+          toolUseMissingSdkUuid: toolUses.length - toolUseWithUuid,
+          toolUseWithToolId: toolUseWithToolId,
+        });
+
         // Cache the parsed history
         this.historyCache.set(sessionId, { messages: allMessages, mtime });
       }
 
-      // Filter by since timestamp before pagination (for incremental fetch).
-      // sinceSeq takes precedence when present (gap-fill on reconnect).
+      // Filter by since cursor before pagination.
+      // Precedence under HISTORY_CURSOR_MS: sinceMs > sinceSeq > since.
       let filtered = allMessages;
-      if (sinceSeq !== undefined) {
+      if (sinceMs !== undefined) {
+        filtered = allMessages.filter((m) => (m.tsMs ?? 0) > sinceMs);
+      } else if (sinceSeq !== undefined) {
         filtered = allMessages.filter((m) => (m.seq ?? 0) > sinceSeq);
       } else if (since) {
         const sinceTime = new Date(since).getTime();
@@ -495,6 +592,7 @@ export class SessionDiscovery {
         offset,
         hasMore: parentStart > 0,
         tailSeq,
+        tailMs: pageMessages.length > 0 ? pageMessages[pageMessages.length - 1].tsMs : undefined,
       };
     } catch (err) {
       logger.warn('discovery', `Read history failed: ${(err as Error).message}`, { sessionId });

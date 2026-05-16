@@ -249,8 +249,8 @@ test('sendSessionHistory: claude session uses sessionDiscovery + agent_type=clau
     showToolUse: true,
     sessionDiscoveryResult: { messages: [{ role: 'assistant_message', content: 'a' }], totalCount: 1, offset: 0, hasMore: false, tailSeq: 5 },
   });
-  const tailSeq = sendSessionHistory(deps, 'claude-uuid-abc');
-  assert.equal(tailSeq, 5);
+  const result = sendSessionHistory(deps, 'claude-uuid-abc');
+  assert.equal(result.tailSeq, 5);
   assert.equal(sd.calls.length, 1);
   assert.equal(cd.calls.length, 0);
   const ev = sent[0] as unknown as { agent_type: string; type: string; tail_seq: number };
@@ -390,8 +390,8 @@ test('sendSessionHistory: returns tailSeq from discovery result (undefined when 
     showToolUse: true,
     sessionDiscoveryResult: { messages: [], totalCount: 0, offset: 0, hasMore: false },
   });
-  const ts = sendSessionHistory(deps, 'claude-uuid');
-  assert.equal(ts, undefined);
+  const result = sendSessionHistory(deps, 'claude-uuid');
+  assert.equal(result.tailSeq, undefined);
 });
 
 test('sendSessionHistory: forwards offset, totalCount, hasMore from discovery to event', () => {

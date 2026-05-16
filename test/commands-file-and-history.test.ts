@@ -21,7 +21,7 @@ interface HistoryCall { sessionId: string; options?: SendSessionHistoryOptions; 
 interface FakeSession { claudeSessionId?: string; status?: SessionStatus }
 
 function makeCtx(overrides: {
-  sendSessionHistory?: (id: string, opts?: SendSessionHistoryOptions) => number | undefined;
+  sendSessionHistory?: (id: string, opts?: SendSessionHistoryOptions) => { tailSeq?: number; tailMs?: number };
   sessions?: FakeSession[];
   capabilities?: Set<string>;
 } = {}) {
@@ -41,7 +41,7 @@ function makeCtx(overrides: {
     resolveExternalSessionId: (id) => id,
     sendSessionHistory: (id, options) => {
       historyCalls.push({ sessionId: id, options });
-      return overrides.sendSessionHistory ? overrides.sendSessionHistory(id, options) : undefined;
+      return overrides.sendSessionHistory ? overrides.sendSessionHistory(id, options) : {};
     },
     sessionManager: {
       getAllSessions: () => sessionsWithStatus,
@@ -159,6 +159,7 @@ test('handleGetHistory forwards all options to sendSessionHistory', () => {
   assert.deepEqual(historyCalls[0].options, {
     since: '2025-01-01T00:00:00Z',
     sinceSeq: 42,
+    sinceMs: undefined,
     offset: 10,
     limit: 100,
   });
@@ -170,6 +171,7 @@ test('handleGetHistory passes undefined options through unchanged', () => {
   assert.deepEqual(historyCalls[0].options, {
     since: undefined,
     sinceSeq: undefined,
+    sinceMs: undefined,
     offset: undefined,
     limit: undefined,
   });
@@ -182,7 +184,7 @@ test('handleGetHistory passes undefined options through unchanged', () => {
 test('handleSyncRequest backfills every active daemon session, using known_seqs as a hint', () => {
   const { ctx, sentEvents, historyCalls } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
-    sendSessionHistory: () => 99,
+    sendSessionHistory: () => ({ tailSeq: 99, tailMs: 99 + 1000000 }),
   });
   // Phone has only seen sess-b. sess-a is active on the daemon but unknown
   // to the phone — daemon should still ship it (as a tail window, sinceSeq
@@ -227,7 +229,7 @@ test('handleSyncRequest skips sessions with HISTORY status (archived; phone must
       { claudeSessionId: 'sess-active', status: SessionStatus.READY },
       { claudeSessionId: 'sess-archived', status: SessionStatus.HISTORY },
     ],
-    sendSessionHistory: () => 1,
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',
@@ -244,7 +246,7 @@ test('handleSyncRequest skips sessions with HISTORY status (archived; phone must
 test('handleSyncRequest excludes sessions whose sendSessionHistory returns undefined', () => {
   const { ctx, sentEvents } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
-    sendSessionHistory: (id) => (id === 'sess-a' ? undefined : 7),
+    sendSessionHistory: (id) => (id === 'sess-a' ? {} : { tailSeq: 7, tailMs: 1007 }),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',
@@ -282,7 +284,7 @@ test('handleSyncRequest filters out sessions without claudeSessionId', () => {
       {}, // no claudeSessionId
       { claudeSessionId: undefined },
     ],
-    sendSessionHistory: () => 1,
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',
@@ -296,7 +298,7 @@ test('handleSyncRequest filters out sessions without claudeSessionId', () => {
 test('handleSyncRequest known_seq=0 is treated as a valid cursor (sinceSeq=0 → ship from seq 1)', () => {
   const { ctx, historyCalls } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }],
-    sendSessionHistory: () => 5,
+    sendSessionHistory: () => ({ tailSeq: 5, tailMs: 5 + 1000000 }),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',
@@ -312,7 +314,7 @@ test('handleSyncRequest known_seq=0 is treated as a valid cursor (sinceSeq=0 →
 test('handleSyncRequest emits sync_ack and session_history_done when SYNC_ACK cap is present', () => {
   const { ctx, sentEvents } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }],
-    sendSessionHistory: (id) => (id === 'sess-a' ? 42 : undefined),
+    sendSessionHistory: (id) => (id === 'sess-a' ? { tailSeq: 42, tailMs: 1042000 } : {}),
     capabilities: new Set(['messages.sync_ack']),
   });
   handleSyncRequest(ctx, {
@@ -346,7 +348,7 @@ test('handleSyncRequest emits sync_ack and session_history_done when SYNC_ACK ca
 test('handleSyncRequest without SYNC_ACK cap only emits sync_complete (back-compat)', () => {
   const { ctx, sentEvents } = makeCtx({
     sessions: [{ claudeSessionId: 'sess-a' }],
-    sendSessionHistory: () => 1,
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
   });
   handleSyncRequest(ctx, {
     type: 'sync_request',

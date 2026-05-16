@@ -343,7 +343,7 @@ export interface SessionStartDeps {
   sendToPhone(event: PcEvent): void;
   /** Read live so the discovery warm-up phase still suppresses replays. */
   isInitialDiscoveryDone(): boolean;
-  sendSessionHistory(claudeSessionId: string): number | undefined;
+  sendSessionHistory(claudeSessionId: string): { tailSeq?: number; tailMs?: number } | number | undefined;
   /** Test seam: defaults to readSessionMap. */
   readSessionMapFn?: typeof readSessionMap;
 }
