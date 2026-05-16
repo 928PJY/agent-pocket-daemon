@@ -125,6 +125,7 @@ agent-pocket logs [-f]   View logs (--trace for verbose)
 agent-pocket pair        Pair with iOS app (--reset to re-pair)
 agent-pocket unpair      Clear pairing
 agent-pocket sessions    List discovered Claude sessions
+agent-pocket dump-history <sessionId>  Print one session's history rows in seq order (debugging)
 agent-pocket panic       Emergency kill all Claude processes
 ```
 

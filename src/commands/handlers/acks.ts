@@ -150,26 +150,44 @@ export function handleVerifyHistory(
 
   const expectedCount = phoneVisible.length;
   const expectedTailSeq = result.tailSeq;
+  const expectedTailMs = result.tailMs;
 
-  let reason: 'count_mismatch' | 'tail_seq_mismatch' | 'head_seq_mismatch' | null = null;
+  // Prefer tail_ms when the phone sent it (HISTORY_CURSOR_MS path). Phone disk
+  // rows persist the seq that was current when they were written; after a
+  // daemon-side reshuffle (e.g. subagent ts anchoring re-orders rows and the
+  // allocator hands out new seqs to back-dated entries) phone seq and daemon
+  // seq drift permanently, so seq-based divergence fires on every reconnect
+  // and the phone's disk never converges. tail_ms is stable across reshuffles
+  // because the daemon re-encodes wire timestamp from the normalized tsMs.
+  type VerifyExtras = { tail_ms?: number; max_count?: number };
+  const extras = command as unknown as VerifyExtras;
+  const phoneTailMs = extras.tail_ms;
+  let reason: 'count_mismatch' | 'tail_seq_mismatch' | 'tail_ms_mismatch' | 'head_seq_mismatch' | null = null;
   if (
-    command.tail_seq !== undefined
+    phoneTailMs !== undefined
+    && expectedTailMs !== undefined
+    && phoneTailMs < expectedTailMs
+  ) {
+    reason = 'tail_ms_mismatch';
+  } else if (
+    phoneTailMs === undefined
+    && command.tail_seq !== undefined
     && expectedTailSeq !== undefined
     && command.tail_seq !== expectedTailSeq
   ) {
     reason = 'tail_seq_mismatch';
   } else if (command.count !== expectedCount) {
     // If the phone reports max_count and its count equals that max, it's
-    // trimming older messages — only tail_seq matters, count divergence is
+    // trimming older messages — only tail matters, count divergence is
     // expected.
-    const maxCount = (command as unknown as Record<string, unknown>).max_count;
+    const maxCount = extras.max_count;
     const phoneAtMax = maxCount !== undefined && command.count === maxCount;
 
     // Phone holds a partial window (e.g. after scoped sync only delivered
     // messages after some after_seq cursor). When phone's head_seq is
     // strictly greater than the earliest seq we'd expect it to see, phone
-    // is intentionally missing the prefix. tail_seq match above already
-    // proved the window is in sync, so count divergence is expected.
+    // is intentionally missing the prefix. tail match above already proved
+    // the window is in sync, so count divergence is expected.
     const expectedHeadSeq = phoneVisible[0]?.seq;
     const phoneHoldsPartialWindow =
       typeof command.head_seq === 'number'
@@ -191,6 +209,7 @@ export function handleVerifyHistory(
     session_id: command.session_id,
     expected_count: expectedCount,
     expected_tail_seq: expectedTailSeq,
+    ...(expectedTailMs !== undefined ? { expected_tail_ms: expectedTailMs } : {}),
     reason,
   };
   logger.info('daemon', 'history_divergence', {
@@ -198,8 +217,10 @@ export function handleVerifyHistory(
     reason,
     expectedCount,
     expectedTailSeq,
+    expectedTailMs,
     phoneCount: command.count,
     phoneTail: command.tail_seq,
+    phoneTailMs,
   });
   ctx.sendToPhone(event as unknown as PcEvent);
 }

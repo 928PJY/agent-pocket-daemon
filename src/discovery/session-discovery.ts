@@ -113,6 +113,20 @@ export interface HistoryMessage {
    * daemon announces PEER_CAPABILITIES.MESSAGES_SEQ_AUTHORITATIVE.
    */
   session_seq?: number;
+  /**
+   * Normalised daemon timestamp (epoch ms). Always set when the daemon
+   * announces PEER_CAPABILITIES.HISTORY_CURSOR_MS. Same value the wire
+   * `timestamp` ISO string decodes to. Rows missing a source timestamp
+   * are filled with `prev_row_ts_ms + 1` so the page sorts stably.
+   */
+  tsMs?: number;
+  /**
+   * 0-based index into the parsed-JSONL order for this session. Acts as
+   * the secondary sort key under PEER_CAPABILITIES.HISTORY_CURSOR_MS so
+   * same-ms clusters resolve in SDK happens-before order. Not sent on
+   * the wire — internal only.
+   */
+  parseIndex?: number;
 }
 
 export interface HistoryPage {
@@ -122,6 +136,11 @@ export interface HistoryPage {
   hasMore: boolean;
   /** Max seq across the entire on-disk history (independent of pagination/filter). */
   tailSeq?: number;
+  /**
+   * Daemon timestamp (epoch ms) of the last message in `messages` after
+   * filtering. Sent on the wire as `tail_ms` under HISTORY_CURSOR_MS.
+   */
+  tailMs?: number;
 }
 
 export interface RunningCliSession {
@@ -261,11 +280,12 @@ export class SessionDiscovery {
    * `offset` counts from the end (0 = most recent page).
    * `limit` is the page size (default 30).
    */
-  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number }): HistoryPage {
+  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number; sinceMs?: number }): HistoryPage {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 30;
     const since = options?.since;
     const sinceSeq = options?.sinceSeq;
+    const sinceMs = options?.sinceMs;
 
     // Find the JSONL file for this session
     const cached = this.cachedSessions;
@@ -382,9 +402,69 @@ export class SessionDiscovery {
           }
         }
 
-        // Include subagent history interleaved by timestamp
+        // Include subagent history. Anchor each subagent agent's rows to the
+        // ts of the corresponding Task tool_use on the main thread, so the
+        // panel sorts adjacent to where it was spawned (subagent's own JSONL
+        // ts records when the subagent ran internally — often minutes/hours
+        // before the main thread received the tool_result, which would push
+        // the panel far back in time once we sort by ts).
+        //
+        // Pairing: walk main-thread Task tool_uses in JSONL order, and walk
+        // distinct subagent agentIds in spawn-time order (= the earliest
+        // event ts inside each subagent JSONL — first prompt is written
+        // synchronously when the SDK forks the subagent, so this is the
+        // closest stable proxy for spawn order). The Claude Agent SDK spawns
+        // 1:1, so the Nth Task pairs with the Nth subagent agent. If counts
+        // don't match (e.g. a Task that crashed before producing a subagent
+        // file, or an orphan subagent file), unpaired subagent rows fall
+        // through and keep their original ts. Sorting explicitly here matters
+        // because `getSubagentHistory` reads `fs.readdirSync` whose iteration
+        // order is filesystem-defined, not chronological.
         const subagentMessages = this.getSubagentHistory(filePath);
         if (subagentMessages.length > 0) {
+          const taskToolUseTs: number[] = [];
+          const SUBAGENT_SPAWN_TOOLS = new Set(['Task', 'Agent', 'dispatch_agent', 'Subagent']);
+          for (const m of allMessages) {
+            if (m.role === 'tool_use' && m.toolName && SUBAGENT_SPAWN_TOOLS.has(m.toolName) && m.timestamp) {
+              const ts = Date.parse(m.timestamp);
+              if (Number.isFinite(ts)) taskToolUseTs.push(ts);
+            }
+          }
+          taskToolUseTs.sort((a, b) => a - b);
+          const agentIdFirstTs = new Map<string, number>();
+          for (const sm of subagentMessages) {
+            const aid = sm.agentId;
+            if (!aid) continue;
+            const ts = sm.timestamp ? Date.parse(sm.timestamp) : NaN;
+            if (!Number.isFinite(ts)) continue;
+            const prev = agentIdFirstTs.get(aid);
+            if (prev === undefined || ts < prev) agentIdFirstTs.set(aid, ts);
+          }
+          const distinctAgentIds = Array.from(agentIdFirstTs.entries())
+            .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+            .map(([aid]) => aid);
+          const agentIdToAnchorTs = new Map<string, number>();
+          const pairCount = Math.min(taskToolUseTs.length, distinctAgentIds.length);
+          for (let i = 0; i < pairCount; i++) {
+            agentIdToAnchorTs.set(distinctAgentIds[i], taskToolUseTs[i]);
+          }
+          let anchored = 0;
+          for (const sm of subagentMessages) {
+            const anchorTs = sm.agentId ? agentIdToAnchorTs.get(sm.agentId) : undefined;
+            if (anchorTs !== undefined) {
+              sm.timestamp = new Date(anchorTs).toISOString();
+              anchored++;
+            }
+          }
+          logger.info('history-debug', 'subagent ts anchoring', {
+            sessionId,
+            taskToolUses: taskToolUseTs.length,
+            distinctAgents: distinctAgentIds.length,
+            paired: pairCount,
+            anchoredRows: anchored,
+            subagentRowsTotal: subagentMessages.length,
+          });
+
           allMessages.push(...subagentMessages);
           allMessages.sort((a, b) => {
             const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
@@ -412,14 +492,97 @@ export class SessionDiscovery {
           msg.session_seq = seq;
         }
 
+        // Re-sort by seq so the array order matches the canonical seq order.
+        // Why: allocator hands out seq in *chronological* order on first parse,
+        // but on subsequent re-parses (JSONL grew) any row whose timestamp is
+        // older than the current allocator tail (subagent backfill, late
+        // arrivals, codex injected echoes) gets a *fresh* high seq — its
+        // timestamp says "old" but its seq says "newest". Without this re-sort,
+        // the array order disagrees with seq order, and the phone — which
+        // sorts by seq — sees a different sequence than the daemon's history
+        // page reports. ChatMessage.less is seq-primary, so phone-side dump
+        // and daemon-side dump must agree.
+        allMessages.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+
+        // HISTORY_CURSOR_MS: assign tsMs + parseIndex, then re-sort by
+        // (tsMs ASC, parseIndex ASC). This is the authoritative order the
+        // phone trusts verbatim under the cap. Rows missing a source
+        // timestamp inherit `prev_ts_ms + 1` so they sort adjacent to
+        // their parse-neighbour instead of drifting to either end of the
+        // page. Wire `timestamp` is re-encoded from the normalised ms so
+        // phone's next `since_ms` = normalised tsMs of the last received row.
+        let prevTs = 0;
+        let missingTs = 0;
+        let sameMsClusters = 0;
+        let lastTs = -1;
+        let lastTsCount = 0;
+        for (let i = 0; i < allMessages.length; i++) {
+          const msg = allMessages[i];
+          msg.parseIndex = i;
+          const srcMs = msg.timestamp ? Date.parse(msg.timestamp) : NaN;
+          if (Number.isFinite(srcMs)) {
+            msg.tsMs = srcMs;
+            prevTs = srcMs;
+          } else {
+            missingTs++;
+            msg.tsMs = (prevTs > 0 ? prevTs : 0) + 1;
+            prevTs = msg.tsMs;
+          }
+          if (msg.tsMs === lastTs) {
+            lastTsCount++;
+          } else {
+            if (lastTsCount > 1) sameMsClusters++;
+            lastTs = msg.tsMs;
+            lastTsCount = 1;
+          }
+        }
+        if (lastTsCount > 1) sameMsClusters++;
+
+        allMessages.sort((a, b) => {
+          const da = (a.tsMs ?? 0) - (b.tsMs ?? 0);
+          if (da !== 0) return da;
+          return (a.parseIndex ?? 0) - (b.parseIndex ?? 0);
+        });
+        // Reassign parseIndex to reflect the final order (so future re-sorts
+        // and the wire-level "second key" agree even after sort shuffles).
+        for (let i = 0; i < allMessages.length; i++) allMessages[i].parseIndex = i;
+        // The phone's cursor is currently a single `since_ms` and daemon-side
+        // filtering is strictly greater than that cursor. If two rows share
+        // the same ms, the second row can be skipped after the phone receives
+        // the first. Make the wire/cursor timestamp strictly increasing while
+        // preserving the already-computed (tsMs, parseIndex) order.
+        let cursorTs = 0;
+        for (const msg of allMessages) {
+          const ts = msg.tsMs ?? 0;
+          cursorTs = Math.max(ts, cursorTs + 1);
+          msg.tsMs = cursorTs;
+        }
+        // Re-encode wire timestamp from normalised ms.
+        for (const msg of allMessages) {
+          if (msg.tsMs !== undefined) {
+            msg.timestamp = new Date(msg.tsMs).toISOString();
+          }
+        }
+
+        logger.info('history-debug', 'timestamp normalization', {
+          sessionId,
+          totalRows: allMessages.length,
+          missingTs,
+          sameMsClusters,
+          headTsMs: allMessages[0]?.tsMs,
+          tailTsMs: allMessages[allMessages.length - 1]?.tsMs,
+        });
+
         // Cache the parsed history
         this.historyCache.set(sessionId, { messages: allMessages, mtime });
       }
 
-      // Filter by since timestamp before pagination (for incremental fetch).
-      // sinceSeq takes precedence when present (gap-fill on reconnect).
+      // Filter by since cursor before pagination.
+      // Precedence under HISTORY_CURSOR_MS: sinceMs > sinceSeq > since.
       let filtered = allMessages;
-      if (sinceSeq !== undefined) {
+      if (sinceMs !== undefined) {
+        filtered = allMessages.filter((m) => (m.tsMs ?? 0) > sinceMs);
+      } else if (sinceSeq !== undefined) {
         filtered = allMessages.filter((m) => (m.seq ?? 0) > sinceSeq);
       } else if (since) {
         const sinceTime = new Date(since).getTime();
@@ -436,39 +599,34 @@ export class SessionDiscovery {
       // (role === 'subagent') are absorbed into a panel anchored on a parent
       // Task tool_use, so a chatty subagent should not eat the page budget for
       // the main thread. We pick `limit` parent messages from the tail
-      // (offset-aware), then re-include every subagent message whose seq falls
-      // between the first and last parent in that window.
+      // (offset-aware), then re-include every subagent message whose tsMs
+      // falls within [first parent tsMs, last parent tsMs] — this keeps each
+      // panel adjacent to its anchor Agent tool_use after ts-anchoring (where
+      // subagent rows share the Agent tool_use's tsMs but their seqs may be
+      // much higher, so seq-based windowing would either miss or over-include).
       const parentMsgs = filtered.filter((m) => m.role !== 'subagent');
       const total = parentMsgs.length;
       const parentEnd = Math.max(total - offset, 0);
       const parentStart = Math.max(parentEnd - limit, 0);
-      // Authoritative tail comes from the allocator: every seq it ever
-      // assigned is < nextSeq. The last element of `allMessages` may
-      // have an older (re-used) seq when newer rows happen to be older
-      // sdk_uuids, so reading from the array tail is unsafe.
       const allocatorTail = this.seqAllocators.for(sessionId).tail();
       const tailSeq = allocatorTail > 0 ? allocatorTail : undefined;
 
       let pageMessages: HistoryMessage[] = [];
       if (parentStart < parentEnd) {
         const parentSlice = parentMsgs.slice(parentStart, parentEnd);
-        const lo = parentSlice[0].seq ?? 0;
-        // Extend `hi` forward through any trailing subagent run so a panel
-        // anchored on a Task at the page tail keeps its messages. We stop at
-        // the next parent message after the window.
-        const lastParentSeq = parentSlice[parentSlice.length - 1].seq ?? Number.MAX_SAFE_INTEGER;
-        const nextParentIdx = parentEnd; // index in parentMsgs
-        const nextParentSeq = nextParentIdx < parentMsgs.length
-          ? (parentMsgs[nextParentIdx].seq ?? Number.MAX_SAFE_INTEGER)
+        const loTs = parentSlice[0].tsMs ?? 0;
+        const hiTs = parentSlice[parentSlice.length - 1].tsMs ?? Number.MAX_SAFE_INTEGER;
+        const nextParentTs = parentEnd < parentMsgs.length
+          ? (parentMsgs[parentEnd].tsMs ?? Number.MAX_SAFE_INTEGER)
           : Number.MAX_SAFE_INTEGER;
         pageMessages = filtered.filter((m) => {
-          const s = m.seq ?? 0;
-          if (s < lo) return false;
-          if (s <= lastParentSeq) return true;
-          // Past the last parent in window: only keep subagent messages that
-          // belong to a panel still inside the window (i.e. before the next
-          // parent message).
-          return m.role === 'subagent' && s < nextParentSeq;
+          const t = m.tsMs ?? 0;
+          if (t < loTs) return false;
+          if (t <= hiTs) return true;
+          // Past the window's last parent: only keep subagent rows that belong
+          // to a panel still inside the window (anchored before the next
+          // parent's tsMs).
+          return m.role === 'subagent' && t < nextParentTs;
         });
       }
 
@@ -483,6 +641,14 @@ export class SessionDiscovery {
         offset,
         hasMore: parentStart > 0,
         tailSeq,
+        // tailMs is the FILTERED-SET tail, not the page tail. Consumers
+        // (verify_history, sync_complete.last_ms) treat tailMs as the
+        // daemon's authoritative cursor for "everything up to here is
+        // delivered". A page tail would lie for partial-window requests
+        // (offset > 0) and for parent-window pagination where pageMessages
+        // can omit the actual newest filtered row, causing false
+        // convergence on the phone.
+        tailMs: filtered.length > 0 ? filtered[filtered.length - 1].tsMs : undefined,
       };
     } catch (err) {
       logger.warn('discovery', `Read history failed: ${(err as Error).message}`, { sessionId });

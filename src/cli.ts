@@ -7,6 +7,7 @@ import type { ConnectionMode } from 'agent-pocket-protocol';
 import { VERSION } from './version.js';
 import { AgentPocketDaemon } from './index.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
+import { CodexDiscovery, isCodexSessionId } from './discovery/codex-discovery.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { LanServer } from './lan/lan-server.js';
 import { runLanPairing } from './lan/lan-pairing.js';
@@ -214,6 +215,7 @@ Commands:
   pair                     Generate QR code and pair with phone
   unpair                   Clear pairing and stop daemon
   sessions                 List active Claude/Codex sessions (use --include-history to also show history)
+  dump-history <sessId>    Print on-disk history rows in seq order (for cross-checking phone order)
   panic                    Kill all Claude Code processes (emergency)
 
 Start options:
@@ -1014,6 +1016,37 @@ async function cmdSessions(flags: Record<string, string>): Promise<void> {
 // Subcommand: unpair
 // ============================================================================
 
+async function cmdDumpHistory(args: string[]): Promise<void> {
+  const sessionId = args[0];
+  if (!sessionId) {
+    console.error('Usage: agent-pocket dump-history <sessionId> [--limit N] [--offset N] [--since-ms MS]');
+    process.exit(1);
+  }
+  const limitArg = args.indexOf('--limit');
+  const offsetArg = args.indexOf('--offset');
+  const sinceMsArg = args.indexOf('--since-ms');
+  const limit = limitArg >= 0 ? parseInt(args[limitArg + 1], 10) : 10000;
+  const offset = offsetArg >= 0 ? parseInt(args[offsetArg + 1], 10) : 0;
+  const sinceMs = sinceMsArg >= 0 ? parseInt(args[sinceMsArg + 1], 10) : undefined;
+
+  const discovery = isCodexSessionId(sessionId) ? new CodexDiscovery() : new SessionDiscovery();
+  await discovery.discoverSessions();
+  const page = discovery.getSessionHistory(sessionId, { offset, limit, sinceMs });
+
+  console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} BEGIN n=${page.messages.length} totalCount=${page.totalCount} tailSeq=${page.tailSeq ?? 'nil'} tailMs=${page.tailMs ?? 'nil'}`);
+  page.messages.forEach((m, i) => {
+    const seq = m.seq ?? m.session_seq;
+    const seqStr = seq !== undefined ? String(seq) : 'nil';
+    const ts = m.timestamp ? Date.parse(m.timestamp) : 0;
+    const uuid = m.sdkUuid ? m.sdkUuid.slice(0, 8) : 'nil';
+    const tool = m.toolName ? ` tool=${m.toolName}` : '';
+    const aid = m.agentId ? ` aid=${m.agentId.slice(0, 8)}` : '';
+    const preview = (m.content ?? '').replace(/\n/g, ' ').slice(0, 40);
+    console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} [${i}] seq=${seqStr} ts=${ts} t=${m.role}${tool}${aid} uuid=${uuid} c="${preview}"`);
+  });
+  console.log(`[OrderFull] sid=${sessionId.slice(0, 8)} END`);
+}
+
 async function cmdUnpair(): Promise<void> {
   // Stop daemon if running
   const { running, pid } = isDaemonRunning();
@@ -1054,7 +1087,7 @@ async function main(): Promise<void> {
   migrateConfigDir();
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
-  const { command, flags } = parseArgs(process.argv);
+  const { command, flags, positional } = parseArgs(process.argv);
 
   if (flags.help) {
     printHelp();
@@ -1087,6 +1120,9 @@ async function main(): Promise<void> {
       break;
     case 'sessions':
       await cmdSessions(flags);
+      break;
+    case 'dump-history':
+      await cmdDumpHistory(positional);
       break;
     case 'panic':
     case 'emergency-lockdown':

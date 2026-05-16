@@ -113,6 +113,7 @@ export function handleGetHistory(
   ctx.sendSessionHistory(command.session_id, {
     since: command.since,
     sinceSeq: command.since_seq,
+    sinceMs: command.since_ms,
     offset: command.offset,
     limit: command.limit,
   });
@@ -131,6 +132,7 @@ export function handleSyncRequest(
 ): void {
   const t0 = Date.now();
   const knownSeqs = command.known_seqs ?? {};
+  const knownMs = command.known_ms ?? {};
 
   // The daemon, not the phone, decides which sessions to backfill: every
   // active session (status != history) currently tracked by SessionManager.
@@ -177,22 +179,32 @@ export function handleSyncRequest(
   for (const sessionId of targets) {
     const sessionStart = Date.now();
     const lastSeq = knownSeqs[sessionId];
+    const lastMs = knownMs[sessionId];
     // Phone has seen this session before → ship only the increment.
     // Phone has never seen it → ship the most-recent tail window
     // (sendSessionHistory's DEFAULT_SESSION_HISTORY_LIMIT). Older history
     // is reachable via paginated `get_history` once the user opens the chat.
-    const tail = ctx.sendSessionHistory(sessionId, {
+    // Under HISTORY_CURSOR_MS, prefer `last_ms` over `last_seq`.
+    const result = ctx.sendSessionHistory(sessionId, {
+      sinceMs: typeof lastMs === 'number' && lastMs >= 0 ? lastMs : undefined,
       sinceSeq: typeof lastSeq === 'number' && lastSeq >= 0 ? lastSeq : undefined,
     });
     perSessionMs[sessionId.slice(0, 8)] = Date.now() - sessionStart;
-    if (tail !== undefined) {
-      delivered.push({ session_id: sessionId, last_seq: tail });
+    if (result.tailSeq !== undefined || result.tailMs !== undefined) {
+      // Always populate `last_seq` (required by SyncCompleteEvent shape);
+      // fall back to 0 when daemon has no seq for this session (rare).
+      delivered.push({
+        session_id: sessionId,
+        last_seq: result.tailSeq ?? 0,
+        last_ms: result.tailMs,
+      });
       if (ackCapable) {
         const done: SessionHistoryDoneEvent = {
           type: 'session_history_done',
           request_id: command.request_id,
           session_id: sessionId,
-          last_seq: tail,
+          last_seq: result.tailSeq ?? 0,
+          last_ms: result.tailMs,
         };
         ctx.sendToPhone(done);
       }

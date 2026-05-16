@@ -235,9 +235,9 @@ const SYNTH_SUPPRESS_WINDOW_MS = 10_000;
 export function sendSessionHistory(
   deps: SendSessionHistoryDeps,
   claudeSessionId: string,
-  options?: { since?: string; sinceSeq?: number; offset?: number; limit?: number },
-): number | undefined {
-  const incremental = options?.since !== undefined || options?.sinceSeq !== undefined;
+  options?: { since?: string; sinceSeq?: number; sinceMs?: number; offset?: number; limit?: number },
+): { tailSeq?: number; tailMs?: number } {
+  const incremental = options?.since !== undefined || options?.sinceSeq !== undefined || options?.sinceMs !== undefined;
   // Incremental backfill may legitimately need more (a long-running session
   // between phone disconnects), but we still cap it. For first-look / tail
   // reads we ship a short window and let the phone paginate.
@@ -253,12 +253,14 @@ export function sendSessionHistory(
         limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
+        sinceMs: options?.sinceMs,
       })
     : deps.sessionDiscovery.getSessionHistory(claudeSessionId, {
         offset: options?.offset ?? 0,
         limit,
         since: options?.since,
         sinceSeq: options?.sinceSeq,
+        sinceMs: options?.sinceMs,
       });
 
   const truncated = result.messages.map((m) => ({
@@ -329,18 +331,30 @@ export function sendSessionHistory(
     filteredOutput: filteredCounts['local_command_output'] || 0,
   });
 
+  // Strip daemon-internal normalization fields before shipping the wire
+  // event. tsMs / parseIndex are bookkeeping for the (tsMs, parseIndex)
+  // sort and the since_ms filter — wire timestamp is already re-encoded
+  // from tsMs so the phone doesn't need either field. Without this the
+  // phone sees opaque numeric fields it doesn't model and old phones
+  // running stricter codable parsers may reject the row.
+  const wireMessages = filtered.map((m) => {
+    const { tsMs: _ts, parseIndex: _pi, ...rest } = m as { tsMs?: number; parseIndex?: number } & Record<string, unknown>;
+    return rest;
+  });
+
   const event = {
     type: 'session_history',
     session_id: claudeSessionId,
     agent_type: isCodexSessionId(claudeSessionId) ? 'codex' : 'claude_code',
-    messages: filtered,
+    messages: wireMessages,
     total_count: result.totalCount,
     offset: result.offset,
     has_more: result.hasMore,
     is_full_history: isFullHistory,
     tail_seq: result.tailSeq,
+    tail_ms: result.tailMs,
   };
 
   deps.sendToPhone(event as unknown as PcEvent);
-  return result.tailSeq;
+  return { tailSeq: result.tailSeq, tailMs: result.tailMs };
 }

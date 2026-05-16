@@ -178,7 +178,7 @@ export class CodexDiscovery {
     return live;
   }
 
-  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number }): HistoryPage {
+  getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number; sinceMs?: number }): HistoryPage {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 30;
     const session = this.getSession(sessionId);
@@ -215,11 +215,53 @@ export class CodexDiscovery {
           msg.seq = seq;
           msg.session_seq = seq;
         }
+        // Re-sort by seq so array order matches canonical seq order. See
+        // session-discovery.ts for the full rationale — same reasoning here:
+        // late-arriving rows on JSONL re-parse get fresh high seq, breaking
+        // chronological array order vs seq order otherwise.
+        allMessages.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+
+        // HISTORY_CURSOR_MS: assign tsMs + parseIndex, then re-sort by
+        // (tsMs ASC, parseIndex ASC). See session-discovery.ts for the
+        // full rationale.
+        let prevTs = 0;
+        for (let i = 0; i < allMessages.length; i++) {
+          const msg = allMessages[i];
+          msg.parseIndex = i;
+          const srcMs = msg.timestamp ? Date.parse(msg.timestamp) : NaN;
+          if (Number.isFinite(srcMs)) {
+            msg.tsMs = srcMs;
+            prevTs = srcMs;
+          } else {
+            msg.tsMs = (prevTs > 0 ? prevTs : 0) + 1;
+            prevTs = msg.tsMs;
+          }
+        }
+        allMessages.sort((a, b) => {
+          const da = (a.tsMs ?? 0) - (b.tsMs ?? 0);
+          if (da !== 0) return da;
+          return (a.parseIndex ?? 0) - (b.parseIndex ?? 0);
+        });
+        for (let i = 0; i < allMessages.length; i++) allMessages[i].parseIndex = i;
+        let cursorTs = 0;
+        for (const msg of allMessages) {
+          const ts = msg.tsMs ?? 0;
+          cursorTs = Math.max(ts, cursorTs + 1);
+          msg.tsMs = cursorTs;
+        }
+        for (const msg of allMessages) {
+          if (msg.tsMs !== undefined) {
+            msg.timestamp = new Date(msg.tsMs).toISOString();
+          }
+        }
+
         this.historyCache.set(session.threadId, { messages: allMessages, mtime: stat.mtimeMs });
       }
 
       let filtered = allMessages;
-      if (options?.sinceSeq !== undefined) {
+      if (options?.sinceMs !== undefined) {
+        filtered = allMessages.filter((m) => (m.tsMs ?? 0) > options.sinceMs!);
+      } else if (options?.sinceSeq !== undefined) {
         filtered = allMessages.filter((m) => (m.seq ?? 0) > options.sinceSeq!);
       } else if (options?.since) {
         const sinceTime = new Date(options.since).getTime();
@@ -235,12 +277,17 @@ export class CodexDiscovery {
       const total = filtered.length;
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
+      const pageMessages = filtered.slice(start, end);
       return {
-        messages: filtered.slice(start, end),
+        messages: pageMessages,
         totalCount: total,
         offset,
         hasMore: start > 0,
         tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
+        // tailMs is the FILTERED-SET tail (not page tail) — see
+        // session-discovery.ts for the rationale. Verify/divergence cursors
+        // must reflect "everything we can deliver", independent of paging.
+        tailMs: filtered.length > 0 ? filtered[filtered.length - 1].tsMs : undefined,
       };
     } catch (err) {
       logger.warn('codex-discovery', `Codex history read failed: ${(err as Error).message}`, { sessionId });
