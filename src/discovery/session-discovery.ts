@@ -565,23 +565,6 @@ export class SessionDiscovery {
           tailTsMs: allMessages[allMessages.length - 1]?.tsMs,
         });
 
-        // Diagnostic: confirm whether tool_use rows actually carry sdkUuid in
-        // the parsed history. Phone-side dedup keys on sdkUuid; if the daemon
-        // ships them without one, live + history fingerprints diverge and the
-        // same logical tool_use renders twice. Logged once per session per
-        // re-parse (cache miss/mtime change); not in steady-state hot path.
-        const toolUses = allMessages.filter((m) => m.role === 'tool_use');
-        const toolUseWithUuid = toolUses.filter((m) => !!m.sdkUuid).length;
-        const toolUseWithToolId = toolUses.filter((m) => !!m.toolId).length;
-        logger.info('history-debug', 'parsed history sdkUuid coverage', {
-          sessionId,
-          totalRows: allMessages.length,
-          toolUseTotal: toolUses.length,
-          toolUseWithSdkUuid: toolUseWithUuid,
-          toolUseMissingSdkUuid: toolUses.length - toolUseWithUuid,
-          toolUseWithToolId: toolUseWithToolId,
-        });
-
         // Cache the parsed history
         this.historyCache.set(sessionId, { messages: allMessages, mtime });
       }
