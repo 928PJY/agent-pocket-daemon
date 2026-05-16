@@ -650,7 +650,14 @@ export class SessionDiscovery {
         offset,
         hasMore: parentStart > 0,
         tailSeq,
-        tailMs: pageMessages.length > 0 ? pageMessages[pageMessages.length - 1].tsMs : undefined,
+        // tailMs is the FILTERED-SET tail, not the page tail. Consumers
+        // (verify_history, sync_complete.last_ms) treat tailMs as the
+        // daemon's authoritative cursor for "everything up to here is
+        // delivered". A page tail would lie for partial-window requests
+        // (offset > 0) and for parent-window pagination where pageMessages
+        // can omit the actual newest filtered row, causing false
+        // convergence on the phone.
+        tailMs: filtered.length > 0 ? filtered[filtered.length - 1].tsMs : undefined,
       };
     } catch (err) {
       logger.warn('discovery', `Read history failed: ${(err as Error).message}`, { sessionId });

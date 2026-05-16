@@ -284,7 +284,10 @@ export class CodexDiscovery {
         offset,
         hasMore: start > 0,
         tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
-        tailMs: pageMessages.length > 0 ? pageMessages[pageMessages.length - 1].tsMs : undefined,
+        // tailMs is the FILTERED-SET tail (not page tail) — see
+        // session-discovery.ts for the rationale. Verify/divergence cursors
+        // must reflect "everything we can deliver", independent of paging.
+        tailMs: filtered.length > 0 ? filtered[filtered.length - 1].tsMs : undefined,
       };
     } catch (err) {
       logger.warn('codex-discovery', `Codex history read failed: ${(err as Error).message}`, { sessionId });
