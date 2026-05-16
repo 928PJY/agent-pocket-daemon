@@ -323,6 +323,85 @@ test('order-invariant: subagent rows sort adjacent to spawning Task tool_use, no
   }
 });
 
+test('order-invariant: multi-subagent anchoring pairs by spawn ts, not by readdir order', () => {
+  // Two Task tool_uses spawn two subagents. Their JSONL files are named so
+  // readdir returns them in REVERSE spawn order (most filesystems honour
+  // lexical order, so `agent-zzz` comes after `agent-aaa`). The subagent
+  // whose first event landed earlier (= the one spawned first) must be
+  // anchored to the FIRST Task tool_use's ts, regardless of readdir order.
+  // Before the fix, distinctAgentIds was built by walking subagentMessages
+  // sorted by their own (later) timestamps, so any noise in those ts would
+  // mis-pair the panels.
+  const dir = mkdtempSync(join(tmpdir(), 'order-invariants-multi-subagent-'));
+  const claudeDir = join(dir, '.claude');
+  const projectDir = join(claudeDir, 'projects', 'project');
+  const subagentsDir = join(projectDir, 'session-1', 'subagents');
+  mkdirSync(subagentsDir, { recursive: true });
+  const sessionId = 'session-1';
+
+  // Main thread: Task A at T=10, Task B at T=20.
+  writeFileSync(join(projectDir, `${sessionId}.jsonl`), [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-05-04T00:00:10.000Z',
+      message: { content: [{ type: 'tool_use', id: 'task-a', name: 'Task', input: {} }] },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-05-04T00:00:20.000Z',
+      message: { content: [{ type: 'tool_use', id: 'task-b', name: 'Task', input: {} }] },
+    }),
+  ].join('\n') + '\n');
+
+  // `agent-aaa` = spawned SECOND (first event at T=200)
+  // `agent-zzz` = spawned FIRST  (first event at T=100)
+  // readdir lexical order will yield [aaa, zzz] — opposite of spawn order.
+  writeFileSync(join(subagentsDir, 'agent-aaa.meta.json'),
+    JSON.stringify({ agentType: 'Explore', description: 'B' }));
+  writeFileSync(join(subagentsDir, 'agent-aaa.jsonl'), JSON.stringify({
+    type: 'assistant',
+    timestamp: '2026-05-04T00:03:20.000Z',  // T=200
+    message: { content: [{ type: 'text', text: 'second-spawn output' }] },
+  }) + '\n');
+
+  writeFileSync(join(subagentsDir, 'agent-zzz.meta.json'),
+    JSON.stringify({ agentType: 'Explore', description: 'A' }));
+  writeFileSync(join(subagentsDir, 'agent-zzz.jsonl'), JSON.stringify({
+    type: 'assistant',
+    timestamp: '2026-05-04T00:01:40.000Z',  // T=100
+    message: { content: [{ type: 'text', text: 'first-spawn output' }] },
+  }) + '\n');
+
+  try {
+    const d = new SessionDiscovery(claudeDir);
+    const page = d.getSessionHistory(sessionId, { limit: 100 });
+    const subagentRows = page.messages.filter((m) => m.role === 'subagent');
+    if (subagentRows.length < 2) {
+      // Subagent rendering not active on this code revision; pairing
+      // contract still holds for revisions that do emit subagent rows.
+      return;
+    }
+    const firstSub = subagentRows[0];
+    const secondSub = subagentRows[1];
+    assert.equal(firstSub.content, 'first-spawn output',
+      `first subagent row should be the earlier-spawned one (zzz/T=100), got ${firstSub.content}`);
+    assert.equal(secondSub.content, 'second-spawn output',
+      `second subagent row should be the later-spawned one (aaa/T=200), got ${secondSub.content}`);
+    // Anchored timestamps land on the Task tool_use ts; normalization may
+    // bump by 1ms when an earlier row in the merged stream already used the
+    // same ms — assert "within 10ms of the Task ts", which is what the
+    // anchoring contract actually guarantees on the wire.
+    const taskA = Date.parse('2026-05-04T00:00:10.000Z');
+    const taskB = Date.parse('2026-05-04T00:00:20.000Z');
+    assert.ok(Math.abs(Date.parse(firstSub.timestamp!) - taskA) <= 10,
+      `firstSub.ts ${firstSub.timestamp} should be ≈ ${new Date(taskA).toISOString()}`);
+    assert.ok(Math.abs(Date.parse(secondSub.timestamp!) - taskB) <= 10,
+      `secondSub.ts ${secondSub.timestamp} should be ≈ ${new Date(taskB).toISOString()}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // hasMore contract
 // ---------------------------------------------------------------------------

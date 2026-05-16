@@ -410,12 +410,16 @@ export class SessionDiscovery {
         // the panel far back in time once we sort by ts).
         //
         // Pairing: walk main-thread Task tool_uses in JSONL order, and walk
-        // distinct subagent agentIds in first-seen order from the subagent
-        // file load — the Claude Agent SDK spawns these 1:1, so the Nth Task
-        // pairs with the Nth subagent agent. If counts don't match (e.g. a
-        // Task that crashed before producing a subagent file, or an orphan
-        // subagent file), unpaired subagent rows fall through and keep their
-        // original ts.
+        // distinct subagent agentIds in spawn-time order (= the earliest
+        // event ts inside each subagent JSONL — first prompt is written
+        // synchronously when the SDK forks the subagent, so this is the
+        // closest stable proxy for spawn order). The Claude Agent SDK spawns
+        // 1:1, so the Nth Task pairs with the Nth subagent agent. If counts
+        // don't match (e.g. a Task that crashed before producing a subagent
+        // file, or an orphan subagent file), unpaired subagent rows fall
+        // through and keep their original ts. Sorting explicitly here matters
+        // because `getSubagentHistory` reads `fs.readdirSync` whose iteration
+        // order is filesystem-defined, not chronological.
         const subagentMessages = this.getSubagentHistory(filePath);
         if (subagentMessages.length > 0) {
           const taskToolUseTs: number[] = [];
@@ -426,15 +430,19 @@ export class SessionDiscovery {
               if (Number.isFinite(ts)) taskToolUseTs.push(ts);
             }
           }
-          const distinctAgentIds: string[] = [];
-          const seenAgentIds = new Set<string>();
+          taskToolUseTs.sort((a, b) => a - b);
+          const agentIdFirstTs = new Map<string, number>();
           for (const sm of subagentMessages) {
             const aid = sm.agentId;
-            if (aid && !seenAgentIds.has(aid)) {
-              seenAgentIds.add(aid);
-              distinctAgentIds.push(aid);
-            }
+            if (!aid) continue;
+            const ts = sm.timestamp ? Date.parse(sm.timestamp) : NaN;
+            if (!Number.isFinite(ts)) continue;
+            const prev = agentIdFirstTs.get(aid);
+            if (prev === undefined || ts < prev) agentIdFirstTs.set(aid, ts);
           }
+          const distinctAgentIds = Array.from(agentIdFirstTs.entries())
+            .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+            .map(([aid]) => aid);
           const agentIdToAnchorTs = new Map<string, number>();
           const pairCount = Math.min(taskToolUseTs.length, distinctAgentIds.length);
           for (let i = 0; i < pairCount; i++) {
