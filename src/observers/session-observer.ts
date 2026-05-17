@@ -17,6 +17,7 @@ import type {
   SystemMessageEvent,
   CompactBoundaryEvent,
   CompactSummaryEvent,
+  TurnMetrics,
 } from 'agent-pocket-protocol';
 import { SubagentObserver } from './subagent-observer.js';
 import { logger } from '../logger.js';
@@ -115,6 +116,15 @@ export class SessionObserver extends EventEmitter {
   // tool_use ids we've emitted but have NOT yet seen a matching tool_result for.
   // Used to synthesize 'interrupted' tool_result events when Claude Code aborts.
   private pendingToolUseIds: Set<string> = new Set();
+
+  // Per-turn accumulator for turnMetrics. Reset on real user turn, advanced
+  // on each assistant entry, drained onto the assistant_message event of the
+  // entry whose stop_reason === 'end_turn'. Replaces the legacy
+  // Stop-hook-based completion_metrics path so controller-mode sessions
+  // (no Stop hook) also see metrics.
+  private turnTokenSum: number = 0;
+  private turnToolUseCount: number = 0;
+  private turnStartMs: number | null = null;
 
   // Subagent observation
   private subagentObserver: SubagentObserver | null = null;
@@ -339,6 +349,18 @@ export class SessionObserver extends EventEmitter {
 
       const message = entry.message as { content?: string | Array<{ type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } | undefined;
 
+      // Reset per-turn accumulator only on a real user turn (string content or
+      // any non-tool_result block). type==='user' rows that wrap tool_result
+      // blocks must keep accumulating into the in-flight turn.
+      const isRealUser = typeof message?.content === 'string'
+        || !Array.isArray(message?.content)
+        || !message!.content!.every((b) => b?.type === 'tool_result');
+      if (isRealUser) {
+        this.turnTokenSum = 0;
+        this.turnToolUseCount = 0;
+        this.turnStartMs = entryTimestamp ? Date.parse(entryTimestamp) || null : null;
+      }
+
       // Detect synthetic interrupt messages Claude Code writes on Esc/Ctrl+C.
       // These are not real user input — emit 'interrupted' and render a small
       // system message to the phone so the user can see the turn was cut short.
@@ -535,10 +557,41 @@ export class SessionObserver extends EventEmitter {
       } else {
         this.justInterrupted = false;
       }
-      this.processAssistantMessage(entry);
-      // Check if this is a completed turn (stop_reason = end_turn means Claude is ready)
-      const message = entry.message as { stop_reason?: string } | undefined;
-      if (message?.stop_reason === 'end_turn') {
+
+      // Accumulate per-turn metrics from this assistant entry. Token formula
+      // matches transcript-reader.tokensOf (this-turn cost only).
+      const assistantMessage = entry.message as {
+        stop_reason?: string;
+        usage?: { output_tokens?: number; cache_creation_input_tokens?: number };
+        content?: Array<{ type: string }>;
+      } | undefined;
+      if (assistantMessage?.usage) {
+        this.turnTokenSum += (assistantMessage.usage.output_tokens ?? 0)
+          + (assistantMessage.usage.cache_creation_input_tokens ?? 0);
+      }
+      if (Array.isArray(assistantMessage?.content)) {
+        this.turnToolUseCount += assistantMessage!.content!.filter((b) => b?.type === 'tool_use').length;
+      }
+
+      // On end_turn the assistant entry is the LAST message of the turn. Build
+      // turnMetrics now and hand it to processAssistantMessage so it can attach
+      // them to that entry's final text-block assistant_message event.
+      let endTurnMetrics: TurnMetrics | undefined;
+      if (assistantMessage?.stop_reason === 'end_turn') {
+        const endMs = entryTimestamp ? Date.parse(entryTimestamp) : NaN;
+        const durationSec = (this.turnStartMs != null && Number.isFinite(endMs) && endMs >= this.turnStartMs)
+          ? Math.round((endMs - this.turnStartMs) / 1000)
+          : 0;
+        endTurnMetrics = {
+          totalTokens: this.turnTokenSum,
+          toolUseCount: this.turnToolUseCount,
+          durationSec,
+        };
+        logger.info('observer', `[TurnMetrics] end_turn session=${this.sessionId.slice(0,8)} tokens=${endTurnMetrics.totalTokens} tools=${endTurnMetrics.toolUseCount} dur=${endTurnMetrics.durationSec}s`);
+      }
+
+      this.processAssistantMessage(entry, endTurnMetrics);
+      if (assistantMessage?.stop_reason === 'end_turn') {
         this.emit('status_change', 'ready');
       }
       return;
@@ -549,7 +602,7 @@ export class SessionObserver extends EventEmitter {
     // handles tool results directly, so we skip them here.
   }
 
-  private processAssistantMessage(entry: Record<string, unknown>): void {
+  private processAssistantMessage(entry: Record<string, unknown>, endTurnMetrics?: TurnMetrics): void {
     const message = entry.message as { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }> } | undefined;
     if (!message?.content || !Array.isArray(message.content)) return;
 
@@ -558,6 +611,17 @@ export class SessionObserver extends EventEmitter {
     // (sdkUuid, sdkBlockIndex) row replaces in place; otherwise fall back to
     // the legacy delta-slice behaviour so old phones don't see piling chunks.
     const fullTextEmit = this.getPeerCapability(PEER_CAPABILITIES.STABLE_SDK_UUID);
+
+    // Find the index of the LAST text block so we can attach turnMetrics to
+    // that block's assistant_message event (and only that one). End_turn rows
+    // with no text block (e.g. tool_use-only) will not surface metrics — by
+    // construction Claude always emits a final text on a real end_turn.
+    let lastTextBlockIndex = -1;
+    if (endTurnMetrics) {
+      for (let i = message.content.length - 1; i >= 0; i--) {
+        if (message.content[i]?.type === 'text') { lastTextBlockIndex = i; break; }
+      }
+    }
 
     for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
       const block = message.content[blockIndex];
@@ -593,7 +657,13 @@ export class SessionObserver extends EventEmitter {
             type: 'assistant_message',
             message: payload,
             ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
+            ...(endTurnMetrics && blockIndex === lastTextBlockIndex
+              ? { turnMetrics: endTurnMetrics }
+              : {}),
           };
+          if (endTurnMetrics && blockIndex === lastTextBlockIndex) {
+            logger.info('observer', `[TurnMetrics] attached to assistant_message sdkUuid=${entryUuid?.slice(0,8)} block=${blockIndex} session=${this.sessionId.slice(0,8)}`);
+          }
           this.emit('output', event);
           break;
         }

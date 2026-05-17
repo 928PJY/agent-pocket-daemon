@@ -52,6 +52,17 @@ export function flattenAgentEvent(
       flat.output_type = 'assistant_message';
       flat.content = agentEvent.message;
       flat.is_complete = false;
+      // Per-turn aggregates that the observer attaches to the LAST
+      // assistant_message of a turn. Forwarded to the phone as `turn_metrics`
+      // (snake_case on the wire, matching other session_output fields). Phone
+      // renders the chip beneath that bubble.
+      if (agentEvent.turnMetrics) {
+        flat.turn_metrics = {
+          totalTokens: agentEvent.turnMetrics.totalTokens,
+          toolUseCount: agentEvent.turnMetrics.toolUseCount,
+          durationSec: agentEvent.turnMetrics.durationSec,
+        };
+      }
       break;
 
     case 'tool_use':

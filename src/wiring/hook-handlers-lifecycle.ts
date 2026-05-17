@@ -32,6 +32,7 @@ import {
   RiskLevel,
   HOOK_HOLD_TIMEOUT_SECONDS,
   SessionStatus,
+  PEER_CAPABILITIES,
 } from 'agent-pocket-protocol';
 import type { NotificationDeliveryEventType } from '../relay/phone-transport.js';
 import { logger } from '../logger.js';
@@ -84,6 +85,13 @@ export interface SessionStopDeps {
   sendToPhone(event: PcEvent): void;
   /** Read live so a `set_preferences` toggle takes effect on the next stop. */
   prefs: { showCompletionMetrics: boolean };
+  /**
+   * Live peer-cap lookup. Used to skip the legacy
+   * `output_type: 'completion_metrics'` session_output when the phone
+   * announces PEER_CAPABILITIES.MESSAGES_TURN_METRICS (metrics travel
+   * inline on the assistant_message instead).
+   */
+  hasPeerCapability(name: string): boolean;
   /** Test seam: defaults to setTimeout. */
   setTimeoutFn?: typeof setTimeout;
   /** Test seam: defaults to readLastTurnSummary from utils. */
@@ -183,23 +191,34 @@ export function registerSessionStopHandler(
     event.is_completion = true;
     event.completion_request_id = completionRequestId;
     event.completion_body = completionBody;
-    if (subtitle) event.completion_subtitle = subtitle;
+    // Notification text deliberately omits the metrics subtitle — metrics
+    // surface in chat as a chip on the last assistant_message instead (via
+    // PEER_CAPABILITIES.MESSAGES_TURN_METRICS). Old phones still get the
+    // chip via the legacy session_output emit below.
 
     deps.sendNotificationEventToPhone(event as unknown as PcEvent, 'session_completed', externalId, completionRequestId, {
       type: 'session_completed',
       session_name: projectName,
       body: truncateUtf8(completionBody.trim() || 'Session finished', 256),
-      subtitle,
       sound: 'completion.caf',
       category: 'SESSION_COMPLETED',
       session_id: externalId,
       request_id: completionRequestId,
     });
 
-    // Delay the chat-side metrics chip slightly so the SDK-stream path has
-    // time to flush the final assistant_message first; otherwise the chip
-    // appears above the message it's summarising.
-    if (subtitle && deps.prefs.showCompletionMetrics) {
+    // Legacy completion_metrics session_output — sent ONLY when the phone
+    // lacks PEER_CAPABILITIES.MESSAGES_TURN_METRICS. When the phone has the
+    // cap, metrics arrive inline on the last assistant_message of the turn
+    // and emitting here would duplicate the chip.
+    //
+    // 500ms delay preserved for the legacy path so the SDK-stream has time
+    // to flush its final assistant_message first; otherwise the chip would
+    // appear above the message it summarises.
+    if (
+      subtitle
+      && deps.prefs.showCompletionMetrics
+      && !deps.hasPeerCapability(PEER_CAPABILITIES.MESSAGES_TURN_METRICS)
+    ) {
       setTimeoutFn(() => {
         deps.sendToPhone({
           type: 'session_output',

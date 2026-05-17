@@ -800,6 +800,7 @@ export class AgentPocketDaemon extends EventEmitter {
         sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
         sendToPhone: (event) => this.sendToPhone(event),
         prefs: this.phonePreferences,
+        hasPeerCapability: (name) => this.hasPeerCapability(name),
       },
       sessionStopFailure: {
         sessionManager: this.sessionManager,

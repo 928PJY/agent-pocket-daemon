@@ -48,6 +48,9 @@ type ParsedMessage = {
    *  matching `<command-name>` row's `uuid`. Lets the phone pair invoke
    *  + output even under non-monotonic ordering. */
   parentInvokeSdkUuid?: string;
+  /** Per-turn aggregates — attached by the history loop, not by the parser
+   *  itself (parser is per-entry; metrics need cross-entry accumulation). */
+  turnMetrics?: { totalTokens: number; toolUseCount: number; durationSec: number };
 };
 
 const HISTORY_TOOL_INPUT_VALUE_CAP = 2000;

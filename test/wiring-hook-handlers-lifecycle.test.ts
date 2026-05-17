@@ -54,6 +54,8 @@ function makeSessionStopDeps(opts: {
   summary?: TurnSummary | null;
   summaryThrows?: boolean;
   prefetchClaudeSessionIds?: Set<string>;
+  /** Defaults to false (legacy path) so existing fixtures still emit the chip. */
+  phoneHasTurnMetricsCap?: boolean;
 } = {}) {
   const harness: SessionStopHarness = {
     pending: new Map(opts.pending ?? []),
@@ -87,6 +89,7 @@ function makeSessionStopDeps(opts: {
       },
       sendToPhone(event: unknown) { harness.sentEvents.push(event); },
       prefs: { showCompletionMetrics: opts.showCompletionMetrics ?? true },
+      hasPeerCapability(_name: string) { return opts.phoneHasTurnMetricsCap ?? false; },
       setTimeoutFn: ((fn: () => void, ms: number) => {
         harness.scheduledTimers.push({ fn, ms });
         return 0 as unknown as ReturnType<typeof setTimeout>;
@@ -121,7 +124,10 @@ test('session_stop: with transcript + matched session emits notification + delay
   const ev = notified.event as Record<string, unknown>;
   assert.equal(ev.is_completion, true);
   assert.equal(ev.completion_body, 'hi there');
-  assert.ok(typeof ev.completion_subtitle === 'string' && (ev.completion_subtitle as string).includes('2 tools'));
+  // completion_subtitle is no longer set — metrics live in chat as a chip,
+  // not in the notification text.
+  assert.equal(ev.completion_subtitle, undefined);
+  assert.equal((notified.wake as Record<string, unknown>).subtitle, undefined);
   assert.equal((notified.wake as Record<string, unknown>).session_name, 'My Proj');
 
   // pending blocking cleared
@@ -130,7 +136,8 @@ test('session_stop: with transcript + matched session emits notification + delay
   // clearPendingActions called
   assert.deepEqual(harness.clearPendingActionsCalls, ['int-1']);
 
-  // metrics chip scheduled
+  // legacy metrics chip still scheduled — this fixture does not announce the
+  // MESSAGES_TURN_METRICS cap, so back-compat path runs.
   assert.equal(harness.scheduledTimers.length, 1);
   assert.equal(harness.scheduledTimers[0]!.ms, 500);
   harness.scheduledTimers[0]!.fn();
@@ -138,6 +145,24 @@ test('session_stop: with transcript + matched session emits notification + delay
   const chip = harness.sentEvents[0] as Record<string, unknown>;
   assert.equal(chip.output_type, 'completion_metrics');
   assert.equal(chip.session_id, 'ext-1');
+});
+
+test('session_stop: phone has MESSAGES_TURN_METRICS cap → suppresses legacy chip', async () => {
+  const hooks = makeHooks();
+  const summary: TurnSummary = { text: 'ok', toolUseCount: 1, totalTokens: 100, durationSec: 3 };
+  const { harness, deps } = makeSessionStopDeps({ summary, phoneHasTurnMetricsCap: true });
+  registerSessionStopHandler(hooks, deps);
+  hooks.emit('session_stop', 'claude-x', '/path');
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+
+  // Notification still fires (and still has no subtitle).
+  assert.equal(harness.notifiedEvents.length, 1);
+  assert.equal((harness.notifiedEvents[0]!.event as Record<string, unknown>).completion_subtitle, undefined);
+  // But the legacy session_output chip is suppressed — metrics arrive inline
+  // on the assistant_message via the session-observer path.
+  assert.equal(harness.scheduledTimers.length, 0);
+  assert.equal(harness.sentEvents.length, 0);
 });
 
 test('session_stop: without transcriptPath emits notification with default body', async () => {
@@ -226,6 +251,7 @@ test('session_stop: defaults setTimeoutFn + readLastTurnSummaryFn when omitted',
     sendNotificationEventToPhone(event: unknown) { harness.notified.push(event); },
     sendToPhone() {},
     prefs: { showCompletionMetrics: false },
+    hasPeerCapability() { return false; },
   });
   hooks.emit('session_stop', 'claude-x', undefined);
   await new Promise(r => setImmediate(r));
