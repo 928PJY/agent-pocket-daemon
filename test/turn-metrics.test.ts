@@ -1,0 +1,303 @@
+import assert from 'node:assert/strict';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { SessionObserver } from '../src/observers/session-observer.js';
+import { SessionDiscovery } from '../src/discovery/session-discovery.js';
+
+type SessionObserverInternals = SessionObserver & { readNewEntries(): void };
+type AssistantEvent = {
+  type: 'assistant_message';
+  message: string;
+  sdkBlockIndex?: number;
+  turnMetrics?: { totalTokens: number; toolUseCount: number; durationSec: number };
+};
+
+function writeEntries(filePath: string, entries: unknown[]): void {
+  writeFileSync(filePath, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+}
+
+function appendEntries(filePath: string, entries: unknown[]): void {
+  appendFileSync(filePath, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+}
+
+// ---------------------------------------------------------------------------
+// Live observer path
+// ---------------------------------------------------------------------------
+
+test('SessionObserver attaches turnMetrics to the assistant_message on end_turn (live path)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-turn-metrics-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const observer = new SessionObserver('session-1', jsonlPath);
+  const outputs: unknown[] = [];
+  observer.on('output', (event) => outputs.push(event));
+
+  try {
+    observer.start(false);
+    appendEntries(jsonlPath, [
+      {
+        type: 'user',
+        timestamp: '2026-05-17T00:00:00.000Z',
+        message: { content: 'go' },
+      },
+      // Mid-turn assistant entry (tool_use stop_reason). Carries usage and a
+      // tool_use block — both must contribute to the accumulator but NO
+      // turnMetrics should be emitted on its assistant_message rows.
+      {
+        type: 'assistant',
+        timestamp: '2026-05-17T00:00:01.000Z',
+        message: {
+          stop_reason: 'tool_use',
+          usage: { output_tokens: 100, cache_creation_input_tokens: 50 },
+          content: [
+            { type: 'text', text: 'thinking out loud' },
+            { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.ts' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-05-17T00:00:02.000Z',
+        message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+      },
+      // Final assistant entry (end_turn) with a single text block.
+      {
+        type: 'assistant',
+        timestamp: '2026-05-17T00:00:10.000Z',
+        message: {
+          stop_reason: 'end_turn',
+          usage: { output_tokens: 200, cache_creation_input_tokens: 25 },
+          content: [{ type: 'text', text: 'final reply' }],
+        },
+      },
+    ]);
+
+    (observer as SessionObserverInternals).readNewEntries();
+
+    const assistantEvents = outputs.filter(
+      (e): e is AssistantEvent => (e as { type: string }).type === 'assistant_message',
+    );
+
+    // Mid-turn assistant_message rows: never carry turnMetrics
+    const midTurn = assistantEvents.find((e) => e.message === 'thinking out loud');
+    assert.ok(midTurn, 'mid-turn assistant event missing');
+    assert.equal(midTurn!.turnMetrics, undefined);
+
+    // End-turn assistant_message: carries the per-turn aggregate
+    const endTurn = assistantEvents.find((e) => e.turnMetrics !== undefined);
+    assert.ok(endTurn, 'end-turn assistant event with turnMetrics missing');
+    // tokens = 100+50 (mid) + 200+25 (end) = 375
+    assert.equal(endTurn!.turnMetrics!.totalTokens, 375);
+    // tool_use count = 1 (from mid-turn)
+    assert.equal(endTurn!.turnMetrics!.toolUseCount, 1);
+    // duration = (00:00:10 - 00:00:00) = 10s
+    assert.equal(endTurn!.turnMetrics!.durationSec, 10);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionObserver resets turnMetrics accumulator on a real user turn (not on tool_result-only user)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-turn-metrics-reset-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const observer = new SessionObserver('session-2', jsonlPath);
+  const outputs: unknown[] = [];
+  observer.on('output', (event) => outputs.push(event));
+
+  try {
+    observer.start(false);
+    appendEntries(jsonlPath, [
+      // --- Turn A ---
+      {
+        type: 'user',
+        timestamp: '2026-05-17T00:00:00.000Z',
+        message: { content: 'turn A' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-05-17T00:00:05.000Z',
+        message: {
+          stop_reason: 'end_turn',
+          usage: { output_tokens: 999, cache_creation_input_tokens: 0 },
+          content: [{ type: 'text', text: 'a-reply' }],
+        },
+      },
+      // --- Turn B: a fresh user turn must reset the accumulator ---
+      {
+        type: 'user',
+        timestamp: '2026-05-17T00:01:00.000Z',
+        message: { content: 'turn B' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-05-17T00:01:03.000Z',
+        message: {
+          stop_reason: 'end_turn',
+          usage: { output_tokens: 10, cache_creation_input_tokens: 5 },
+          content: [{ type: 'text', text: 'b-reply' }],
+        },
+      },
+    ]);
+
+    (observer as SessionObserverInternals).readNewEntries();
+
+    const assistantEvents = outputs.filter(
+      (e): e is AssistantEvent => (e as { type: string }).type === 'assistant_message',
+    );
+    const a = assistantEvents.find((e) => e.message === 'a-reply');
+    const b = assistantEvents.find((e) => e.message === 'b-reply');
+
+    assert.ok(a?.turnMetrics, 'turn A must have metrics');
+    assert.equal(a!.turnMetrics!.totalTokens, 999);
+    assert.equal(a!.turnMetrics!.durationSec, 5);
+
+    assert.ok(b?.turnMetrics, 'turn B must have metrics');
+    // If the accumulator hadn't reset, b would be 999+15=1014.
+    assert.equal(b!.turnMetrics!.totalTokens, 15);
+    assert.equal(b!.turnMetrics!.durationSec, 3);
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// History path
+// ---------------------------------------------------------------------------
+
+test('SessionDiscovery.getSessionHistory computes turnMetrics on end_turn rows from JSONL', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-history-metrics-'));
+  const claudeDir = join(dir, '.claude');
+  const projectDir = join(claudeDir, 'projects', 'test-project');
+  mkdirSync(projectDir, { recursive: true });
+  const jsonlPath = join(projectDir, 'sess-history.jsonl');
+
+  writeEntries(jsonlPath, [
+    {
+      type: 'user',
+      uuid: 'u1',
+      timestamp: '2026-05-17T00:00:00.000Z',
+      message: { content: 'do thing' },
+    },
+    // Mid-turn assistant (tool_use): contributes to accumulator, no metrics emitted
+    {
+      type: 'assistant',
+      uuid: 'a1',
+      timestamp: '2026-05-17T00:00:02.000Z',
+      message: {
+        stop_reason: 'tool_use',
+        usage: { output_tokens: 80, cache_creation_input_tokens: 20 },
+        content: [
+          { type: 'text', text: 'using a tool' },
+          { type: 'tool_use', id: 'tool-x', name: 'Read', input: {} },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'u2',
+      timestamp: '2026-05-17T00:00:03.000Z',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'tool-x', content: 'ok' }] },
+    },
+    // End-turn assistant with two text blocks. turnMetrics must land on
+    // block index 1 (the last text block), not block 0.
+    {
+      type: 'assistant',
+      uuid: 'a2',
+      timestamp: '2026-05-17T00:00:08.000Z',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 50, cache_creation_input_tokens: 50 },
+        content: [
+          { type: 'text', text: 'wrap-up 1' },
+          { type: 'text', text: 'wrap-up 2' },
+        ],
+      },
+    },
+  ]);
+
+  try {
+    const discovery = new SessionDiscovery(claudeDir);
+    await discovery.discoverSessions();
+    const page = discovery.getSessionHistory('sess-history', { limit: 100 });
+
+    const assistantMsgs = page.messages.filter((m) => m.role === 'assistant');
+    // Expect: 1 from a1 ("using a tool") + 2 from a2 ("wrap-up 1", "wrap-up 2")
+    assert.equal(assistantMsgs.length, 3);
+
+    const midTurn = assistantMsgs.find((m) => m.content === 'using a tool');
+    const endTurnFirst = assistantMsgs.find((m) => m.content === 'wrap-up 1');
+    const endTurnLast = assistantMsgs.find((m) => m.content === 'wrap-up 2');
+
+    assert.equal(midTurn?.turnMetrics, undefined);
+    assert.equal(endTurnFirst?.turnMetrics, undefined);
+    assert.ok(endTurnLast?.turnMetrics, 'history end_turn last block must have turnMetrics');
+    // Tokens: a1 (80+20) + a2 (50+50) = 200
+    assert.equal(endTurnLast!.turnMetrics!.totalTokens, 200);
+    // 1 tool_use
+    assert.equal(endTurnLast!.turnMetrics!.toolUseCount, 1);
+    // Duration: 00:00:08 - 00:00:00 = 8s
+    assert.equal(endTurnLast!.turnMetrics!.durationSec, 8);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionDiscovery.getSessionHistory keeps turnMetrics independent across multiple turns', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-history-metrics-multi-'));
+  const claudeDir = join(dir, '.claude');
+  const projectDir = join(claudeDir, 'projects', 'test-project');
+  mkdirSync(projectDir, { recursive: true });
+  const jsonlPath = join(projectDir, 'sess-multi.jsonl');
+
+  writeEntries(jsonlPath, [
+    // Turn A
+    { type: 'user', uuid: 'u1', timestamp: '2026-05-17T00:00:00.000Z', message: { content: 'A' } },
+    {
+      type: 'assistant',
+      uuid: 'a1',
+      timestamp: '2026-05-17T00:00:04.000Z',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 300, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'A done' }],
+      },
+    },
+    // Turn B
+    { type: 'user', uuid: 'u2', timestamp: '2026-05-17T01:00:00.000Z', message: { content: 'B' } },
+    {
+      type: 'assistant',
+      uuid: 'a2',
+      timestamp: '2026-05-17T01:00:02.000Z',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 7, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'B done' }],
+      },
+    },
+  ]);
+
+  try {
+    const discovery = new SessionDiscovery(claudeDir);
+    await discovery.discoverSessions();
+    const page = discovery.getSessionHistory('sess-multi', { limit: 100 });
+    const a = page.messages.find((m) => m.content === 'A done');
+    const b = page.messages.find((m) => m.content === 'B done');
+
+    assert.equal(a?.turnMetrics?.totalTokens, 300);
+    assert.equal(a?.turnMetrics?.durationSec, 4);
+
+    // Critical: B's metrics must NOT include A's tokens — the accumulator
+    // resets on every real user turn.
+    assert.equal(b?.turnMetrics?.totalTokens, 7);
+    assert.equal(b?.turnMetrics?.durationSec, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
