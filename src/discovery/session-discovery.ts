@@ -88,6 +88,10 @@ export interface HistoryMessage {
   subagentToolUseCount?: number;
   /** Final cumulative token count from archive (only set when archive exists). */
   subagentTokenCount?: number;
+  /** Per-turn aggregates attached to the LAST assistant text block of a turn
+   *  (JSONL row whose `stop_reason === 'end_turn'`). Mirrors the live observer
+   *  pipeline so reconnect/history replay shows the same chip. */
+  turnMetrics?: { totalTokens: number; toolUseCount: number; durationSec: number };
   /** local_command_invoke: command name without leading slash. */
   localCommandName?: string;
   /** local_command_invoke: raw `<command-args>` body if present. */
@@ -361,11 +365,77 @@ export class SessionDiscovery {
         const toolStatusById = new Map<string, 'success' | 'error'>();
         const toolResultContentById = new Map<string, string>();
 
+        // Per-turn accumulator — mirrors observer's live computation so the
+        // chip survives reconnect/history replay. Reset on every real user
+        // turn (i.e. content is a string or contains non-tool_result blocks),
+        // accumulate on each assistant entry, attach to the last text block
+        // when stop_reason === 'end_turn'.
+        let turnTokenSum = 0;
+        let turnToolUseCount = 0;
+        let turnStartMs: number | null = null;
+
         for (const line of lines) {
           try {
             const entry = JSON.parse(line) as Record<string, unknown>;
+            const entryTimestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
+
+            if (entry.type === 'user') {
+              const message = entry.message as { content?: unknown } | undefined;
+              const content = message?.content;
+              const isRealUser = typeof content === 'string'
+                || !Array.isArray(content)
+                || !(content as Array<Record<string, unknown>>).every((b) => b?.type === 'tool_result');
+              if (isRealUser) {
+                turnTokenSum = 0;
+                turnToolUseCount = 0;
+                turnStartMs = entryTimestamp ? Date.parse(entryTimestamp) || null : null;
+              }
+            }
+
+            if (entry.type === 'assistant') {
+              const message = entry.message as {
+                stop_reason?: string;
+                usage?: { output_tokens?: number; cache_creation_input_tokens?: number };
+                content?: Array<{ type?: string }>;
+              } | undefined;
+              if (message?.usage) {
+                turnTokenSum += (message.usage.output_tokens ?? 0)
+                  + (message.usage.cache_creation_input_tokens ?? 0);
+              }
+              if (Array.isArray(message?.content)) {
+                turnToolUseCount += message!.content!.filter((b) => b?.type === 'tool_use').length;
+              }
+            }
+
             const msgs = this.parseHistoryEntry(entry);
-            if (msgs.length > 0) allMessages.push(...msgs);
+
+            if (entry.type === 'assistant') {
+              const stopReason = (entry.message as { stop_reason?: string } | undefined)?.stop_reason;
+              if (stopReason === 'end_turn') {
+                const endMs = entryTimestamp ? Date.parse(entryTimestamp) : NaN;
+                const durationSec = (turnStartMs != null && Number.isFinite(endMs) && endMs >= turnStartMs)
+                  ? Math.round((endMs - turnStartMs) / 1000)
+                  : 0;
+                const metrics = {
+                  totalTokens: turnTokenSum,
+                  toolUseCount: turnToolUseCount,
+                  durationSec,
+                };
+                // Attach to the last assistant text block in THIS entry's
+                // parsed output. `parseHistoryEntry` emits one ParsedMessage
+                // per text/tool_use block in source order, so the last
+                // role==='assistant' entry is the highest sdkBlockIndex text.
+                let lastAssistantIdx = -1;
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                  if (msgs[i].role === 'assistant') { lastAssistantIdx = i; break; }
+                }
+                if (lastAssistantIdx >= 0) {
+                  (msgs[lastAssistantIdx] as HistoryMessage).turnMetrics = metrics;
+                }
+              }
+            }
+
+            if (msgs.length > 0) allMessages.push(...msgs as HistoryMessage[]);
 
             if (entry.type === 'user') {
               const message = entry.message as { content?: unknown } | undefined;

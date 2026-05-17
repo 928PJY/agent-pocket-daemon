@@ -14,6 +14,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<vo
   }
 }
 
+// Skip the fs.watchFile poll (500ms cadence + filesystem mtime quantization
+// makes this flake on CI runners) by calling the observer's read entry
+// point directly after each append. Mirrors the harness used by
+// session-observer-lifecycle.test.ts.
+type SessionObserverInternals = SessionObserver & { readNewEntries(): void };
+
 // `fs.watchFile` (used by SessionObserver) polls and compares mtime — when the
 // initial empty write and the subsequent appendFileSync land in the same
 // mtime tick on CI filesystems, the watcher never fires and the test times
@@ -46,6 +52,7 @@ test('observer emits parent_invoke_sdk_uuid on string-content local_command_outp
       message: { role: 'user', content: '<local-command-stdout>cost: $0.42</local-command-stdout>' },
     }) + '\n');
 
+    (observer as SessionObserverInternals).readNewEntries();
     await waitFor(() => outputs.length > 0);
 
     const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
@@ -80,6 +87,7 @@ test('observer emits parent_invoke_sdk_uuid on array-block local_command_output'
       ] },
     }) + '\n');
 
+    (observer as SessionObserverInternals).readNewEntries();
     await waitFor(() => outputs.length > 0);
 
     const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
@@ -113,6 +121,7 @@ test('observer emits parent_invoke_sdk_uuid on system local_command subtype', as
       content: '<local-command-stdout>context: 50%</local-command-stdout>',
     }) + '\n');
 
+    (observer as SessionObserverInternals).readNewEntries();
     await waitFor(() => outputs.length > 0);
 
     const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
@@ -145,6 +154,7 @@ test('observer: local_command_invoke does NOT carry parent_invoke_sdk_uuid even 
       message: { role: 'user', content: '<command-name>/cost</command-name>' },
     }) + '\n');
 
+    (observer as SessionObserverInternals).readNewEntries();
     await waitFor(() => outputs.length > 0);
 
     const ev = outputs[0] as { type: string; parent_invoke_sdk_uuid?: string };
