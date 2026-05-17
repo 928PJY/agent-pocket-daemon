@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { SessionObserver } from '../src/observers/session-observer.js';
 import { SessionDiscovery } from '../src/discovery/session-discovery.js';
+import { SessionManager } from '../src/sessions/session-manager.js';
 
 type SessionObserverInternals = SessionObserver & { readNewEntries(): void };
 type AssistantEvent = {
@@ -298,6 +299,135 @@ test('SessionDiscovery.getSessionHistory keeps turnMetrics independent across mu
     assert.equal(b?.turnMetrics?.totalTokens, 7);
     assert.equal(b?.turnMetrics?.durationSec, 2);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Controller mode (SDK mapper) — addresses PR #78 review comment that
+// controller sessions never see turnMetrics because the new path skipped
+// session-manager.ts while the legacy completion_metrics emit was gated off.
+// ---------------------------------------------------------------------------
+
+test('SessionManager controller mapper attaches turnMetrics on end_turn assistant_message', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-controller-tm-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const outputs: AssistantEvent[] = [];
+  manager.on('session_output', (_sessionId, event) => {
+    if ((event as { type: string }).type === 'assistant_message') {
+      outputs.push(event as AssistantEvent);
+    }
+  });
+  const privateManager = manager as unknown as {
+    handleSDKMessage(state: ReturnType<SessionManager['getSession']>, message: unknown): void;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-controller-1', jsonlPath, dir, 999);
+    const session = manager.getSession(sessionId)!;
+    outputs.length = 0;
+
+    // Real user turn — resets accumulator + sets turnStartMs to now
+    privateManager.handleSDKMessage(session, {
+      type: 'user',
+      message: { content: 'do thing' },
+    });
+    // Mid-turn assistant (tool_use): contributes tokens + 1 tool, no metrics emitted
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        stop_reason: 'tool_use',
+        usage: { output_tokens: 100, cache_creation_input_tokens: 50 },
+        content: [
+          { type: 'text', text: 'thinking out loud' },
+          { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.ts' } },
+        ],
+      },
+    });
+    // Tool result back to model — must NOT reset accumulator
+    privateManager.handleSDKMessage(session, {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    });
+    // End-turn assistant — emits metrics on its (only) text block
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 200, cache_creation_input_tokens: 25 },
+        content: [{ type: 'text', text: 'final reply' }],
+      },
+    });
+
+    const midTurn = outputs.find((e) => e.message === 'thinking out loud');
+    assert.ok(midTurn, 'mid-turn assistant_message missing');
+    assert.equal(midTurn!.turnMetrics, undefined);
+
+    const endTurn = outputs.find((e) => e.turnMetrics !== undefined);
+    assert.ok(endTurn, 'end-turn assistant_message with turnMetrics missing');
+    // tokens = 100+50 (mid) + 200+25 (end) = 375
+    assert.equal(endTurn!.turnMetrics!.totalTokens, 375);
+    assert.equal(endTurn!.turnMetrics!.toolUseCount, 1);
+    // durationSec uses Date.now() — assert it's a sane non-negative integer
+    assert.equal(typeof endTurn!.turnMetrics!.durationSec, 'number');
+    assert.ok(endTurn!.turnMetrics!.durationSec >= 0);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager controller mapper resets turnMetrics accumulator on a real user turn', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-controller-tm-reset-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const outputs: AssistantEvent[] = [];
+  manager.on('session_output', (_sessionId, event) => {
+    if ((event as { type: string }).type === 'assistant_message') {
+      outputs.push(event as AssistantEvent);
+    }
+  });
+  const privateManager = manager as unknown as {
+    handleSDKMessage(state: ReturnType<SessionManager['getSession']>, message: unknown): void;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-controller-2', jsonlPath, dir, 999);
+    const session = manager.getSession(sessionId)!;
+    outputs.length = 0;
+
+    // Turn A
+    privateManager.handleSDKMessage(session, { type: 'user', message: { content: 'A' } });
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 999, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'A done' }],
+      },
+    });
+    // Turn B — must reset accumulator. Without reset, B would report 999+15.
+    privateManager.handleSDKMessage(session, { type: 'user', message: { content: 'B' } });
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 10, cache_creation_input_tokens: 5 },
+        content: [{ type: 'text', text: 'B done' }],
+      },
+    });
+
+    const a = outputs.find((e) => e.message === 'A done');
+    const b = outputs.find((e) => e.message === 'B done');
+    assert.equal(a?.turnMetrics?.totalTokens, 999);
+    assert.equal(b?.turnMetrics?.totalTokens, 15);
+  } finally {
+    manager.shutdown();
     rmSync(dir, { recursive: true, force: true });
   }
 });

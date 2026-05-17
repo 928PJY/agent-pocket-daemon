@@ -110,6 +110,15 @@ export interface SessionState {
   lastEmittedThinkingLength: number;
   /** Track emitted tool_use IDs to avoid duplicates */
   emittedToolUseIds: Set<string>;
+  /** Per-turn turnMetrics accumulator — mirrors the live observer pipeline.
+   *  Reset on every real user turn (not on tool_result-only user messages),
+   *  advanced on each SDK 'assistant' message that carries usage/tool_use,
+   *  and emitted on the assistant message whose `stop_reason === 'end_turn'`
+   *  (attached to that turn's last text block). Controller mode equivalent
+   *  of session-observer.ts's accumulator. */
+  turnTokenSum: number;
+  turnToolUseCount: number;
+  turnStartMs: number | null;
   /** Controller mode: a slash command pushed to the SDK whose first reply we
    *  want to synthesize as local_command_invoke + local_command_output (for
    *  SDK-internal commands like /cost /status /context that the SDK renders
@@ -314,6 +323,9 @@ export class SessionManager extends EventEmitter {
       lastEmittedTextLength: 0,
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
+      turnTokenSum: 0,
+      turnToolUseCount: 0,
+      turnStartMs: null,
       isObserved: false,
       permissionMode: 'default',
       hasReceivedEvents: false,
@@ -372,6 +384,9 @@ export class SessionManager extends EventEmitter {
       lastEmittedTextLength: 0,
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
+      turnTokenSum: 0,
+      turnToolUseCount: 0,
+      turnStartMs: null,
       isObserved: false,
       permissionMode: 'default',
       hasReceivedEvents: false,
@@ -643,6 +658,9 @@ export class SessionManager extends EventEmitter {
       lastEmittedTextLength: 0,
       lastEmittedThinkingLength: 0,
       emittedToolUseIds: new Set(),
+      turnTokenSum: 0,
+      turnToolUseCount: 0,
+      turnStartMs: null,
       isObserved: true,
       observer,
       terminalPid,
@@ -1536,9 +1554,54 @@ export class SessionManager extends EventEmitter {
       }
 
       case 'assistant': {
-        const betaMessage = (message as { message?: { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }> } }).message;
+        const betaMessage = (message as { message?: {
+          content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown }>;
+          stop_reason?: string;
+          usage?: { output_tokens?: number; cache_creation_input_tokens?: number };
+        } }).message;
         const sdkUuid = (message as { uuid?: string }).uuid;
         const fullTextEmit = this.config.hasPeerCapability?.(PEER_CAPABILITIES.STABLE_SDK_UUID) ?? false;
+
+        // turnMetrics accumulator (controller-mode equivalent of the observer
+        // pipeline). Token usage and tool_use counts can be on ANY assistant
+        // message in a multi-step turn; metrics are emitted only on the
+        // assistant message whose stop_reason === 'end_turn', attached to
+        // that turn's LAST text block. SDK streams the same block in growing
+        // chunks (lastEmittedTextLength tracks our high-water mark) — we
+        // only attach metrics on the chunk that emits the last block's final
+        // delta, to mirror observer-mode "one chip per turn" behavior.
+        if (betaMessage?.usage) {
+          state.turnTokenSum += (betaMessage.usage.output_tokens ?? 0)
+            + (betaMessage.usage.cache_creation_input_tokens ?? 0);
+        }
+        if (Array.isArray(betaMessage?.content)) {
+          for (const b of betaMessage!.content!) {
+            if (b?.type === 'tool_use' && typeof b.id === 'string' && !state.emittedToolUseIds.has(b.id)) {
+              // Count tool_use blocks as we see them (use the dedupe set we
+              // already maintain so a re-stream of the same message doesn't
+              // double-count).
+              state.turnToolUseCount += 1;
+            }
+          }
+        }
+        // Compute end-of-turn metrics + the block index of the final text
+        // block (if any). Both are read in the text-block emit branch below.
+        let endTurnMetrics: { totalTokens: number; toolUseCount: number; durationSec: number } | undefined;
+        let endTurnLastTextBlockIndex = -1;
+        if (betaMessage?.stop_reason === 'end_turn') {
+          const startMs = state.turnStartMs ?? Date.now();
+          endTurnMetrics = {
+            totalTokens: state.turnTokenSum,
+            toolUseCount: state.turnToolUseCount,
+            durationSec: Math.max(0, Math.round((Date.now() - startMs) / 1000)),
+          };
+          if (Array.isArray(betaMessage.content)) {
+            for (let i = betaMessage.content.length - 1; i >= 0; i--) {
+              if (betaMessage.content[i]?.type === 'text') { endTurnLastTextBlockIndex = i; break; }
+            }
+          }
+          logger.info('session-manager', `[TurnMetrics] end_turn (controller) session=${sessionId.slice(0,8)} tokens=${endTurnMetrics.totalTokens} tools=${endTurnMetrics.toolUseCount} dur=${endTurnMetrics.durationSec}s lastTextBlock=${endTurnLastTextBlockIndex}`);
+        }
 
         // Controller-mode slash-command synthesis: SDK builtin commands like
         // /cost render their output as a single assistant text block within
@@ -1637,6 +1700,12 @@ export class SessionManager extends EventEmitter {
                   type: 'assistant_message',
                   message: payload,
                   ...(sdkUuid ? { sdkUuid, sdkBlockIndex: blockIndex } : {}),
+                  // Attach turnMetrics only when emitting the LAST text block
+                  // of an end_turn assistant message. Mirrors observer-mode:
+                  // one chip per turn, anchored to the final assistant bubble.
+                  ...(endTurnMetrics && blockIndex === endTurnLastTextBlockIndex
+                    ? { turnMetrics: endTurnMetrics }
+                    : {}),
                 };
                 state.status = SessionStatus.RUNNING;
                 this.emit('session_output', sessionId, event);
@@ -1673,6 +1742,17 @@ export class SessionManager extends EventEmitter {
         const userMessage = (message as { message?: { content?: unknown } }).message;
         const sdkUuid = (message as { uuid?: string }).uuid;
         const content = userMessage?.content;
+        // Real user turn (typed text or any non-tool_result content) resets
+        // the turnMetrics accumulator. A user message that's ONLY tool_results
+        // is the SDK shovelling tool output back at the model — same turn.
+        const isRealUser = typeof content === 'string'
+          || !Array.isArray(content)
+          || !(content as Array<{ type?: string }>).every((b) => b?.type === 'tool_result');
+        if (isRealUser) {
+          state.turnTokenSum = 0;
+          state.turnToolUseCount = 0;
+          state.turnStartMs = Date.now();
+        }
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'tool_result' && block.tool_use_id) {
