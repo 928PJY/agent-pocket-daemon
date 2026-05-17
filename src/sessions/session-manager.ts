@@ -938,6 +938,12 @@ export class SessionManager extends EventEmitter {
    * Reverses the four-line nullification in markObservedSessionHistory:
    * sets isObserved=true, status=READY, terminalPid, terminalTarget,
    * and creates a fresh SessionObserver. Returns true on success.
+   *
+   * Refuses any session whose status is not HISTORY. Without this guard a
+   * controller-mode session (isObserved=false because it owns an SDK Query
+   * rather than a terminal, status in {STARTING, READY, RUNNING, ...}) would
+   * be silently flipped into observer mode the moment discovery scans the
+   * daemon's own PID alongside the controller's JSONL file.
    */
   rePromoteHistoryToObserved(
     sessionId: string,
@@ -950,6 +956,7 @@ export class SessionManager extends EventEmitter {
     if (!session) return false;
     if (session.isObserved) return false;
     if (!session.claudeSessionId) return false;
+    if (session.status !== SessionStatus.HISTORY) return false;
 
     const demotedFor = Date.now() - session.lastActivity;
 

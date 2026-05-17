@@ -11,6 +11,7 @@ import {
   type HookGateway,
   type PendingClearInfo,
 } from '../src/wiring/hook-handlers-lifecycle.js';
+import { SessionStatus } from 'agent-pocket-protocol';
 import type {
   PendingBlockingEntry,
   MessageSeqRef,
@@ -746,7 +747,7 @@ test('session_start(resume): historified session is re-promoted via session-map 
   registerSessionStartHandler(hooks, {
     sessionManager: {
       findByClaudeSessionId() {
-        return { sessionId: 'int-1', isObserved: false, terminalTarget: undefined } as never;
+        return { sessionId: 'int-1', isObserved: false, status: SessionStatus.HISTORY, terminalTarget: undefined } as never;
       },
       findByTerminalPid() { return undefined as never; },
       observeSession() { throw new Error('should not observe — re-promote path'); },
@@ -809,7 +810,7 @@ test('session_start(resume): no PID in session-map → defers to polling', () =>
   registerSessionStartHandler(hooks, {
     sessionManager: {
       findByClaudeSessionId() {
-        return { sessionId: 'int-1', isObserved: false, terminalTarget: undefined } as never;
+        return { sessionId: 'int-1', isObserved: false, status: SessionStatus.HISTORY, terminalTarget: undefined } as never;
       },
       findByTerminalPid() { return undefined as never; },
       observeSession() { throw new Error('no-op'); },
@@ -829,6 +830,46 @@ test('session_start(resume): no PID in session-map → defers to polling', () =>
   });
   hooks.emit('session_start', 'claude-resumed', 'resume', '/proj', '/t');
   assert.equal(repromoted, false);
+});
+
+test('session_start(resume): controller-mode session is not re-promoted', () => {
+  // Bug repro: when an APP-started controller session also triggers an
+  // in-process SessionStart(resume) hook (e.g. SDK resumes the conversation
+  // mid-flight), the handler must NOT call rePromoteHistoryToObserved —
+  // the controller is not historified and the daemon's PID is just itself.
+  const hooks = makeHooks();
+  let repromoted = false;
+  registerSessionStartHandler(hooks, {
+    sessionManager: {
+      findByClaudeSessionId() {
+        return {
+          sessionId: 'int-controller',
+          isObserved: false,
+          status: SessionStatus.RUNNING,
+          terminalTarget: undefined,
+        } as never;
+      },
+      findByTerminalPid() { return undefined as never; },
+      observeSession() { throw new Error('no-op'); },
+      markObservedSessionHistory() {},
+      removeSession() {},
+      rePromoteHistoryToObserved() { repromoted = true; return true; },
+    },
+    resolveExternalSessionId(id: string) { return id; },
+    pendingClearInfo: new Map(),
+    sessionIdMap: new Map(),
+    replacedSessionIds: new Set(),
+    prefetchClaudeSessionIds: new Set(),
+    sendToPhone() {},
+    isInitialDiscoveryDone() { return true; },
+    sendSessionHistory() { return 0; },
+    readSessionMapFn() {
+      // Even with a PID available, controller must not be re-promoted.
+      return { 'controller-csid': { pid: 4242, cwd: '/proj', timestamp: 1 } };
+    },
+  });
+  hooks.emit('session_start', 'controller-csid', 'resume', '/proj', '/proj/controller-csid.jsonl');
+  assert.equal(repromoted, false, 'rePromoteHistoryToObserved must not be called for controller');
 });
 
 // ---------------------------------------------------------------------------
