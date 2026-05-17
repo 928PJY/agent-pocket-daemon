@@ -388,6 +388,10 @@ export function registerSessionStartHandler(
       // Already observed (e.g. resume in a fresh terminal but daemon never
       // historified): nothing to do, polling will keep it consistent.
       if (!existing || existing.isObserved) return;
+      // Controller-mode session (isObserved=false but never historified). The
+      // SDK runs in-process so any SessionStart hook the SDK triggers is just
+      // the daemon talking to itself — never re-promote into observer mode.
+      if (existing.status !== SessionStatus.HISTORY) return;
 
       // Historified record + new resume process. session-map.json is written
       // synchronously by the hook script before this POST, so the new PID is

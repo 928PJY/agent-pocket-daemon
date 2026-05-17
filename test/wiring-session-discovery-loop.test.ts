@@ -43,6 +43,7 @@ interface FakeSession {
   entrypoint?: string;
   observer?: FakeObserverState;
   lastActivity?: number;
+  status?: SessionStatus;
 }
 
 interface ObserveCall {
@@ -155,7 +156,14 @@ function makeClaudeFixture(opts: {
       rePromoteHistoryToObserved: ((sessionId: string, pid: number, jsonlPath: string, customTitle, terminalTarget) => {
         const s = sessions.find(x => x.sessionId === sessionId);
         if (!s || s.isObserved || !s.claudeSessionId) return false;
+        // Mirror the production guard added to SessionManager: rePromote is
+        // only valid for HISTORY records. A controller-mode entry (isObserved
+        // false but status STARTING/READY/RUNNING/etc.) must NOT be flipped
+        // into observer mode just because the daemon's own PID was scanned
+        // alongside the controller's JSONL file.
+        if (s.status !== SessionStatus.HISTORY) return false;
         s.isObserved = true;
+        s.status = SessionStatus.READY;
         s.terminalPid = pid;
         s.observer = { jsonlPath };
         s.terminalTarget = terminalTarget as never;
@@ -262,6 +270,7 @@ test('claude discovery (resume): historified sid + new PID alive → re-promote,
       claudeSessionId: 'claude-resumed',
       isObserved: false,
       terminalPid: undefined,
+      status: SessionStatus.HISTORY,
     }],
     alivePids: [9999],
     initialDone: true,
@@ -281,6 +290,7 @@ test('claude discovery (resume): historified sid but no JSONL match → no re-pr
       sessionId: 'internal-historified',
       claudeSessionId: 'claude-resumed',
       isObserved: false,
+      status: SessionStatus.HISTORY,
     }],
     alivePids: [9999],
     initialDone: true,
@@ -288,6 +298,43 @@ test('claude discovery (resume): historified sid but no JSONL match → no re-pr
   await discoverAndObserveSessions(f.deps);
   assert.equal(f.repromoteCalls.length, 0);
   assert.equal(f.observeCalls.length, 0);
+});
+
+test('claude discovery: controller-mode session NOT flipped to observer', async () => {
+  // Repro for the production bug where an APP-started controller session
+  // gets silently switched to observer mode after a few seconds.
+  //
+  // Setup: the daemon's own PID (e.g. 4242) shows up in runningCli because
+  // the Claude SDK runs SessionStart hooks in-process and the hook writes
+  // ~/.claude/sessions/4242.json with the controller's claudeSessionId. The
+  // SDK also writes the JSONL file. Discovery then sees:
+  //   - runningCli:  [{ pid: daemonPid, sessionId: controllerCsid }]
+  //   - existingBySid: the controller record (isObserved=false, status=READY)
+  //   - discovered:  the SDK-written JSONL for that csid
+  // Without the status===HISTORY guard, this triggers rePromote and the
+  // controller silently becomes an "observer" of itself.
+  const f = makeClaudeFixture({
+    runningCli: [{ pid: 4242, sessionId: 'controller-csid', cwd: '/proj', entrypoint: 'claude' }],
+    discovered: [{ sessionId: 'controller-csid', projectDir: '/proj', lastModified: 200, filePath: '/proj/.claude/controller-csid.jsonl' }],
+    sessions: [{
+      sessionId: 'internal-controller',
+      claudeSessionId: 'controller-csid',
+      isObserved: false,
+      status: SessionStatus.READY,
+      // No terminalPid — this is a controller, not an observed session.
+    }],
+    alivePids: [4242],
+    initialDone: true,
+  });
+  await discoverAndObserveSessions(f.deps);
+
+  assert.equal(f.repromoteCalls.length, 0, 'controller must not be re-promoted');
+  assert.equal(f.observeCalls.length, 0, 'controller must not be re-observed as a fresh session');
+  const ctl = f.sessions.find(s => s.sessionId === 'internal-controller');
+  assert.ok(ctl, 'controller record must still exist');
+  assert.equal(ctl.isObserved, false, 'isObserved must remain false');
+  assert.equal(ctl.status, SessionStatus.READY, 'status must not be rewritten');
+  assert.equal(ctl.terminalPid, undefined, 'no terminalPid must be attached');
 });
 
 test('claude discovery: session-map.json overrides PID JSON when entry exists with different sessionId', async () => {
