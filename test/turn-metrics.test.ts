@@ -431,3 +431,117 @@ test('SessionManager controller mapper resets turnMetrics accumulator on a real 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Regression: end_turn message that repeats already-emitted text must still
+// surface turnMetrics live (addresses PR #78 review comment).
+// ---------------------------------------------------------------------------
+
+test('SessionObserver emits metadata-only assistant_message when end_turn repeats text already emitted', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-tm-repeat-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const observer = new SessionObserver('session-repeat', jsonlPath, { hasPeerCapability: () => true });
+  const outputs: unknown[] = [];
+  observer.on('output', (event) => outputs.push(event));
+
+  try {
+    observer.start(false);
+    appendEntries(jsonlPath, [
+      { type: 'user', timestamp: '2026-05-17T00:00:00.000Z', message: { content: 'go' } },
+      // First chunk emits the full text under STABLE_SDK_UUID (fullTextEmit).
+      {
+        type: 'assistant',
+        uuid: 'asst-1',
+        timestamp: '2026-05-17T00:00:01.000Z',
+        message: {
+          stop_reason: 'tool_use',
+          usage: { output_tokens: 30, cache_creation_input_tokens: 0 },
+          content: [{ type: 'text', text: 'all of the reply' }],
+        },
+      },
+      // Final end_turn message REPEATS the same text — the length guard
+      // would normally skip emit. With the fix, we still send a metadata-
+      // only assistant_message so the chip lands on the existing row.
+      {
+        type: 'assistant',
+        uuid: 'asst-1',
+        timestamp: '2026-05-17T00:00:02.000Z',
+        message: {
+          stop_reason: 'end_turn',
+          usage: { output_tokens: 5, cache_creation_input_tokens: 0 },
+          content: [{ type: 'text', text: 'all of the reply' }],
+        },
+      },
+    ]);
+
+    (observer as SessionObserverInternals).readNewEntries();
+
+    const assistantEvents = outputs.filter(
+      (e): e is AssistantEvent => (e as { type: string }).type === 'assistant_message',
+    );
+    const withMetrics = assistantEvents.find((e) => e.turnMetrics !== undefined);
+    assert.ok(withMetrics, 'must emit a turnMetrics-carrying assistant_message even when text is unchanged');
+    // tokens = 30 + 5 = 35
+    assert.equal(withMetrics!.turnMetrics!.totalTokens, 35);
+    // payload may be empty (metadata-only) when there's no new text delta
+    assert.equal(typeof withMetrics!.message, 'string');
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('SessionManager controller mapper emits metadata-only metrics on end_turn with no text delta', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-controller-tm-repeat-'));
+  const jsonlPath = join(dir, 'session.jsonl');
+  writeFileSync(jsonlPath, '');
+
+  const manager = new SessionManager();
+  const outputs: AssistantEvent[] = [];
+  manager.on('session_output', (_sessionId, event) => {
+    if ((event as { type: string }).type === 'assistant_message') {
+      outputs.push(event as AssistantEvent);
+    }
+  });
+  const privateManager = manager as unknown as {
+    handleSDKMessage(state: ReturnType<SessionManager['getSession']>, message: unknown): void;
+  };
+
+  try {
+    const sessionId = manager.observeSession('claude-controller-repeat', jsonlPath, dir, 999);
+    const session = manager.getSession(sessionId)!;
+    outputs.length = 0;
+
+    privateManager.handleSDKMessage(session, { type: 'user', message: { content: 'go' } });
+    // First chunk: full text emitted
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      uuid: 'asst-1',
+      message: {
+        stop_reason: 'tool_use',
+        usage: { output_tokens: 30, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'final reply' }],
+      },
+    });
+    // end_turn: same text, no new delta — controller must still emit
+    // metadata-only event carrying turnMetrics.
+    privateManager.handleSDKMessage(session, {
+      type: 'assistant',
+      uuid: 'asst-1',
+      message: {
+        stop_reason: 'end_turn',
+        usage: { output_tokens: 5, cache_creation_input_tokens: 0 },
+        content: [{ type: 'text', text: 'final reply' }],
+      },
+    });
+
+    const withMetrics = outputs.find((e) => e.turnMetrics !== undefined);
+    assert.ok(withMetrics, 'controller must emit metrics event even when text is unchanged');
+    assert.equal(withMetrics!.turnMetrics!.totalTokens, 35);
+  } finally {
+    manager.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

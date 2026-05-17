@@ -1674,9 +1674,12 @@ export class SessionManager extends EventEmitter {
               }
               case 'text': {
                 const fullText = block.text ?? '';
-                if (fullText.length <= state.lastEmittedTextLength) break;
+                const shouldAttachMetrics = !!endTurnMetrics && blockIndex === endTurnLastTextBlockIndex;
+                const hasNewText = fullText.length > state.lastEmittedTextLength;
+                // No new text AND nothing else to do → skip.
+                if (!hasNewText && !shouldAttachMetrics) break;
 
-                if (fullTextEmit) {
+                if (hasNewText && fullTextEmit) {
                   const localCmd = parseLocalCommandUserText(fullText);
                   if (localCmd === 'drop') {
                     state.lastEmittedTextLength = fullText.length;
@@ -1693,9 +1696,11 @@ export class SessionManager extends EventEmitter {
                   }
                 }
 
-                const payload = fullTextEmit ? fullText : fullText.slice(state.lastEmittedTextLength);
-                state.lastEmittedTextLength = fullText.length;
-                if (payload.length === 0) break;
+                const payload = hasNewText
+                  ? (fullTextEmit ? fullText : fullText.slice(state.lastEmittedTextLength))
+                  : '';
+                if (hasNewText) state.lastEmittedTextLength = fullText.length;
+                if (payload.length === 0 && !shouldAttachMetrics) break;
                 const event: AssistantMessageEvent = {
                   type: 'assistant_message',
                   message: payload,
@@ -1703,9 +1708,11 @@ export class SessionManager extends EventEmitter {
                   // Attach turnMetrics only when emitting the LAST text block
                   // of an end_turn assistant message. Mirrors observer-mode:
                   // one chip per turn, anchored to the final assistant bubble.
-                  ...(endTurnMetrics && blockIndex === endTurnLastTextBlockIndex
-                    ? { turnMetrics: endTurnMetrics }
-                    : {}),
+                  // When the final end_turn message repeats text already
+                  // emitted (no delta), we STILL emit a metadata-only event
+                  // (empty `message`) so the chip can land on the existing
+                  // (sdkUuid, sdkBlockIndex) row via the iOS backfill path.
+                  ...(shouldAttachMetrics ? { turnMetrics: endTurnMetrics } : {}),
                 };
                 state.status = SessionStatus.RUNNING;
                 this.emit('session_output', sessionId, event);

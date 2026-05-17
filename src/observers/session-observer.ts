@@ -649,20 +649,25 @@ export class SessionObserver extends EventEmitter {
             this.lastEmittedTextLength = fullText.length;
             break;
           }
-          if (fullText.length <= this.lastEmittedTextLength) break;
-          const payload = fullTextEmit ? fullText : fullText.slice(this.lastEmittedTextLength);
-          this.lastEmittedTextLength = fullText.length;
-          if (payload.length === 0) break;
+          const shouldAttachMetrics = !!endTurnMetrics && blockIndex === lastTextBlockIndex;
+          const hasNewText = fullText.length > this.lastEmittedTextLength;
+          // No new text AND nothing to attach → genuinely nothing to do.
+          if (!hasNewText && !shouldAttachMetrics) break;
+          const payload = hasNewText
+            ? (fullTextEmit ? fullText : fullText.slice(this.lastEmittedTextLength))
+            : '';
+          if (hasNewText) this.lastEmittedTextLength = fullText.length;
+          // If there's no text delta AND no metrics to attach, drop. (Handled
+          // above, but keep the guard explicit so re-arrangement is safe.)
+          if (payload.length === 0 && !shouldAttachMetrics) break;
           const event: AssistantMessageEvent = {
             type: 'assistant_message',
             message: payload,
             ...(entryUuid ? { sdkUuid: entryUuid, sdkBlockIndex: blockIndex } : {}),
-            ...(endTurnMetrics && blockIndex === lastTextBlockIndex
-              ? { turnMetrics: endTurnMetrics }
-              : {}),
+            ...(shouldAttachMetrics ? { turnMetrics: endTurnMetrics } : {}),
           };
-          if (endTurnMetrics && blockIndex === lastTextBlockIndex) {
-            logger.info('observer', `[TurnMetrics] attached to assistant_message sdkUuid=${entryUuid?.slice(0,8)} block=${blockIndex} session=${this.sessionId.slice(0,8)}`);
+          if (shouldAttachMetrics) {
+            logger.info('observer', `[TurnMetrics] attached to assistant_message sdkUuid=${entryUuid?.slice(0,8)} block=${blockIndex} session=${this.sessionId.slice(0,8)} hasNewText=${hasNewText}`);
           }
           this.emit('output', event);
           break;
