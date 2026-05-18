@@ -171,6 +171,14 @@ const LOCAL_COMMAND_EVENT_TYPES = new Set([
   'compact_summary',
 ]);
 
+const CODEX_TAG_EVENT_TYPES = new Set([
+  'codex_environment_context',
+  'codex_collaboration_mode',
+  'codex_skills_listing',
+  'codex_system_reminder',
+  'codex_mem_citation',
+]);
+
 export function sendFlattenedSessionOutput(
   deps: SendFlattenedSessionOutputDeps,
   sessionId: string,
@@ -182,6 +190,15 @@ export function sendFlattenedSessionOutput(
     if (consumeInjectedMessage(injected, agentEvent.message)) {
       return;
     }
+  }
+
+  // Codex meta-events (extracted from `<environment_context>` etc.) require
+  // PEER_CAPABILITIES.CODEX_TAG_EXTRACTION on the phone. Old phones never
+  // saw a dedicated event for these — they got the raw `<tag>` text inline
+  // in the previous protocol — so silently drop here to avoid leaking
+  // unrenderable events.
+  if (CODEX_TAG_EVENT_TYPES.has(agentEvent.type)) {
+    if (!deps.hasPeerCapability(PEER_CAPABILITIES.CODEX_TAG_EXTRACTION)) return;
   }
 
   if (LOCAL_COMMAND_EVENT_TYPES.has(agentEvent.type)) {
@@ -317,6 +334,9 @@ export function sendSessionHistory(
     if (!hasLocalCommandCap && LOCAL_COMMAND_HISTORY_ROLES.has(m.role)) {
       return false;
     }
+    if (m.role === 'codex_meta' && !deps.hasPeerCapability(PEER_CAPABILITIES.CODEX_TAG_EXTRACTION)) {
+      return false;
+    }
     if (m.role === 'local_command_invoke' && m.sdkUuid && suppressedInvokeUuids.has(m.sdkUuid)) {
       return false;
     }
@@ -348,9 +368,31 @@ export function sendSessionHistory(
   // from tsMs so the phone doesn't need either field. Without this the
   // phone sees opaque numeric fields it doesn't model and old phones
   // running stricter codable parsers may reject the row.
-  const wireMessages = filtered.map((m) => {
-    const { tsMs: _ts, parseIndex: _pi, ...rest } = m as { tsMs?: number; parseIndex?: number } & Record<string, unknown>;
-    return rest;
+  //
+  // codex_meta rows are flattened to the same wire shape the live path
+  // delivers (`{ role: 'codex_environment_context', ...eventFields }`),
+  // so iOS uses a single per-role parser instead of a separate nested
+  // payload format for history.
+  const wireMessages = filtered.flatMap((m) => {
+    if (m.role === 'codex_meta' && m.codexMetaEvent) {
+      const ev = m.codexMetaEvent as { type: string } & Record<string, unknown>;
+      const { type: evType, ...evFields } = ev;
+      const ts = m.timestamp;
+      const seq = m.session_seq ?? m.seq;
+      return [{
+        role: evType,
+        content: '',
+        ...evFields,
+        ...(ts !== undefined ? { timestamp: ts } : {}),
+        ...(seq !== undefined ? { session_seq: seq, seq } : {}),
+      }];
+    }
+    const { tsMs: _ts, parseIndex: _pi, codexMetaEvent: _meta, ...rest } = m as {
+      tsMs?: number;
+      parseIndex?: number;
+      codexMetaEvent?: unknown;
+    } & Record<string, unknown>;
+    return [rest];
   });
 
   const event = {

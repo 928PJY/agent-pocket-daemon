@@ -45,7 +45,8 @@ export interface HistoryMessage {
     | 'local_command_invoke'
     | 'local_command_output'
     | 'compact_boundary'
-    | 'compact_summary';
+    | 'compact_summary'
+    | 'codex_meta';
   content: string;
   /**
    * For role='user' entries: the SDK transcript UUID from the JSONL row's
@@ -131,6 +132,14 @@ export interface HistoryMessage {
    * the wire — internal only.
    */
   parseIndex?: number;
+  /**
+   * For role='codex_meta' rows: the pre-built ClaudeEvent to emit verbatim.
+   * Populated by the Codex tag extractor (`src/utils/codex-tag-extract.ts`).
+   * Carries one of CODEX_TAG_EVENT_TYPES (`codex_environment_context`,
+   * `codex_collaboration_mode`, `codex_skills_listing`, `codex_system_reminder`,
+   * `codex_mem_citation`). `content` is left empty for these rows.
+   */
+  codexMetaEvent?: import('agent-pocket-protocol').ClaudeEvent;
 }
 
 export interface HistoryPage {

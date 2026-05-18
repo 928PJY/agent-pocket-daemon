@@ -7,6 +7,7 @@ import type { HistoryMessage, HistoryPage } from './session-discovery.js';
 import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
+import { extractCodexMetaEvents } from '../utils/codex-tag-extract.js';
 
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
@@ -478,9 +479,27 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
 export function parseCodexResponseItem(payload: Record<string, unknown>, timestamp?: string): HistoryMessage[] {
   const itemType = payload.type as string | undefined;
   if (itemType === 'message') {
-    const role = payload.role === 'user' ? 'user' : 'assistant';
+    const rawRole = typeof payload.role === 'string' ? payload.role : undefined;
     const content = extractCodexContentText(payload.content);
     if (!content) return [];
+
+    // Developer-role frames are pure meta-channel: environment_context,
+    // collaboration_mode, skills_instructions, plugins_instructions, …
+    // Pre-CODEX_TAG_EXTRACTION we collapsed them into assistant messages and
+    // leaked the raw `<tag>` literals into chat. Now we extract every
+    // recognised tag and drop anything left over (developer prose without
+    // tags is internal scaffolding the user shouldn't see).
+    if (rawRole === 'developer') {
+      const { events } = extractCodexMetaEvents(content, { timestamp });
+      return events.map((event) => ({
+        role: 'codex_meta',
+        content: '',
+        codexMetaEvent: event,
+        timestamp,
+      }));
+    }
+
+    const role = rawRole === 'user' ? 'user' : 'assistant';
     if (role === 'user') {
       if (isCodexRuntimeWarningMessage(content)) return [];
       const interruptReason = detectInterruptText(content);
@@ -488,7 +507,23 @@ export function parseCodexResponseItem(payload: Record<string, unknown>, timesta
         return [{ role: 'system', content: interruptMessageText(interruptReason ?? 'streaming'), timestamp }];
       }
     }
-    return [{ role, content, timestamp }];
+
+    // user/assistant content may carry inline `<system-reminder>` or
+    // `<oai-mem-citation>` blocks. Extract them as separate codex_meta
+    // rows ahead of the cleaned text so the phone renders the chip / card
+    // before the bubble. If stripping leaves no prose, the text row is
+    // dropped (a reply that was *only* a citation block is rare but valid).
+    const { events: metaEvents, stripped } = extractCodexMetaEvents(content, { timestamp });
+    const messages: HistoryMessage[] = metaEvents.map((event) => ({
+      role: 'codex_meta',
+      content: '',
+      codexMetaEvent: event,
+      timestamp,
+    }));
+    if (stripped.length > 0) {
+      messages.push({ role, content: stripped, timestamp });
+    }
+    return messages;
   }
 
   if (itemType === 'function_call') {
@@ -541,6 +576,8 @@ export function codexHistoryMessageToEvent(message: HistoryMessage): ClaudeEvent
       };
     case 'system':
       return { type: 'system_message', message: message.content };
+    case 'codex_meta':
+      return message.codexMetaEvent ?? null;
     default:
       return null;
   }
