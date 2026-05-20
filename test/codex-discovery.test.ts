@@ -45,7 +45,11 @@ test('parseCodexHistoryEntry maps Codex response items to history messages', () 
       content: [{ type: 'output_text', text: 'Done.' }],
     },
   });
-  assert.deepEqual(assistant, [{ role: 'assistant', content: 'Done.', timestamp: '2026-04-29T00:00:00.000Z' }]);
+  assert.equal(assistant.length, 1);
+  assert.equal(assistant[0].role, 'assistant');
+  assert.equal(assistant[0].content, 'Done.');
+  assert.equal(assistant[0].timestamp, '2026-04-29T00:00:00.000Z');
+  assert.match(assistant[0].sdkUuid ?? '', /^codex_msg:/);
 
   const toolUse = parseCodexHistoryEntry({
     type: 'response_item',
@@ -278,4 +282,109 @@ test('parseCodexLifecycleEntry detects completed and failed Codex turns', () => 
     type: 'event_msg',
     payload: { type: 'exec_command_end', call_id: 'call_2', exit_code: 1, aggregated_output: 'test failed' },
   }), null);
+});
+
+test('parseCodexHistoryEntry maps task_started.collaboration_mode_kind to codex_collaboration_mode row', () => {
+  const messages = parseCodexHistoryEntry({
+    timestamp: '2026-05-20T03:37:12.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'task_started',
+      turn_id: 'turn-abc',
+      collaboration_mode_kind: 'plan',
+    },
+  });
+  assert.equal(messages.length, 1);
+  const m = messages[0] as {
+    role: string;
+    codexMetaEvent: { type: string; mode: string; body: string };
+    sdkUuid?: string;
+    timestamp?: string;
+  };
+  assert.equal(m.role, 'codex_meta');
+  assert.equal(m.codexMetaEvent.type, 'codex_collaboration_mode');
+  assert.equal(m.codexMetaEvent.mode, 'Plan');
+  assert.equal(m.codexMetaEvent.body, '');
+  // sdkUuid must be pinned to turn_id so the seq-allocator hands out the
+  // same seq on re-parse — without it allocAnonymous() bumps the seq on
+  // every rollout mtime change, breaking phone-side dedupe of the banner.
+  assert.equal(m.sdkUuid, 'codex_collaboration_mode:turn-abc');
+  assert.equal(m.timestamp, '2026-05-20T03:37:12.000Z');
+});
+
+test('parseCodexHistoryEntry capitalizes various collaboration_mode_kind values', () => {
+  const plan = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 't1', collaboration_mode_kind: 'plan' },
+  });
+  assert.equal((plan[0] as { codexMetaEvent: { mode: string } }).codexMetaEvent.mode, 'Plan');
+
+  const dflt = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 't2', collaboration_mode_kind: 'default' },
+  });
+  assert.equal((dflt[0] as { codexMetaEvent: { mode: string } }).codexMetaEvent.mode, 'Default');
+
+  const fullAccess = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 't3', collaboration_mode_kind: 'full_access' },
+  });
+  assert.equal((fullAccess[0] as { codexMetaEvent: { mode: string } }).codexMetaEvent.mode, 'Full_access');
+});
+
+test('parseCodexHistoryEntry returns [] when task_started lacks collaboration_mode_kind', () => {
+  const messages = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 't1' },
+  });
+  assert.equal(messages.length, 0);
+});
+
+test('parseCodexHistoryEntry returns [] when task_started has no turn_id (still emits, but no sdkUuid)', () => {
+  const messages = parseCodexHistoryEntry({
+    type: 'event_msg',
+    payload: { type: 'task_started', collaboration_mode_kind: 'plan' },
+  });
+  // Without turn_id the row still surfaces but with no sdkUuid (callers can
+  // fall back to seq-allocator's anonymous slot).
+  assert.equal(messages.length, 1);
+  const m = messages[0] as { sdkUuid?: string; codexMetaEvent: { mode: string } };
+  assert.equal(m.sdkUuid, undefined);
+  assert.equal(m.codexMetaEvent.mode, 'Plan');
+});
+
+test('CodexDiscovery.getSessionHistory collapses consecutive same-mode codex_collaboration_mode rows', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-collapse-'));
+  try {
+    const codexDir = path.join(dir, '.codex');
+    const sessionsDir = path.join(codexDir, 'sessions', '2026', '05', '20');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const rolloutPath = path.join(sessionsDir, 'rollout-2026-05-20T00-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl');
+    // Sequence: default → default (dup) → plan → plan (dup) → default
+    // Expected after collapse: default, plan, default (3 banners).
+    fs.writeFileSync(rolloutPath, [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't1', collaboration_mode_kind: 'default' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't2', collaboration_mode_kind: 'default' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't3', collaboration_mode_kind: 'plan' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't4', collaboration_mode_kind: 'plan' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't5', collaboration_mode_kind: 'default' } }),
+    ].join('\n') + '\n');
+
+    const discovery = new CodexDiscovery(codexDir);
+    discovery.registerSessionFromRollout({
+      sessionId: 'codex:placeholder',
+      rolloutPath,
+      cwd: dir,
+    });
+    const sessionId = 'codex:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const history = discovery.getSessionHistory(sessionId);
+
+    const modeRows = history.messages.filter((m) => {
+      const ev = (m as { codexMetaEvent?: { type?: string } }).codexMetaEvent;
+      return m.role === 'codex_meta' && ev?.type === 'codex_collaboration_mode';
+    }) as Array<{ codexMetaEvent: { mode: string } }>;
+    assert.deepEqual(modeRows.map((m) => m.codexMetaEvent.mode), ['Default', 'Plan', 'Default']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -1,12 +1,14 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import type { ClaudeEvent } from 'agent-pocket-protocol';
 import type { HistoryMessage, HistoryPage } from './session-discovery.js';
 import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
+import { extractCodexMetaEvents } from '../utils/codex-tag-extract.js';
 
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
@@ -204,6 +206,23 @@ export class CodexDiscovery {
           } catch {
             // Ignore malformed or partial lines.
           }
+        }
+        // Collapse consecutive task_started → codex_collaboration_mode rows
+        // with the same mode. Every Codex turn writes a task_started, so
+        // without this every turn would render its own banner. Only mode
+        // *transitions* should surface a banner.
+        {
+          const compacted: typeof allMessages = [];
+          let lastMode: string | undefined;
+          for (const msg of allMessages) {
+            const ev = (msg as { codexMetaEvent?: { type?: string; mode?: string } }).codexMetaEvent;
+            if (msg.role === 'codex_meta' && ev?.type === 'codex_collaboration_mode') {
+              if (ev.mode === lastMode) continue;
+              lastMode = ev.mode;
+            }
+            compacted.push(msg);
+          }
+          allMessages = compacted;
         }
         for (const msg of allMessages) {
           let seq: number;
@@ -438,6 +457,31 @@ export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryM
         timestamp,
       }];
     }
+    // `<collaboration_mode>` developer-message blocks are template payloads
+    // re-injected every turn; the authoritative mode signal lives in
+    // `task_started.collaboration_mode_kind` (lowercase, e.g. "default" /
+    // "plan"). Emit a codex_meta row per task_started so the phone always
+    // sees the current mode without parsing markdown out of the block body.
+    if (payloadType === 'task_started') {
+      const kind = typeof payload.collaboration_mode_kind === 'string'
+        ? payload.collaboration_mode_kind
+        : undefined;
+      if (kind) {
+        const mode = kind.charAt(0).toUpperCase() + kind.slice(1);
+        const turnId = typeof payload.turn_id === 'string' ? payload.turn_id : undefined;
+        // Pin sdkUuid to turn_id so seq-allocator hands out the same seq on
+        // re-parse — without it allocAnonymous() bumps the seq on every
+        // rollout mtime change, breaking phone-side dedupe of the banner.
+        const sdkUuid = turnId ? `codex_collaboration_mode:${turnId}` : undefined;
+        return [{
+          role: 'codex_meta',
+          content: '',
+          codexMetaEvent: { type: 'codex_collaboration_mode', mode, body: '', ...(timestamp ? { timestamp } : {}) },
+          timestamp,
+          ...(sdkUuid ? { sdkUuid } : {}),
+        }];
+      }
+    }
   }
 
   return [];
@@ -478,9 +522,27 @@ export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexL
 export function parseCodexResponseItem(payload: Record<string, unknown>, timestamp?: string): HistoryMessage[] {
   const itemType = payload.type as string | undefined;
   if (itemType === 'message') {
-    const role = payload.role === 'user' ? 'user' : 'assistant';
+    const rawRole = typeof payload.role === 'string' ? payload.role : undefined;
     const content = extractCodexContentText(payload.content);
     if (!content) return [];
+
+    // Developer-role frames are pure meta-channel: environment_context,
+    // collaboration_mode, skills_instructions, plugins_instructions, …
+    // Pre-CODEX_TAG_EXTRACTION we collapsed them into assistant messages and
+    // leaked the raw `<tag>` literals into chat. Now we extract every
+    // recognised tag and drop anything left over (developer prose without
+    // tags is internal scaffolding the user shouldn't see).
+    if (rawRole === 'developer') {
+      const { events } = extractCodexMetaEvents(content, { timestamp });
+      return events.map((event) => ({
+        role: 'codex_meta',
+        content: '',
+        codexMetaEvent: event,
+        timestamp,
+      }));
+    }
+
+    const role = rawRole === 'user' ? 'user' : 'assistant';
     if (role === 'user') {
       if (isCodexRuntimeWarningMessage(content)) return [];
       const interruptReason = detectInterruptText(content);
@@ -488,7 +550,29 @@ export function parseCodexResponseItem(payload: Record<string, unknown>, timesta
         return [{ role: 'system', content: interruptMessageText(interruptReason ?? 'streaming'), timestamp }];
       }
     }
-    return [{ role, content, timestamp }];
+
+    // user/assistant content may carry inline `<system-reminder>` or
+    // `<oai-mem-citation>` blocks. Extract them as separate codex_meta
+    // rows ahead of the cleaned text so the phone renders the chip / card
+    // before the bubble. If stripping leaves no prose, the text row is
+    // dropped (a reply that was *only* a citation block is rare but valid).
+    const { events: metaEvents, stripped } = extractCodexMetaEvents(content, { timestamp });
+    const messages: HistoryMessage[] = metaEvents.map((event) => ({
+      role: 'codex_meta',
+      content: '',
+      codexMetaEvent: event,
+      timestamp,
+    }));
+    if (stripped.length > 0) {
+      // Pin a stable pseudo-sdkUuid derived from (role, timestamp, content
+      // prefix) so live emit and history re-parse produce the same key. Codex
+      // JSONL has no native message id; without this the live observer ships
+      // rows with no sdk_uuid, the phone fingerprints them as random local
+      // ids, and the history-replay copy on reconnect lands as a duplicate.
+      const sdkUuid = stableCodexMessageUuid(role, timestamp, stripped);
+      messages.push({ role, content: stripped, timestamp, sdkUuid });
+    }
+    return messages;
   }
 
   if (itemType === 'function_call') {
@@ -541,6 +625,8 @@ export function codexHistoryMessageToEvent(message: HistoryMessage): ClaudeEvent
       };
     case 'system':
       return { type: 'system_message', message: message.content };
+    case 'codex_meta':
+      return message.codexMetaEvent ?? null;
     default:
       return null;
   }
@@ -588,6 +674,16 @@ function stringifyCodexOutput(value: unknown): string {
   } catch {
     return String(value ?? '');
   }
+}
+
+function stableCodexMessageUuid(role: string, timestamp: string | undefined, content: string): string {
+  const h = crypto.createHash('sha1');
+  h.update(role);
+  h.update('\0');
+  h.update(timestamp ?? '');
+  h.update('\0');
+  h.update(content.slice(0, 256));
+  return `codex_msg:${h.digest('hex').slice(0, 24)}`;
 }
 
 function extractLifecycleSummary(payload: Record<string, unknown>): string | undefined {

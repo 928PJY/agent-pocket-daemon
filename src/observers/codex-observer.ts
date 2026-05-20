@@ -17,6 +17,12 @@ export class CodexObserver extends EventEmitter {
   private offset = 0;
   private active = false;
   private buffer = '';
+  /**
+   * Last collaboration_mode value emitted to phone. Codex writes
+   * task_started on every turn; without this diff every turn would
+   * surface its own mode banner. Only transitions emit.
+   */
+  private lastEmittedMode: string | undefined;
 
   constructor(sessionId: string, rolloutPath: string) {
     super();
@@ -106,8 +112,24 @@ export class CodexObserver extends EventEmitter {
     if (messages.length > 0) {
       this.emit('status_change', 'running');
       for (const message of messages) {
+        const ev = (message as { codexMetaEvent?: { type?: string; mode?: string } }).codexMetaEvent;
+        if (message.role === 'codex_meta' && ev?.type === 'codex_collaboration_mode') {
+          if (ev.mode === this.lastEmittedMode) continue;
+          this.lastEmittedMode = ev.mode;
+        }
         const event = codexHistoryMessageToEvent(message);
-        if (event) this.emit('output', event);
+        if (event) {
+          // Mirror sdkUuid/sdkBlockIndex onto the event so the serializer's
+          // wire flattener picks them up at line 140. Without this the live
+          // emit path ships rows with no sdk_uuid/session_seq, the phone
+          // fingerprints them as `local|<random-uuid>`, and on reconnect the
+          // history-replay copy (which DOES carry a seq) lands as a duplicate.
+          const m = message as { sdkUuid?: string; sdkBlockIndex?: number };
+          const target = event as unknown as Record<string, unknown>;
+          if (m.sdkUuid) target.sdkUuid = m.sdkUuid;
+          if (typeof m.sdkBlockIndex === 'number') target.sdkBlockIndex = m.sdkBlockIndex;
+          this.emit('output', event);
+        }
       }
       if (messages.some((message) => message.role === 'system' && message.content === 'Interrupted by user.')) {
         this.emit('status_change', 'ready');
