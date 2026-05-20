@@ -405,3 +405,94 @@ test('sendSessionHistory: forwards offset, totalCount, hasMore from discovery to
   assert.equal(ev.offset, 10);
   assert.equal(ev.has_more, true);
 });
+
+// ---------------------------------------------------------------------------
+// flattenAgentEvent — codex_meta cases
+//
+// Regression for end-to-end issue uncovered during iOS validation: the
+// switch had no case for these 5 types, so they fell into `default` and got
+// serialized as `content: JSON.stringify(agentEvent)`. iOS then read no
+// top-level fields and rendered empty Environment cards / Default-stuck mode
+// banners. These tests pin the field-spread shape that iOS depends on.
+// ---------------------------------------------------------------------------
+
+test('flattenAgentEvent: codex_environment_context spreads cwd/shell/etc onto envelope', () => {
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_environment_context',
+    cwd: '/Users/me/proj',
+    shell: 'zsh',
+    current_date: '2026-05-20',
+    timezone: 'Asia/Shanghai',
+  } as ClaudeEvent, 'codex');
+  assert.equal(flat.output_type, 'codex_environment_context');
+  assert.equal((flat as Record<string, unknown>).cwd, '/Users/me/proj');
+  assert.equal((flat as Record<string, unknown>).shell, 'zsh');
+  assert.equal((flat as Record<string, unknown>).current_date, '2026-05-20');
+  assert.equal((flat as Record<string, unknown>).timezone, 'Asia/Shanghai');
+  // The pre-fix default branch would set `content` to a JSON blob; the
+  // fixed path must NOT do that.
+  assert.equal((flat as Record<string, unknown>).content, undefined);
+});
+
+test('flattenAgentEvent: codex_collaboration_mode spreads mode/body onto envelope', () => {
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_collaboration_mode',
+    mode: 'Plan',
+    body: '',
+  } as ClaudeEvent, 'codex');
+  assert.equal(flat.output_type, 'codex_collaboration_mode');
+  assert.equal((flat as Record<string, unknown>).mode, 'Plan');
+  assert.equal((flat as Record<string, unknown>).body, '');
+  assert.equal((flat as Record<string, unknown>).content, undefined);
+});
+
+test('flattenAgentEvent: codex_skills_listing spreads skills array onto envelope', () => {
+  const skills = [
+    { name: 'skill-a', description: 'do a', filePath: '/p/a/SKILL.md' },
+    { name: 'skill-b', description: 'do b', filePath: '/p/b/SKILL.md' },
+  ];
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_skills_listing',
+    skills,
+  } as ClaudeEvent, 'codex');
+  assert.equal(flat.output_type, 'codex_skills_listing');
+  assert.deepEqual((flat as Record<string, unknown>).skills, skills);
+  assert.equal((flat as Record<string, unknown>).content, undefined);
+});
+
+test('flattenAgentEvent: codex_system_reminder spreads text/severity onto envelope', () => {
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_system_reminder',
+    text: 'task tools not used recently',
+    severity: 'info',
+  } as ClaudeEvent, 'codex');
+  assert.equal(flat.output_type, 'codex_system_reminder');
+  assert.equal((flat as Record<string, unknown>).text, 'task tools not used recently');
+  assert.equal((flat as Record<string, unknown>).severity, 'info');
+  assert.equal((flat as Record<string, unknown>).content, undefined);
+});
+
+test('flattenAgentEvent: codex_mem_citation spreads entries/rollout_ids onto envelope', () => {
+  const entries = [{ filePath: '/a.md', preview: 'hi' }];
+  const rolloutIds = ['11111111-1111-1111-1111-111111111111'];
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_mem_citation',
+    entries,
+    rollout_ids: rolloutIds,
+  } as ClaudeEvent, 'codex');
+  assert.equal(flat.output_type, 'codex_mem_citation');
+  assert.deepEqual((flat as Record<string, unknown>).entries, entries);
+  assert.deepEqual((flat as Record<string, unknown>).rollout_ids, rolloutIds);
+  assert.equal((flat as Record<string, unknown>).content, undefined);
+});
+
+test('flattenAgentEvent: codex_meta event with ISO timestamp converts to epoch ms number', () => {
+  const flat = flattenAgentEvent('s1', {
+    type: 'codex_collaboration_mode',
+    mode: 'Default',
+    body: '',
+    timestamp: '2026-05-20T03:37:12.000Z',
+  } as ClaudeEvent, 'codex');
+  assert.equal(typeof flat.timestamp, 'number');
+  assert.equal(flat.timestamp, new Date('2026-05-20T03:37:12.000Z').getTime());
+});
