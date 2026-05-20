@@ -154,6 +154,17 @@ export interface HistoryPage {
    * filtering. Sent on the wire as `tail_ms` under HISTORY_CURSOR_MS.
    */
   tailMs?: number;
+  /**
+   * Offset the phone should send on the *next* older-page `get_history`
+   * request. Counted in the same unit the daemon uses internally
+   * (parent rows for Claude, wire rows for Codex). The phone cannot
+   * derive this from `messages.length` because the wire array is a
+   * lossy projection of the daemon's internal page (parent-window
+   * re-includes subagent rows for Claude; Codex 1:1 but rows the phone
+   * drops at parse — empty assistant blocks, etc.). Undefined when
+   * `hasMore` is false.
+   */
+  nextOffset?: number;
 }
 
 export interface RunningCliSession {
@@ -719,6 +730,10 @@ export class SessionDiscovery {
         totalCount: filtered.length,
         offset,
         hasMore: parentStart > 0,
+        // Parent-counted cursor: next page should start `offset + (parents
+        // emitted this page)` from the tail. Wire `messages.length` would
+        // be wrong because it includes the re-injected subagent rows.
+        nextOffset: parentStart > 0 ? offset + (parentEnd - parentStart) : undefined,
         tailSeq,
         // tailMs is the FILTERED-SET tail, not the page tail. Consumers
         // (verify_history, sync_complete.last_ms) treat tailMs as the

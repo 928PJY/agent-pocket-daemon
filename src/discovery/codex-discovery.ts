@@ -302,6 +302,10 @@ export class CodexDiscovery {
         totalCount: total,
         offset,
         hasMore: start > 0,
+        // Codex paginates wire 1:1 (no subagent re-injection), so the next
+        // page's offset is simply `offset + emitted`. Still emit
+        // explicitly so the phone never has to guess.
+        nextOffset: start > 0 ? offset + (end - start) : undefined,
         tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
         // tailMs is the FILTERED-SET tail (not page tail) — see
         // session-discovery.ts for the rationale. Verify/divergence cursors

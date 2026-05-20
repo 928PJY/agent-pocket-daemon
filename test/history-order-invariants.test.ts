@@ -223,6 +223,95 @@ test('order-invariant: codex tailMs equals filtered[last].tsMs across page windo
   }
 });
 
+test('nextOffset: claude paginates by parent rows and advances correctly across pages', () => {
+  // 10 parents, each with one subagent row inside its tsMs window so the
+  // re-injection logic actually fires. Page size = 3 parents → expect
+  // nextOffset to advance by 3 per page in parent units (not the larger
+  // wire `messages.length` which includes subagents).
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    const ts = `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`;
+    lines.push({ type: 'user', message: { content: `user-${i}` }, timestamp: ts });
+    // subagent anchored at same tsMs so the parent-window catches it
+    lines.push({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: `sub-${i}` }] },
+      timestamp: ts,
+      isSidechain: true,
+      parentUuid: `p-${i}`,
+    });
+  }
+  const { dir, claudeDir, sessionId } = makeClaudeSession(lines);
+  try {
+    const d = new SessionDiscovery(claudeDir);
+    // Establish how many parent rows the parser actually recognises in
+    // this fixture (depends on which line shapes count as "parent" — we
+    // care that next_offset advances in *that* same unit, not in wire
+    // messages.length).
+    const big = d.getSessionHistory(sessionId, { limit: 1000 });
+    const parents = big.messages.filter((m) => m.role !== 'subagent').length;
+    assert.ok(parents >= 6, `expected ≥6 parents to exercise pagination, got ${parents}`);
+
+    const pageSize = 3;
+    const page1 = d.getSessionHistory(sessionId, { offset: 0, limit: pageSize });
+    assert.equal(page1.hasMore, true);
+    assert.equal(page1.nextOffset, pageSize,
+      'first nextOffset should advance by parent page size, not wire row count');
+    assert.ok(
+      page1.messages.length >= pageSize,
+      'wire messages.length includes re-injected subagents and must be ≥ parent page size',
+    );
+
+    const page2 = d.getSessionHistory(sessionId, { offset: page1.nextOffset!, limit: pageSize });
+    assert.equal(page2.hasMore, true);
+    assert.equal(page2.nextOffset, pageSize * 2);
+
+    // Final page: ask for everything older than what we've consumed.
+    const tail = d.getSessionHistory(sessionId, { offset: parents - 1, limit: pageSize });
+    assert.equal(tail.hasMore, false, 'asking past the oldest parent should report hasMore=false');
+    assert.equal(tail.nextOffset, undefined, 'nextOffset must be undefined once hasMore=false');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nextOffset: codex advances by wire-row count and undefined on last page', () => {
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    lines.push({
+      record_type: 'event_msg',
+      timestamp: `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`,
+      payload: { type: 'agent_message', message: `row-${i}` },
+    });
+  }
+  const { dir, codexDir, sessionId } = makeCodexSession(lines);
+  try {
+    const d = new CodexDiscovery(codexDir);
+    registerCodex(d, codexDir, sessionId);
+    const full = d.getSessionHistory(sessionId, { limit: 100 });
+    if (full.messages.length === 0) {
+      // Codex parser may not recognize this minimal envelope; bail like the
+      // sibling tailMs test does.
+      return;
+    }
+
+    const page1 = d.getSessionHistory(sessionId, { offset: 0, limit: 3 });
+    assert.equal(page1.hasMore, true);
+    assert.equal(page1.nextOffset, page1.messages.length);
+
+    const page2 = d.getSessionHistory(sessionId, { offset: page1.nextOffset!, limit: 3 });
+    assert.equal(page2.hasMore, true);
+    assert.equal(page2.nextOffset, page1.nextOffset! + page2.messages.length);
+
+    // Last page covers remainder — hasMore=false → nextOffset=undefined.
+    const tail = d.getSessionHistory(sessionId, { offset: full.messages.length, limit: 3 });
+    assert.equal(tail.hasMore, false);
+    assert.equal(tail.nextOffset, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // since_ms idempotence
 // ---------------------------------------------------------------------------
