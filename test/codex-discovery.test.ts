@@ -45,7 +45,11 @@ test('parseCodexHistoryEntry maps Codex response items to history messages', () 
       content: [{ type: 'output_text', text: 'Done.' }],
     },
   });
-  assert.deepEqual(assistant, [{ role: 'assistant', content: 'Done.', timestamp: '2026-04-29T00:00:00.000Z' }]);
+  assert.equal(assistant.length, 1);
+  assert.equal(assistant[0].role, 'assistant');
+  assert.equal(assistant[0].content, 'Done.');
+  assert.equal(assistant[0].timestamp, '2026-04-29T00:00:00.000Z');
+  assert.match(assistant[0].sdkUuid ?? '', /^codex_msg:/);
 
   const toolUse = parseCodexHistoryEntry({
     type: 'response_item',

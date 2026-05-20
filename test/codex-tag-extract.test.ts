@@ -5,7 +5,6 @@ import {
   CODEX_TAG_EVENT_TYPES,
 } from '../src/utils/codex-tag-extract.js';
 import type {
-  CodexCollaborationModeEvent,
   CodexEnvironmentContextEvent,
   CodexMemCitationEvent,
   CodexSkillsListingEvent,
@@ -48,25 +47,6 @@ test('<environment_context> with partial fields omits absent ones', () => {
   const ev = r.events[0] as CodexEnvironmentContextEvent;
   assert.equal(ev.cwd, '/tmp');
   assert.equal(ev.shell, undefined);
-});
-
-test('extracts <collaboration_mode> with header parsing', () => {
-  const text = `<collaboration_mode># Collaboration Mode: Plan
-
-You are in Plan mode. Propose without executing.</collaboration_mode>`;
-  const r = extractCodexMetaEvents(text);
-  const ev = r.events[0] as CodexCollaborationModeEvent;
-  assert.equal(ev.type, 'codex_collaboration_mode');
-  assert.equal(ev.mode, 'Plan');
-  assert.ok(ev.body.startsWith('You are in Plan mode'));
-});
-
-test('<collaboration_mode> falls back to mode=Default when header is missing', () => {
-  const text = '<collaboration_mode>free-form body without header</collaboration_mode>';
-  const r = extractCodexMetaEvents(text);
-  const ev = r.events[0] as CodexCollaborationModeEvent;
-  assert.equal(ev.mode, 'Default');
-  assert.equal(ev.body, 'free-form body without header');
 });
 
 test('extracts <skills_instructions> into structured skill list', () => {

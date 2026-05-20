@@ -44,9 +44,13 @@ export interface ExtractResult {
 
 // Tags this extractor handles. Order doesn't matter — extraction walks each
 // independently and the final `stripped` strips all of them.
+// NOTE: `collaboration_mode` is intentionally NOT here. The block body is
+// just a templated markdown instruction re-injected every turn; the
+// authoritative mode signal is `event_msg.task_started.collaboration_mode_kind`
+// (handled in parseCodexHistoryEntry). Parsing the tag would just produce a
+// duplicate event with a misleading body.
 const TAG_NAMES = [
   'environment_context',
-  'collaboration_mode',
   'skills_instructions',
   'system-reminder',
   'oai-mem-citation',
@@ -146,8 +150,6 @@ function matchToEvent(m: TagMatch, ctx: ExtractContext): CodexMetaEvent | null {
   switch (m.tag) {
     case 'environment_context':
       return parseEnvironmentContext(m.inner, ctx);
-    case 'collaboration_mode':
-      return parseCollaborationMode(m.inner, ctx);
     case 'skills_instructions':
       return parseSkillsListing(m.inner, ctx);
     case 'system-reminder':
@@ -171,25 +173,6 @@ function parseEnvironmentContext(inner: string, ctx: ExtractContext): CodexEnvir
   if (shell) ev.shell = shell;
   if (currentDate) ev.current_date = currentDate;
   if (timezone) ev.timezone = timezone;
-  if (ctx.timestamp) ev.timestamp = ctx.timestamp;
-  if (ctx.sdkUuid) ev.sdkUuid = ctx.sdkUuid;
-  return ev;
-}
-
-function parseCollaborationMode(inner: string, ctx: ExtractContext): CodexCollaborationModeEvent {
-  // Codex writes `<collaboration_mode># Collaboration Mode: Default\n\n…body…</collaboration_mode>`.
-  // First non-empty line gives us the mode name; the rest is body.
-  const trimmed = inner.trim();
-  let mode = 'Default';
-  let body = trimmed;
-  const firstNewline = trimmed.indexOf('\n');
-  const headerLine = firstNewline >= 0 ? trimmed.slice(0, firstNewline) : trimmed;
-  const headerMatch = headerLine.match(/^#?\s*Collaboration Mode:\s*(.+)$/i);
-  if (headerMatch) {
-    mode = headerMatch[1].trim();
-    body = firstNewline >= 0 ? trimmed.slice(firstNewline + 1).trimStart() : '';
-  }
-  const ev: CodexCollaborationModeEvent = { type: 'codex_collaboration_mode', mode, body };
   if (ctx.timestamp) ev.timestamp = ctx.timestamp;
   if (ctx.sdkUuid) ev.sdkUuid = ctx.sdkUuid;
   return ev;

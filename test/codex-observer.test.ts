@@ -38,10 +38,11 @@ test('CodexObserver emits output and status changes from appended rollout entrie
     (observer as CodexObserverInternals).readNewEntries();
 
     assert.deepEqual(statuses, ['running', 'running', 'ready']);
-    assert.deepEqual(outputs, [
-      { type: 'assistant_message', message: 'Ready.' },
-      { type: 'tool_result', tool_id: 'call-1', status: 'success', output: 'ok' },
-    ]);
+    assert.equal(outputs.length, 2);
+    assert.equal(outputs[0].type, 'assistant_message');
+    assert.equal((outputs[0] as { message: string }).message, 'Ready.');
+    assert.match((outputs[0] as { sdkUuid?: string }).sdkUuid ?? '', /^codex_msg:/);
+    assert.deepEqual(outputs[1], { type: 'tool_result', tool_id: 'call-1', status: 'success', output: 'ok' });
   } finally {
     observer.stop();
     rmSync(dir, { recursive: true, force: true });

@@ -207,6 +207,7 @@ function makeVerifyDeps(
     getSdkHistory: routedTo === 'sdk' ? () => page : () => makeHistoryPage([]),
     getCodexHistory: routedTo === 'codex' ? () => page : () => makeHistoryPage([]),
     phonePreferences: { showToolUse },
+    hasPeerCapability: () => true,
   };
 }
 
@@ -389,6 +390,7 @@ test('handleVerifyHistory routes codex sessions through getCodexHistory', () => 
     getSdkHistory: () => { sdkCalls++; return makeHistoryPage([]); },
     getCodexHistory: () => { codexCalls++; return makeHistoryPage([{ role: 'user', content: 'hi' }], 1); },
     phonePreferences: { showToolUse: true },
+    hasPeerCapability: () => true,
   };
   const { ctx } = makeCtx();
   handleVerifyHistory(ctx, deps, {

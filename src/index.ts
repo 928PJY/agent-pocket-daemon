@@ -1370,6 +1370,7 @@ export class AgentPocketDaemon extends EventEmitter {
       getSdkHistory: (id, opts) => this.sessionDiscovery.getSessionHistory(id, opts),
       getCodexHistory: (id, opts) => this.codexDiscovery.getSessionHistory(id, opts),
       phonePreferences: this.phonePreferences,
+      hasPeerCapability: (cap) => this.hasPeerCapability(cap),
     };
     handleVerifyHistoryExternal(this.commandContext(), deps, command);
   }

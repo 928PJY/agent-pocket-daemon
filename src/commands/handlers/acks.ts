@@ -21,6 +21,7 @@ import type {
   ErrorEvent,
   HistoryDivergenceEvent,
 } from 'agent-pocket-protocol';
+import { PEER_CAPABILITIES } from 'agent-pocket-protocol';
 import type { CommandContext } from '../command-context.js';
 import { isCodexSessionId } from '../../discovery/codex-discovery.js';
 import type { HistoryPage } from '../../discovery/session-discovery.js';
@@ -122,6 +123,8 @@ export interface VerifyHistoryDeps {
   getCodexHistory(sessionId: string, options: { offset: number; limit: number }): HistoryPage;
   /** Phone-side display preferences (mirror of the daemon's `phonePreferences`). */
   phonePreferences: { showToolUse: boolean };
+  /** Peer capability check (mirror of CommandContext.hasPeerCapability). */
+  hasPeerCapability: (cap: string) => boolean;
 }
 
 export function handleVerifyHistory(
@@ -139,12 +142,15 @@ export function handleVerifyHistory(
     : result.messages.filter((m) => m.role !== 'tool_use' && m.role !== 'tool_result');
 
   // Match phone-side parsing: skip empty user messages, blank assistant
-  // messages, and unrecognized roles (phone only handles
-  // user/assistant/tool_use/subagent).
+  // messages, and unrecognized roles (phone handles
+  // user/assistant/tool_use/subagent, plus codex_meta when the peer
+  // advertises CODEX_TAG_EXTRACTION).
+  const hasCodexTagCap = deps.hasPeerCapability(PEER_CAPABILITIES.CODEX_TAG_EXTRACTION);
   const phoneVisible = visible.filter((m) => {
     if (m.role === 'user') return m.content.length > 0;
     if (m.role === 'assistant') return m.content.trim().length > 0;
     if (m.role === 'tool_use' || m.role === 'subagent') return true;
+    if (m.role === 'codex_meta') return hasCodexTagCap;
     return false;
   });
 

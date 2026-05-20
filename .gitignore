@@ -8,3 +8,4 @@ coverage/
 !.env.example
 *.tsbuildinfo
 .claude/worktrees/
+.worktrees/

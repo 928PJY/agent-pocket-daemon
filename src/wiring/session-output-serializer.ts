@@ -126,6 +126,27 @@ export function flattenAgentEvent(
       if (agentEvent.timestamp) flat.timestamp = new Date(agentEvent.timestamp).getTime();
       break;
 
+    case 'codex_environment_context':
+    case 'codex_collaboration_mode':
+    case 'codex_skills_listing':
+    case 'codex_system_reminder':
+    case 'codex_mem_citation': {
+      // Spread the codex_meta event's payload fields directly onto the wire
+      // envelope so iOS reads cwd/mode/skills/etc. at the top level (the
+      // history-replay path uses the same shape — see sendSessionHistory's
+      // wireMessages flatMap). Without this the default branch JSON.stringify
+      // would bury every field inside `content`, and the phone's per-role
+      // parser would only find the string and fall back to empty defaults
+      // (env card empty body, mode banner stuck on Default).
+      const { type: _t, ...rest } = agentEvent as { type: string } & Record<string, unknown>;
+      flat.output_type = agentEvent.type;
+      Object.assign(flat, rest);
+      if (typeof rest.timestamp === 'string') {
+        flat.timestamp = new Date(rest.timestamp).getTime();
+      }
+      break;
+    }
+
     default:
       flat.output_type = (agentEvent as { type: string }).type;
       flat.content = JSON.stringify(agentEvent);
@@ -198,7 +219,8 @@ export function sendFlattenedSessionOutput(
   // in the previous protocol — so silently drop here to avoid leaking
   // unrenderable events.
   if (CODEX_TAG_EVENT_TYPES.has(agentEvent.type)) {
-    if (!deps.hasPeerCapability(PEER_CAPABILITIES.CODEX_TAG_EXTRACTION)) return;
+    const hasCap = deps.hasPeerCapability(PEER_CAPABILITIES.CODEX_TAG_EXTRACTION);
+    if (!hasCap) return;
   }
 
   if (LOCAL_COMMAND_EVENT_TYPES.has(agentEvent.type)) {
