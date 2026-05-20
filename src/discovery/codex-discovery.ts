@@ -297,15 +297,19 @@ export class CodexDiscovery {
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
       const pageMessages = filtered.slice(start, end);
+      // `nextOffset` is meaningful ONLY for offset-paginated calls. since-
+      // based requests (sinceMs / sinceSeq / since) paginate against a
+      // filtered subset, so a computed offset doesn't map to the absolute
+      // tail and would mis-cursor a follow-up `offset:N` request.
+      const isSinceCall =
+        options?.sinceMs !== undefined || options?.sinceSeq !== undefined || options?.since !== undefined;
+      const nextOffset = !isSinceCall && start > 0 ? offset + (end - start) : undefined;
       return {
         messages: pageMessages,
         totalCount: total,
         offset,
         hasMore: start > 0,
-        // Codex paginates wire 1:1 (no subagent re-injection), so the next
-        // page's offset is simply `offset + emitted`. Still emit
-        // explicitly so the phone never has to guess.
-        nextOffset: start > 0 ? offset + (end - start) : undefined,
+        nextOffset,
         tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
         // tailMs is the FILTERED-SET tail (not page tail) — see
         // session-discovery.ts for the rationale. Verify/divergence cursors

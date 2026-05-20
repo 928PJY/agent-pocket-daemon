@@ -161,8 +161,15 @@ export interface HistoryPage {
    * derive this from `messages.length` because the wire array is a
    * lossy projection of the daemon's internal page (parent-window
    * re-includes subagent rows for Claude; Codex 1:1 but rows the phone
-   * drops at parse — empty assistant blocks, etc.). Undefined when
-   * `hasMore` is false.
+   * drops at parse — empty assistant blocks, etc.).
+   *
+   * Undefined when:
+   *  - `hasMore` is false (head reached), OR
+   *  - the call used a `since*` cursor (sinceMs / sinceSeq / since).
+   *    since-based replies paginate against a *filtered* subset of
+   *    history, so a computed offset has no relation to the absolute
+   *    tail and would mis-cursor a follow-up `offset:N` request.
+   *    since-based is for incremental/divergence fill, not browsing.
    */
   nextOffset?: number;
 }
@@ -720,6 +727,17 @@ export class SessionDiscovery {
         });
       }
 
+      // `nextOffset` is the cursor for the phone's next older-page request.
+      // It is meaningful ONLY when this call was offset-paginated. For
+      // since-based calls (sinceMs / sinceSeq / since) the daemon
+      // paginates against `filtered` (a subset of allMessages), so a
+      // computed offset has no relation to the absolute tail and would
+      // mis-cursor a follow-up `offset:N` call. since-based replies are
+      // incremental/divergence fills, not paginated browsing — phone
+      // should keep its existing cursor untouched.
+      const isSinceCall = sinceMs !== undefined || sinceSeq !== undefined || since !== undefined;
+      const nextOffset = !isSinceCall && parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
+
       return {
         messages: pageMessages,
         // Report ALL-message count (parent + subagent) so the phone's
@@ -730,10 +748,7 @@ export class SessionDiscovery {
         totalCount: filtered.length,
         offset,
         hasMore: parentStart > 0,
-        // Parent-counted cursor: next page should start `offset + (parents
-        // emitted this page)` from the tail. Wire `messages.length` would
-        // be wrong because it includes the re-injected subagent rows.
-        nextOffset: parentStart > 0 ? offset + (parentEnd - parentStart) : undefined,
+        nextOffset,
         tailSeq,
         // tailMs is the FILTERED-SET tail, not the page tail. Consumers
         // (verify_history, sync_complete.last_ms) treat tailMs as the

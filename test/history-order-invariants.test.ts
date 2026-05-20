@@ -312,6 +312,61 @@ test('nextOffset: codex advances by wire-row count and undefined on last page', 
   }
 });
 
+test('nextOffset: claude since-based reply MUST NOT emit nextOffset', () => {
+  // since-based replies paginate against a filtered subset, so any
+  // computed offset has no relation to the absolute tail. The phone
+  // would otherwise cache it as the next-older cursor and request
+  // already-seen rows on the next scroll-up.
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    const ts = `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`;
+    lines.push({ type: 'user', message: { content: `user-${i}` }, timestamp: ts });
+  }
+  const { dir, claudeDir, sessionId } = makeClaudeSession(lines);
+  try {
+    const d = new SessionDiscovery(claudeDir);
+    const full = d.getSessionHistory(sessionId, { limit: 1000 });
+    if (full.messages.length === 0) return;
+    const midMs = full.messages[Math.floor(full.messages.length / 2)].tsMs!;
+
+    const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
+    assert.equal(sinceMs.nextOffset, undefined,
+      'sinceMs reply must not emit nextOffset (subset-relative, would mis-cursor a follow-up offset call)');
+
+    const sinceSeq = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 3 });
+    assert.equal(sinceSeq.nextOffset, undefined, 'sinceSeq reply must not emit nextOffset');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nextOffset: codex since-based reply MUST NOT emit nextOffset', () => {
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    lines.push({
+      record_type: 'event_msg',
+      timestamp: `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`,
+      payload: { type: 'agent_message', message: `row-${i}` },
+    });
+  }
+  const { dir, codexDir, sessionId } = makeCodexSession(lines);
+  try {
+    const d = new CodexDiscovery(codexDir);
+    registerCodex(d, codexDir, sessionId);
+    const full = d.getSessionHistory(sessionId, { limit: 100 });
+    if (full.messages.length === 0) return;
+    const midMs = full.messages[Math.floor(full.messages.length / 2)].tsMs!;
+
+    const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
+    assert.equal(sinceMs.nextOffset, undefined, 'codex sinceMs reply must not emit nextOffset');
+
+    const sinceSeq = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 3 });
+    assert.equal(sinceSeq.nextOffset, undefined, 'codex sinceSeq reply must not emit nextOffset');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // since_ms idempotence
 // ---------------------------------------------------------------------------
