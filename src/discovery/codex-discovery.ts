@@ -297,11 +297,38 @@ export class CodexDiscovery {
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
       const pageMessages = filtered.slice(start, end);
+      // `nextOffset` is the offset value the phone should send on its
+      // next older-page `get_history` to fetch rows OLDER than this
+      // reply. Always counted against the ABSOLUTE message set,
+      // independent of any since-filter, because the phone's follow-up
+      // call uses plain offset pagination from the absolute tail.
+      //
+      // since-paginated: phone is up to date on `filtered.length - start`
+      // absolute newest rows (the rows above the emit window plus the
+      // window itself). Asking for `offset = (filtered.length - start)`
+      // returns the next-older slice. Undefined when no rows older
+      // than the emit slice exist (filter spans full history AND we
+      // emitted starting from index 0).
+      const isSinceCall =
+        options?.sinceMs !== undefined || options?.sinceSeq !== undefined || options?.since !== undefined;
+      let nextOffset: number | undefined;
+      if (isSinceCall) {
+        const olderCount = allMessages.length - filtered.length;
+        const remainingOlder = olderCount + start;
+        const emittedNewest = filtered.length - start;
+        // Same guard as session-discovery: empty since-based reply must
+        // not emit a cursor; otherwise next_offset: 0 would clobber a
+        // valid older-page cursor cached on the phone.
+        nextOffset = emittedNewest > 0 && remainingOlder > 0 ? emittedNewest : undefined;
+      } else {
+        nextOffset = start > 0 ? offset + (end - start) : undefined;
+      }
       return {
         messages: pageMessages,
         totalCount: total,
         offset,
         hasMore: start > 0,
+        nextOffset,
         tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
         // tailMs is the FILTERED-SET tail (not page tail) — see
         // session-discovery.ts for the rationale. Verify/divergence cursors

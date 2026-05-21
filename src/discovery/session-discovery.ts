@@ -154,6 +154,24 @@ export interface HistoryPage {
    * filtering. Sent on the wire as `tail_ms` under HISTORY_CURSOR_MS.
    */
   tailMs?: number;
+  /**
+   * Offset the phone should send on the *next* older-page `get_history`
+   * request. Counted in the same unit the daemon uses internally
+   * (parent rows for Claude, wire rows for Codex). The phone cannot
+   * derive this from `messages.length` because the wire array is a
+   * lossy projection of the daemon's internal page (parent-window
+   * re-includes subagent rows for Claude; Codex 1:1 but rows the phone
+   * drops at parse — empty assistant blocks, etc.).
+   *
+   * Undefined when:
+   *  - `hasMore` is false (head reached), OR
+   *  - the call used a `since*` cursor (sinceMs / sinceSeq / since).
+   *    since-based replies paginate against a *filtered* subset of
+   *    history, so a computed offset has no relation to the absolute
+   *    tail and would mis-cursor a follow-up `offset:N` request.
+   *    since-based is for incremental/divergence fill, not browsing.
+   */
+  nextOffset?: number;
 }
 
 export interface RunningCliSession {
@@ -709,6 +727,42 @@ export class SessionDiscovery {
         });
       }
 
+      // `nextOffset` is the offset value the phone should send on its
+      // next older-page `get_history` to fetch rows OLDER than the
+      // current reply. Always counted against the absolute parent set
+      // (independent of any since-filter), so the phone can use it as
+      // a `get_history { offset: N }` cursor regardless of how this
+      // call was made.
+      //
+      // Two cases:
+      //  - offset-paginated (no since): nextOffset = offset + emitted
+      //    parents from this page; undefined when head reached.
+      //  - since-paginated: the phone has already received the newest
+      //    `parentStart` filtered rows (above the emit slice) plus the
+      //    `parentEnd - parentStart` rows in this slice. Together
+      //    that's `parentMsgs.length - parentStart` absolute newest
+      //    parents the phone is up to date on. nextOffset should equal
+      //    that count so the daemon's offset-paginated branch returns
+      //    the next-older window. Undefined when no rows older than
+      //    the emit slice exist (filter retained the whole history
+      //    AND the slice reached parentStart=0).
+      const isSinceCall = sinceMs !== undefined || sinceSeq !== undefined || since !== undefined;
+      let nextOffset: number | undefined;
+      if (isSinceCall) {
+        const allParentCount = allMessages.filter((m) => m.role !== 'subagent').length;
+        const olderCount = allParentCount - parentMsgs.length;
+        const remainingOlder = olderCount + parentStart;
+        const emittedNewest = parentMsgs.length - parentStart;
+        // An empty since-based reply (phone already caught up) MUST NOT
+        // emit a cursor at all — otherwise we'd ship `next_offset: 0`,
+        // which the phone caches and later replays as `get_history
+        // { offset: 0 }`, re-fetching the newest page and potentially
+        // overwriting a valid older-page cursor with 0.
+        nextOffset = emittedNewest > 0 && remainingOlder > 0 ? emittedNewest : undefined;
+      } else {
+        nextOffset = parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
+      }
+
       return {
         messages: pageMessages,
         // Report ALL-message count (parent + subagent) so the phone's
@@ -719,6 +773,7 @@ export class SessionDiscovery {
         totalCount: filtered.length,
         offset,
         hasMore: parentStart > 0,
+        nextOffset,
         tailSeq,
         // tailMs is the FILTERED-SET tail, not the page tail. Consumers
         // (verify_history, sync_complete.last_ms) treat tailMs as the

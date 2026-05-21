@@ -382,6 +382,10 @@ export function sendSessionHistory(
     rawOutput: rawCounts['local_command_output'] || 0,
     filteredInvoke: filteredCounts['local_command_invoke'] || 0,
     filteredOutput: filteredCounts['local_command_output'] || 0,
+    offset: result.offset,
+    hasMore: result.hasMore,
+    nextOffset: result.nextOffset,
+    totalCount: result.totalCount,
   });
 
   // Strip daemon-internal normalization fields before shipping the wire
@@ -425,6 +429,11 @@ export function sendSessionHistory(
     total_count: result.totalCount,
     offset: result.offset,
     has_more: result.hasMore,
+    // Daemon-owned cursor for the phone's next older-page get_history.
+    // Counted in the daemon's pagination unit (parent rows for Claude,
+    // wire rows for Codex). Phone-side counting can't reproduce this:
+    // wire messages drop empty rows, re-include subagent panels, etc.
+    next_offset: result.nextOffset,
     is_full_history: isFullHistory,
     tail_seq: result.tailSeq,
     tail_ms: result.tailMs,
