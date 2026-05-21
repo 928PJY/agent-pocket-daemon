@@ -420,6 +420,61 @@ test('nextOffset: codex since-based reply lets phone chain into older windows', 
   }
 });
 
+test('nextOffset: empty since-based reply must NOT emit a cursor (phone caught up)', () => {
+  // Reviewer scenario: sync_request with known_ms at tail returns 0 rows.
+  // If daemon emitted next_offset:0 here, iOS would cache 0 and replay
+  // `get_history { offset: 0 }` on next scroll-up, clobbering a valid
+  // older-page cursor and re-fetching the newest page.
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    const ts = `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`;
+    lines.push({ type: 'user', message: { content: `user-${i}` }, timestamp: ts });
+  }
+  const { dir, claudeDir, sessionId } = makeClaudeSession(lines);
+  try {
+    const d = new SessionDiscovery(claudeDir);
+    const full = d.getSessionHistory(sessionId, { limit: 1000 });
+    if (full.tailMs === undefined) return;
+    // Phone is fully caught up — since = tailMs filters out everything.
+    const caught = d.getSessionHistory(sessionId, { sinceMs: full.tailMs, limit: 30 });
+    assert.equal(caught.messages.length, 0, 'precondition: caught-up reply is empty');
+    assert.equal(
+      caught.nextOffset,
+      undefined,
+      'empty since reply must omit nextOffset — emitting 0 would clobber a valid cached cursor on the phone',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nextOffset: codex empty since-based reply must NOT emit a cursor', () => {
+  const lines: object[] = [];
+  for (let i = 0; i < 10; i++) {
+    lines.push({
+      record_type: 'event_msg',
+      timestamp: `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`,
+      payload: { type: 'agent_message', message: `row-${i}` },
+    });
+  }
+  const { dir, codexDir, sessionId } = makeCodexSession(lines);
+  try {
+    const d = new CodexDiscovery(codexDir);
+    registerCodex(d, codexDir, sessionId);
+    const full = d.getSessionHistory(sessionId, { limit: 1000 });
+    if (full.tailMs === undefined) return;
+    const caught = d.getSessionHistory(sessionId, { sinceMs: full.tailMs, limit: 30 });
+    assert.equal(caught.messages.length, 0);
+    assert.equal(
+      caught.nextOffset,
+      undefined,
+      'codex caught-up reply must omit nextOffset',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // since_ms idempotence
 // ---------------------------------------------------------------------------

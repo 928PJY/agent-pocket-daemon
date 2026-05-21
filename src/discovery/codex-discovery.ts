@@ -315,7 +315,11 @@ export class CodexDiscovery {
       if (isSinceCall) {
         const olderCount = allMessages.length - filtered.length;
         const remainingOlder = olderCount + start;
-        nextOffset = remainingOlder > 0 ? filtered.length - start : undefined;
+        const emittedNewest = filtered.length - start;
+        // Same guard as session-discovery: empty since-based reply must
+        // not emit a cursor; otherwise next_offset: 0 would clobber a
+        // valid older-page cursor cached on the phone.
+        nextOffset = emittedNewest > 0 && remainingOlder > 0 ? emittedNewest : undefined;
       } else {
         nextOffset = start > 0 ? offset + (end - start) : undefined;
       }

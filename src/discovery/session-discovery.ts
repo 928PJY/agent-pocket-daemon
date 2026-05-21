@@ -752,7 +752,13 @@ export class SessionDiscovery {
         const allParentCount = allMessages.filter((m) => m.role !== 'subagent').length;
         const olderCount = allParentCount - parentMsgs.length;
         const remainingOlder = olderCount + parentStart;
-        nextOffset = remainingOlder > 0 ? parentMsgs.length - parentStart : undefined;
+        const emittedNewest = parentMsgs.length - parentStart;
+        // An empty since-based reply (phone already caught up) MUST NOT
+        // emit a cursor at all — otherwise we'd ship `next_offset: 0`,
+        // which the phone caches and later replays as `get_history
+        // { offset: 0 }`, re-fetching the newest page and potentially
+        // overwriting a valid older-page cursor with 0.
+        nextOffset = emittedNewest > 0 && remainingOlder > 0 ? emittedNewest : undefined;
       } else {
         nextOffset = parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
       }
