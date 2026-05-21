@@ -110,6 +110,14 @@ export function handleGetHistory(
   ctx: Pick<CommandContext, 'sendSessionHistory'>,
   command: GetHistoryCommand,
 ): void {
+  logger.info('history-debug', 'get_history received', {
+    sessionId: command.session_id,
+    offset: command.offset,
+    limit: command.limit,
+    sinceMs: command.since_ms,
+    sinceSeq: command.since_seq,
+    since: command.since,
+  });
   ctx.sendSessionHistory(command.session_id, {
     since: command.since,
     sinceSeq: command.since_seq,

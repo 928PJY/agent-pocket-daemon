@@ -727,16 +727,30 @@ export class SessionDiscovery {
         });
       }
 
-      // `nextOffset` is the cursor for the phone's next older-page request.
-      // It is meaningful ONLY when this call was offset-paginated. For
-      // since-based calls (sinceMs / sinceSeq / since) the daemon
-      // paginates against `filtered` (a subset of allMessages), so a
-      // computed offset has no relation to the absolute tail and would
-      // mis-cursor a follow-up `offset:N` call. since-based replies are
-      // incremental/divergence fills, not paginated browsing — phone
-      // should keep its existing cursor untouched.
+      // `nextOffset` is the offset value the phone should send on its
+      // next older-page `get_history` to fetch rows OLDER than the
+      // current reply. Always counted against the absolute parent set
+      // (independent of any since-filter), so the phone can use it as
+      // a `get_history { offset: N }` cursor regardless of how this
+      // call was made.
+      //
+      // Two cases:
+      //  - offset-paginated (no since): nextOffset = offset + emitted
+      //    parents from this page; undefined when head reached.
+      //  - since-paginated: nextOffset points just past the older-than-
+      //    since slice, i.e. `allParents - filteredParents`. The phone
+      //    treats this as "if you scroll up from what you just got,
+      //    start at offset N". Undefined when filter retained the
+      //    entire history (no older rows exist).
       const isSinceCall = sinceMs !== undefined || sinceSeq !== undefined || since !== undefined;
-      const nextOffset = !isSinceCall && parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
+      let nextOffset: number | undefined;
+      if (isSinceCall) {
+        const allParentCount = allMessages.filter((m) => m.role !== 'subagent').length;
+        const olderParentCount = allParentCount - parentMsgs.length;
+        nextOffset = olderParentCount > 0 ? olderParentCount : undefined;
+      } else {
+        nextOffset = parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
+      }
 
       return {
         messages: pageMessages,

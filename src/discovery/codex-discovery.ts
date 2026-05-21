@@ -297,13 +297,26 @@ export class CodexDiscovery {
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
       const pageMessages = filtered.slice(start, end);
-      // `nextOffset` is meaningful ONLY for offset-paginated calls. since-
-      // based requests (sinceMs / sinceSeq / since) paginate against a
-      // filtered subset, so a computed offset doesn't map to the absolute
-      // tail and would mis-cursor a follow-up `offset:N` request.
+      // `nextOffset` is the offset value the phone should send on its next
+      // older-page `get_history` to fetch rows OLDER than this reply.
+      // Always computed against the ABSOLUTE message set (independent of
+      // any since-filter), because the phone's follow-up call uses plain
+      // offset pagination, which counts from the absolute tail.
+      //
+      //  - offset-paginated (no since): nextOffset = offset + emitted, iff
+      //    older rows remain (start > 0).
+      //  - since-paginated: nextOffset = (all - filtered), iff any rows
+      //    were filtered out as older-than-since. That's exactly the
+      //    offset of the first row older than what we just delivered.
       const isSinceCall =
         options?.sinceMs !== undefined || options?.sinceSeq !== undefined || options?.since !== undefined;
-      const nextOffset = !isSinceCall && start > 0 ? offset + (end - start) : undefined;
+      let nextOffset: number | undefined;
+      if (isSinceCall) {
+        const olderCount = allMessages.length - filtered.length;
+        nextOffset = olderCount > 0 ? olderCount : undefined;
+      } else {
+        nextOffset = start > 0 ? offset + (end - start) : undefined;
+      }
       return {
         messages: pageMessages,
         totalCount: total,

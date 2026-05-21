@@ -312,11 +312,13 @@ test('nextOffset: codex advances by wire-row count and undefined on last page', 
   }
 });
 
-test('nextOffset: claude since-based reply MUST NOT emit nextOffset', () => {
-  // since-based replies paginate against a filtered subset, so any
-  // computed offset has no relation to the absolute tail. The phone
-  // would otherwise cache it as the next-older cursor and request
-  // already-seen rows on the next scroll-up.
+test('nextOffset: claude since-based reply emits absolute-set cursor for older rows', () => {
+  // since-based replies return only rows newer-than-since. To let the
+  // phone scroll OLDER than what it just received, the daemon must
+  // report a nextOffset counted against the ABSOLUTE message set —
+  // specifically, the number of parent rows older-than-since. The
+  // phone's follow-up scroll-up uses plain offset pagination, which
+  // counts from the absolute tail, so this is the only correct value.
   const lines: object[] = [];
   for (let i = 0; i < 10; i++) {
     const ts = `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`;
@@ -327,20 +329,34 @@ test('nextOffset: claude since-based reply MUST NOT emit nextOffset', () => {
     const d = new SessionDiscovery(claudeDir);
     const full = d.getSessionHistory(sessionId, { limit: 1000 });
     if (full.messages.length === 0) return;
-    const midMs = full.messages[Math.floor(full.messages.length / 2)].tsMs!;
-
+    const allParents = full.messages.filter((m) => m.role !== 'subagent');
+    if (allParents.length < 4) return;
+    // Pick a midpoint such that there are strictly older parents below it.
+    const midIdx = Math.floor(allParents.length / 2);
+    const midMs = allParents[midIdx].tsMs!;
+    const olderParents = allParents.filter((m) => (m.tsMs ?? 0) <= midMs).length;
+    // sinceMs returns only parents strictly newer than midMs; nextOffset
+    // should equal the count of parents at or below midMs.
     const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
-    assert.equal(sinceMs.nextOffset, undefined,
-      'sinceMs reply must not emit nextOffset (subset-relative, would mis-cursor a follow-up offset call)');
+    assert.equal(
+      sinceMs.nextOffset,
+      olderParents,
+      'sinceMs reply must emit nextOffset = count of older-than-since parents (absolute-set offset)',
+    );
 
-    const sinceSeq = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 3 });
-    assert.equal(sinceSeq.nextOffset, undefined, 'sinceSeq reply must not emit nextOffset');
+    // sinceSeq:0 returns the full tail → no older rows remain → no cursor.
+    const sinceAll = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 1000 });
+    assert.equal(
+      sinceAll.nextOffset,
+      undefined,
+      'when since reply covers the full set, no older rows remain → nextOffset undefined',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('nextOffset: codex since-based reply MUST NOT emit nextOffset', () => {
+test('nextOffset: codex since-based reply emits absolute-set cursor for older rows', () => {
   const lines: object[] = [];
   for (let i = 0; i < 10; i++) {
     lines.push({
@@ -354,14 +370,24 @@ test('nextOffset: codex since-based reply MUST NOT emit nextOffset', () => {
     const d = new CodexDiscovery(codexDir);
     registerCodex(d, codexDir, sessionId);
     const full = d.getSessionHistory(sessionId, { limit: 100 });
-    if (full.messages.length === 0) return;
-    const midMs = full.messages[Math.floor(full.messages.length / 2)].tsMs!;
+    if (full.messages.length < 4) return;
+    const midIdx = Math.floor(full.messages.length / 2);
+    const midMs = full.messages[midIdx].tsMs!;
+    const olderCount = full.messages.filter((m) => (m.tsMs ?? 0) <= midMs).length;
 
     const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
-    assert.equal(sinceMs.nextOffset, undefined, 'codex sinceMs reply must not emit nextOffset');
+    assert.equal(
+      sinceMs.nextOffset,
+      olderCount,
+      'codex sinceMs reply must emit nextOffset = older-than-since wire-row count',
+    );
 
-    const sinceSeq = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 3 });
-    assert.equal(sinceSeq.nextOffset, undefined, 'codex sinceSeq reply must not emit nextOffset');
+    const sinceAll = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 100 });
+    assert.equal(
+      sinceAll.nextOffset,
+      undefined,
+      'codex since reply covering full set → no older rows → nextOffset undefined',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

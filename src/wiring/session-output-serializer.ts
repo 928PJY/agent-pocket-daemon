@@ -382,6 +382,10 @@ export function sendSessionHistory(
     rawOutput: rawCounts['local_command_output'] || 0,
     filteredInvoke: filteredCounts['local_command_invoke'] || 0,
     filteredOutput: filteredCounts['local_command_output'] || 0,
+    offset: result.offset,
+    hasMore: result.hasMore,
+    nextOffset: result.nextOffset,
+    totalCount: result.totalCount,
   });
 
   // Strip daemon-internal normalization fields before shipping the wire
