@@ -737,17 +737,22 @@ export class SessionDiscovery {
       // Two cases:
       //  - offset-paginated (no since): nextOffset = offset + emitted
       //    parents from this page; undefined when head reached.
-      //  - since-paginated: nextOffset points just past the older-than-
-      //    since slice, i.e. `allParents - filteredParents`. The phone
-      //    treats this as "if you scroll up from what you just got,
-      //    start at offset N". Undefined when filter retained the
-      //    entire history (no older rows exist).
+      //  - since-paginated: the phone has already received the newest
+      //    `parentStart` filtered rows (above the emit slice) plus the
+      //    `parentEnd - parentStart` rows in this slice. Together
+      //    that's `parentMsgs.length - parentStart` absolute newest
+      //    parents the phone is up to date on. nextOffset should equal
+      //    that count so the daemon's offset-paginated branch returns
+      //    the next-older window. Undefined when no rows older than
+      //    the emit slice exist (filter retained the whole history
+      //    AND the slice reached parentStart=0).
       const isSinceCall = sinceMs !== undefined || sinceSeq !== undefined || since !== undefined;
       let nextOffset: number | undefined;
       if (isSinceCall) {
         const allParentCount = allMessages.filter((m) => m.role !== 'subagent').length;
-        const olderParentCount = allParentCount - parentMsgs.length;
-        nextOffset = olderParentCount > 0 ? olderParentCount : undefined;
+        const olderCount = allParentCount - parentMsgs.length;
+        const remainingOlder = olderCount + parentStart;
+        nextOffset = remainingOlder > 0 ? parentMsgs.length - parentStart : undefined;
       } else {
         nextOffset = parentStart > 0 ? offset + (parentEnd - parentStart) : undefined;
       }

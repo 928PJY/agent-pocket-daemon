@@ -297,23 +297,25 @@ export class CodexDiscovery {
       const end = Math.max(total - offset, 0);
       const start = Math.max(end - limit, 0);
       const pageMessages = filtered.slice(start, end);
-      // `nextOffset` is the offset value the phone should send on its next
-      // older-page `get_history` to fetch rows OLDER than this reply.
-      // Always computed against the ABSOLUTE message set (independent of
-      // any since-filter), because the phone's follow-up call uses plain
-      // offset pagination, which counts from the absolute tail.
+      // `nextOffset` is the offset value the phone should send on its
+      // next older-page `get_history` to fetch rows OLDER than this
+      // reply. Always counted against the ABSOLUTE message set,
+      // independent of any since-filter, because the phone's follow-up
+      // call uses plain offset pagination from the absolute tail.
       //
-      //  - offset-paginated (no since): nextOffset = offset + emitted, iff
-      //    older rows remain (start > 0).
-      //  - since-paginated: nextOffset = (all - filtered), iff any rows
-      //    were filtered out as older-than-since. That's exactly the
-      //    offset of the first row older than what we just delivered.
+      // since-paginated: phone is up to date on `filtered.length - start`
+      // absolute newest rows (the rows above the emit window plus the
+      // window itself). Asking for `offset = (filtered.length - start)`
+      // returns the next-older slice. Undefined when no rows older
+      // than the emit slice exist (filter spans full history AND we
+      // emitted starting from index 0).
       const isSinceCall =
         options?.sinceMs !== undefined || options?.sinceSeq !== undefined || options?.since !== undefined;
       let nextOffset: number | undefined;
       if (isSinceCall) {
         const olderCount = allMessages.length - filtered.length;
-        nextOffset = olderCount > 0 ? olderCount : undefined;
+        const remainingOlder = olderCount + start;
+        nextOffset = remainingOlder > 0 ? filtered.length - start : undefined;
       } else {
         nextOffset = start > 0 ? offset + (end - start) : undefined;
       }

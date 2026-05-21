@@ -312,39 +312,59 @@ test('nextOffset: codex advances by wire-row count and undefined on last page', 
   }
 });
 
-test('nextOffset: claude since-based reply emits absolute-set cursor for older rows', () => {
-  // since-based replies return only rows newer-than-since. To let the
-  // phone scroll OLDER than what it just received, the daemon must
-  // report a nextOffset counted against the ABSOLUTE message set —
-  // specifically, the number of parent rows older-than-since. The
-  // phone's follow-up scroll-up uses plain offset pagination, which
-  // counts from the absolute tail, so this is the only correct value.
+test('nextOffset: claude since-based reply lets phone chain into older windows', () => {
+  // The reviewer scenario (daemon PR #82): 100 absolute rows, phone has
+  // through row 50, daemon returns the newest 30 of the filtered set
+  // (rows 71–100) with limit=30. nextOffset must equal 30 so the phone's
+  // follow-up `get_history { offset: 30, limit: 30 }` returns rows 41–70.
+  // Returning `allParents - filteredParents` (50) would skip rows 51–70.
   const lines: object[] = [];
-  for (let i = 0; i < 10; i++) {
-    const ts = `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`;
+  for (let i = 0; i < 100; i++) {
+    const ts = `2026-05-04T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`;
     lines.push({ type: 'user', message: { content: `user-${i}` }, timestamp: ts });
   }
   const { dir, claudeDir, sessionId } = makeClaudeSession(lines);
   try {
     const d = new SessionDiscovery(claudeDir);
     const full = d.getSessionHistory(sessionId, { limit: 1000 });
-    if (full.messages.length === 0) return;
     const allParents = full.messages.filter((m) => m.role !== 'subagent');
-    if (allParents.length < 4) return;
-    // Pick a midpoint such that there are strictly older parents below it.
-    const midIdx = Math.floor(allParents.length / 2);
-    const midMs = allParents[midIdx].tsMs!;
-    const olderParents = allParents.filter((m) => (m.tsMs ?? 0) <= midMs).length;
-    // sinceMs returns only parents strictly newer than midMs; nextOffset
-    // should equal the count of parents at or below midMs.
-    const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
+    if (allParents.length < 100) return; // parser may dedupe / drop — bail
+    // Phone is up to row 50 (absolute idx 49). since = parent 49's tsMs
+    // → daemon's filter keeps rows 51..100 = 50 rows.
+    const sinceMs = allParents[49].tsMs!;
+    const filteredCount = allParents.filter((m) => (m.tsMs ?? 0) > sinceMs).length;
+    assert.equal(filteredCount, 50, 'filter sanity check');
+
+    // limit=30 → daemon emits the newest 30 of the 50 filtered, so
+    // parentStart in the impl = 20. nextOffset must equal
+    // filtered.length - parentStart = 50 - 20 = 30.
+    const page1 = d.getSessionHistory(sessionId, { sinceMs, limit: 30 });
     assert.equal(
-      sinceMs.nextOffset,
-      olderParents,
-      'sinceMs reply must emit nextOffset = count of older-than-since parents (absolute-set offset)',
+      page1.nextOffset,
+      30,
+      'since-based first page: nextOffset must point exactly to the next older window, not at the since boundary',
     );
 
-    // sinceSeq:0 returns the full tail → no older rows remain → no cursor.
+    // Chain through that nextOffset: an offset-paginated request with
+    // offset=30 must give a non-overlapping older slice, not jump past
+    // rows 51–70.
+    const page2 = d.getSessionHistory(sessionId, { offset: page1.nextOffset!, limit: 30 });
+    assert.equal(page2.messages.filter((m) => m.role !== 'subagent').length, 30);
+    // The newest parent in page2 must be exactly one older than the
+    // oldest parent in page1 (no skipped rows).
+    const page1Parents = page1.messages.filter((m) => m.role !== 'subagent');
+    const page2Parents = page2.messages.filter((m) => m.role !== 'subagent');
+    assert.ok(
+      page2Parents[page2Parents.length - 1].tsMs! < page1Parents[0].tsMs!,
+      'page2 newest must be older than page1 oldest',
+    );
+    // Specifically, page2 should cover rows 41..70 (parent idx 40..69).
+    assert.equal(page2Parents[0].content, allParents[40].content, 'page2 first row = absolute row 41');
+    assert.equal(page2Parents[page2Parents.length - 1].content, allParents[69].content, 'page2 last row = absolute row 70');
+
+    // Edge: since covers full history (sinceSeq:0 returns everything),
+    // emit slice already includes the oldest absolute row → no older
+    // remains → nextOffset undefined.
     const sinceAll = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 1000 });
     assert.equal(
       sinceAll.nextOffset,
@@ -356,12 +376,12 @@ test('nextOffset: claude since-based reply emits absolute-set cursor for older r
   }
 });
 
-test('nextOffset: codex since-based reply emits absolute-set cursor for older rows', () => {
+test('nextOffset: codex since-based reply lets phone chain into older windows', () => {
   const lines: object[] = [];
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 100; i++) {
     lines.push({
       record_type: 'event_msg',
-      timestamp: `2026-05-04T00:00:${String(i).padStart(2, '0')}.000Z`,
+      timestamp: `2026-05-04T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
       payload: { type: 'agent_message', message: `row-${i}` },
     });
   }
@@ -369,20 +389,27 @@ test('nextOffset: codex since-based reply emits absolute-set cursor for older ro
   try {
     const d = new CodexDiscovery(codexDir);
     registerCodex(d, codexDir, sessionId);
-    const full = d.getSessionHistory(sessionId, { limit: 100 });
-    if (full.messages.length < 4) return;
-    const midIdx = Math.floor(full.messages.length / 2);
-    const midMs = full.messages[midIdx].tsMs!;
-    const olderCount = full.messages.filter((m) => (m.tsMs ?? 0) <= midMs).length;
+    const full = d.getSessionHistory(sessionId, { limit: 1000 });
+    if (full.messages.length < 100) return;
+    const sinceMs = full.messages[49].tsMs!;
+    const filteredCount = full.messages.filter((m) => (m.tsMs ?? 0) > sinceMs).length;
+    assert.equal(filteredCount, 50);
 
-    const sinceMs = d.getSessionHistory(sessionId, { sinceMs: midMs, limit: 3 });
+    const page1 = d.getSessionHistory(sessionId, { sinceMs, limit: 30 });
     assert.equal(
-      sinceMs.nextOffset,
-      olderCount,
-      'codex sinceMs reply must emit nextOffset = older-than-since wire-row count',
+      page1.nextOffset,
+      30,
+      'codex since-based: nextOffset must let phone chain into next older window',
     );
 
-    const sinceAll = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 100 });
+    const page2 = d.getSessionHistory(sessionId, { offset: page1.nextOffset!, limit: 30 });
+    assert.equal(page2.messages.length, 30);
+    assert.ok(
+      page2.messages[page2.messages.length - 1].tsMs! < page1.messages[0].tsMs!,
+      'page2 newest must be older than page1 oldest',
+    );
+
+    const sinceAll = d.getSessionHistory(sessionId, { sinceSeq: 0, limit: 1000 });
     assert.equal(
       sinceAll.nextOffset,
       undefined,
