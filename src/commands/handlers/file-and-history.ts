@@ -155,6 +155,34 @@ export function handleSyncRequest(
     .filter((id): id is string => typeof id === 'string');
   const targets = new Set<string>(activeSessionIds);
 
+  // Iter 5 (#271): when both sides announce MESSAGES_SYNC_PRIORITY_SESSION
+  // and the phone tagged this request with a focused session, push it to
+  // the front of the backfill loop so the phone gets that session's
+  // session_history + session_history_done before any other session's
+  // frames. Reuses the existing SYNC_ACK machinery — the phone, on seeing
+  // session_history_done for its priority session, commits that session's
+  // staged frames immediately and stops waiting on the trailing sync_complete.
+  // Silently ignored if the named session isn't in scope (archived / unknown).
+  let orderedTargets: string[] = Array.from(targets);
+  const prioritySupported = ctx.hasPeerCapability(
+    PEER_CAPABILITIES.MESSAGES_SYNC_PRIORITY_SESSION,
+  );
+  const prioritySessionId = command.priority_session_id;
+  if (
+    prioritySupported &&
+    typeof prioritySessionId === 'string' &&
+    targets.has(prioritySessionId)
+  ) {
+    orderedTargets = [
+      prioritySessionId,
+      ...orderedTargets.filter((id) => id !== prioritySessionId),
+    ];
+    logger.info('daemon', 'sync_request priority hoisted', {
+      requestId: command.request_id,
+      sessionId: prioritySessionId.slice(0, 8),
+    });
+  }
+
   logger.info('daemon', 'sync_request received', {
     requestId: command.request_id,
     knownSessions: Object.keys(knownSeqs).length,
@@ -184,7 +212,7 @@ export function handleSyncRequest(
 
   const delivered: SyncCompleteEvent['delivered'] = [];
   const perSessionMs: Record<string, number> = {};
-  for (const sessionId of targets) {
+  for (const sessionId of orderedTargets) {
     const sessionStart = Date.now();
     const lastSeq = knownSeqs[sessionId];
     const lastMs = knownMs[sessionId];
