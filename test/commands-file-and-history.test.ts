@@ -359,3 +359,65 @@ test('handleSyncRequest without SYNC_ACK cap only emits sync_complete (back-comp
   const types = sentEvents.map((e) => (e.event as unknown as { type: string }).type);
   assert.deepEqual(types, ['sync_complete']);
 });
+
+test('handleSyncRequest hoists priority_session_id to front of backfill loop when cap present', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [
+      { claudeSessionId: 'sess-a' },
+      { claudeSessionId: 'sess-b' },
+      { claudeSessionId: 'sess-c' },
+    ],
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
+    capabilities: new Set([
+      'messages.sync_ack',
+      'messages.sync_priority_session',
+    ]),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+    priority_session_id: 'sess-c',
+  } as never);
+  const order = historyCalls.map((c) => c.sessionId);
+  assert.equal(order[0], 'sess-c');
+  assert.equal(order.length, 3);
+});
+
+test('handleSyncRequest ignores priority_session_id when cap absent (back-compat order preserved)', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [
+      { claudeSessionId: 'sess-a' },
+      { claudeSessionId: 'sess-b' },
+    ],
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+    priority_session_id: 'sess-b',
+  } as never);
+  const order = historyCalls.map((c) => c.sessionId);
+  // First-come-first-served Set iteration order — priority hint silently dropped.
+  assert.deepEqual(order, ['sess-a', 'sess-b']);
+});
+
+test('handleSyncRequest drops unknown priority_session_id silently', () => {
+  const { ctx, historyCalls } = makeCtx({
+    sessions: [{ claudeSessionId: 'sess-a' }, { claudeSessionId: 'sess-b' }],
+    sendSessionHistory: () => ({ tailSeq: 1, tailMs: 1 + 1000000 }),
+    capabilities: new Set([
+      'messages.sync_ack',
+      'messages.sync_priority_session',
+    ]),
+  });
+  handleSyncRequest(ctx, {
+    type: 'sync_request',
+    request_id: 'req-1',
+    known_seqs: {},
+    priority_session_id: 'sess-archived',
+  } as never);
+  const order = historyCalls.map((c) => c.sessionId);
+  assert.deepEqual(order, ['sess-a', 'sess-b']);
+});

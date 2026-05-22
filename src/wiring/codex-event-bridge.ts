@@ -21,6 +21,7 @@
 
 import * as path from 'node:path';
 import {
+  PEER_CAPABILITIES,
   SessionStatus,
   type ClaudeEvent,
   type PcEvent,
@@ -61,6 +62,9 @@ export interface SendCodexCompletionDeps {
     requestId: string,
     wakePayload: WakeBlobPayload,
   ): void;
+  hasPeerCapability(name: string): boolean;
+  /** See SessionStopDeps.getSeqTail — same contract. */
+  getSeqTail(sessionId: string): number | undefined;
 }
 
 export function sendCodexCompletion(
@@ -72,6 +76,7 @@ export function sendCodexCompletion(
   if (!deps.isInitialDiscoveryDone()) return;
   const body = summary?.trim() || deps.getLastAssistantMessage(sessionId) || 'Codex turn finished';
   const completionRequestId = deps.nextCompletionRequestId(sessionId);
+  const firedAt = Date.now();
   deps.sendNotificationEventToPhone({
     type: 'session_status',
     session_id: sessionId,
@@ -87,6 +92,9 @@ export function sendCodexCompletion(
     category: 'SESSION_COMPLETED',
     session_id: sessionId,
     request_id: completionRequestId,
+    ...(deps.hasPeerCapability(PEER_CAPABILITIES.MESSAGES_COMPLETION_BARRIER)
+      ? { completion_seq: deps.getSeqTail(sessionId), completion_ms: firedAt }
+      : {}),
   });
 }
 
