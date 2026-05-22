@@ -13,8 +13,6 @@ import type {
   ClaudeEvent,
   CodexCollaborationModeEvent,
   CodexEnvironmentContextEvent,
-  CodexMemCitationEntry,
-  CodexMemCitationEvent,
   CodexSkillInfo,
   CodexSkillsListingEvent,
   CodexSystemReminderEvent,
@@ -24,8 +22,7 @@ export type CodexMetaEvent =
   | CodexEnvironmentContextEvent
   | CodexCollaborationModeEvent
   | CodexSkillsListingEvent
-  | CodexSystemReminderEvent
-  | CodexMemCitationEvent;
+  | CodexSystemReminderEvent;
 
 export interface ExtractContext {
   /** ISO 8601 — copied verbatim onto every extracted event. */
@@ -155,7 +152,13 @@ function matchToEvent(m: TagMatch, ctx: ExtractContext): CodexMetaEvent | null {
     case 'system-reminder':
       return parseSystemReminder(m.inner, ctx);
     case 'oai-mem-citation':
-      return parseMemCitation(m.inner, ctx);
+      // Tag is still listed in TAG_NAMES so `stripped` removes the block
+      // from chat text, but no dedicated event is emitted — the iOS card
+      // for memory citations is incomplete, so we suppress the event
+      // entirely until the UI side ships. The tag stays harvested (not
+      // leaked as raw XML) so re-enabling later only requires returning
+      // an event from this branch.
+      return null;
   }
 }
 
@@ -216,44 +219,6 @@ function parseSystemReminder(inner: string, ctx: ExtractContext): CodexSystemRem
   return ev;
 }
 
-function parseMemCitation(inner: string, ctx: ExtractContext): CodexMemCitationEvent {
-  const entries: CodexMemCitationEntry[] = [];
-  const entriesInner = sliceChildTag(inner, 'citation_entries');
-  if (entriesInner !== undefined) {
-    for (const rawLine of entriesInner.split('\n')) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      const noteIdx = line.indexOf('|note=');
-      const pathRange = noteIdx >= 0 ? line.slice(0, noteIdx) : line;
-      const note = noteIdx >= 0 ? line.slice(noteIdx + '|note='.length).replace(/^\[|\]$/g, '').trim() : undefined;
-      const m = pathRange.match(/^(.+):(\d+)-(\d+)$/);
-      if (!m) continue;
-      const entry: CodexMemCitationEntry = {
-        path: m[1],
-        line_start: Number.parseInt(m[2], 10),
-        line_end: Number.parseInt(m[3], 10),
-      };
-      if (note) entry.note = note;
-      entries.push(entry);
-    }
-  }
-
-  const rolloutIds: string[] = [];
-  const idsInner = sliceChildTag(inner, 'rollout_ids');
-  if (idsInner !== undefined) {
-    for (const rawLine of idsInner.split('\n')) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      rolloutIds.push(line);
-    }
-  }
-
-  const ev: CodexMemCitationEvent = { type: 'codex_mem_citation', entries, rollout_ids: rolloutIds };
-  if (ctx.timestamp) ev.timestamp = ctx.timestamp;
-  if (ctx.sdkUuid) ev.sdkUuid = ctx.sdkUuid;
-  return ev;
-}
-
 // ---------------------------------------------------------------------------
 // Tiny XML helpers (no deps, deliberately permissive)
 // ---------------------------------------------------------------------------
@@ -270,21 +235,10 @@ function innerText(haystack: string, child: string): string | undefined {
   return value.length > 0 ? value : undefined;
 }
 
-function sliceChildTag(haystack: string, child: string): string | undefined {
-  const open = `<${child}>`;
-  const close = `</${child}>`;
-  const openIdx = haystack.indexOf(open);
-  if (openIdx < 0) return undefined;
-  const closeIdx = haystack.indexOf(close, openIdx + open.length);
-  if (closeIdx < 0) return undefined;
-  return haystack.slice(openIdx + open.length, closeIdx);
-}
-
 /** Event types this extractor produces — exported for serializer cap-gating. */
 export const CODEX_TAG_EVENT_TYPES: ReadonlySet<ClaudeEvent['type']> = new Set([
   'codex_environment_context',
   'codex_collaboration_mode',
   'codex_skills_listing',
   'codex_system_reminder',
-  'codex_mem_citation',
 ] as const);

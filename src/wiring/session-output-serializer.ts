@@ -129,8 +129,7 @@ export function flattenAgentEvent(
     case 'codex_environment_context':
     case 'codex_collaboration_mode':
     case 'codex_skills_listing':
-    case 'codex_system_reminder':
-    case 'codex_mem_citation': {
+    case 'codex_system_reminder': {
       // Spread the codex_meta event's payload fields directly onto the wire
       // envelope so iOS reads cwd/mode/skills/etc. at the top level (the
       // history-replay path uses the same shape — see sendSessionHistory's
@@ -197,7 +196,6 @@ const CODEX_TAG_EVENT_TYPES = new Set([
   'codex_collaboration_mode',
   'codex_skills_listing',
   'codex_system_reminder',
-  'codex_mem_citation',
 ]);
 
 export function sendFlattenedSessionOutput(

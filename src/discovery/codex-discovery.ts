@@ -578,11 +578,13 @@ export function parseCodexResponseItem(payload: Record<string, unknown>, timesta
       }
     }
 
-    // user/assistant content may carry inline `<system-reminder>` or
-    // `<oai-mem-citation>` blocks. Extract them as separate codex_meta
-    // rows ahead of the cleaned text so the phone renders the chip / card
-    // before the bubble. If stripping leaves no prose, the text row is
-    // dropped (a reply that was *only* a citation block is rare but valid).
+    // user/assistant content may carry inline `<system-reminder>` blocks
+    // (and `<oai-mem-citation>` blocks, which are stripped but no longer
+    // emitted as their own event — see codex-tag-extract.ts). Extract them
+    // as separate codex_meta rows ahead of the cleaned text so the phone
+    // renders the chip / card before the bubble. If stripping leaves no
+    // prose, the text row is dropped (a reply that was *only* a citation
+    // block is rare but valid).
     const { events: metaEvents, stripped } = extractCodexMetaEvents(content, { timestamp });
     const messages: HistoryMessage[] = metaEvents.map((event) => ({
       role: 'codex_meta',
