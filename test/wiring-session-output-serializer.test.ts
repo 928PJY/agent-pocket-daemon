@@ -472,20 +472,6 @@ test('flattenAgentEvent: codex_system_reminder spreads text/severity onto envelo
   assert.equal((flat as Record<string, unknown>).content, undefined);
 });
 
-test('flattenAgentEvent: codex_mem_citation spreads entries/rollout_ids onto envelope', () => {
-  const entries = [{ filePath: '/a.md', preview: 'hi' }];
-  const rolloutIds = ['11111111-1111-1111-1111-111111111111'];
-  const flat = flattenAgentEvent('s1', {
-    type: 'codex_mem_citation',
-    entries,
-    rollout_ids: rolloutIds,
-  } as ClaudeEvent, 'codex');
-  assert.equal(flat.output_type, 'codex_mem_citation');
-  assert.deepEqual((flat as Record<string, unknown>).entries, entries);
-  assert.deepEqual((flat as Record<string, unknown>).rollout_ids, rolloutIds);
-  assert.equal((flat as Record<string, unknown>).content, undefined);
-});
-
 test('flattenAgentEvent: codex_meta event with ISO timestamp converts to epoch ms number', () => {
   const flat = flattenAgentEvent('s1', {
     type: 'codex_collaboration_mode',

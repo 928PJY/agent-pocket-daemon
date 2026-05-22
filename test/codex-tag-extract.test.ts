@@ -6,7 +6,6 @@ import {
 } from '../src/utils/codex-tag-extract.js';
 import type {
   CodexEnvironmentContextEvent,
-  CodexMemCitationEvent,
   CodexSkillsListingEvent,
   CodexSystemReminderEvent,
 } from 'agent-pocket-protocol';
@@ -77,44 +76,36 @@ The task tools haven't been used recently. Consider using TaskCreate.
   assert.ok(!ev.text.endsWith('\n'));
 });
 
-test('extracts <oai-mem-citation> with entries + rollout_ids', () => {
+test('<oai-mem-citation> is stripped from text but emits no event (UI not ready)', () => {
   const text = `<oai-mem-citation>
 <citation_entries>
 MEMORY.md:234-236|note=[responsesapi citation extraction]
-rollout_summaries/2026-02-17-weekly.md:10-12|note=[weekly report format]
 </citation_entries>
 <rollout_ids>
 019c6e27-e55b-73d1-87d8-4e01f1f75043
-019c7714-3b77-74d1-9866-e1f484aae2ab
 </rollout_ids>
 </oai-mem-citation>`;
   const r = extractCodexMetaEvents(text);
-  const ev = r.events[0] as CodexMemCitationEvent;
-  assert.equal(ev.type, 'codex_mem_citation');
-  assert.equal(ev.entries.length, 2);
-  assert.equal(ev.entries[0].path, 'MEMORY.md');
-  assert.equal(ev.entries[0].line_start, 234);
-  assert.equal(ev.entries[0].line_end, 236);
-  assert.equal(ev.entries[0].note, 'responsesapi citation extraction');
-  assert.deepEqual(ev.rollout_ids, [
-    '019c6e27-e55b-73d1-87d8-4e01f1f75043',
-    '019c7714-3b77-74d1-9866-e1f484aae2ab',
-  ]);
+  assert.deepEqual(r.events, [],
+    'mem-citation event emission is currently suppressed in the extractor');
+  assert.equal(r.stripped, '',
+    'tag must still be stripped so raw XML never reaches chat bubbles');
 });
 
-test('<oai-mem-citation> tolerates missing note suffix on an entry', () => {
-  const text = `<oai-mem-citation>
+test('<oai-mem-citation> mixed with prose: prose preserved, no event', () => {
+  const text = `Answer prose.
+
+<oai-mem-citation>
 <citation_entries>
-MEMORY.md:100-101
+MEMORY.md:1-2
 </citation_entries>
 <rollout_ids>
+abc
 </rollout_ids>
 </oai-mem-citation>`;
   const r = extractCodexMetaEvents(text);
-  const ev = r.events[0] as CodexMemCitationEvent;
-  assert.equal(ev.entries.length, 1);
-  assert.equal(ev.entries[0].note, undefined);
-  assert.deepEqual(ev.rollout_ids, []);
+  assert.deepEqual(r.events, []);
+  assert.equal(r.stripped, 'Answer prose.');
 });
 
 test('multiple tags preserve document order in the events array', () => {
@@ -132,14 +123,7 @@ trailer`;
 test('strips recognised tags from the surrounding text and trims', () => {
   const text = `Answer prose.
 
-<oai-mem-citation>
-<citation_entries>
-MEMORY.md:1-2
-</citation_entries>
-<rollout_ids>
-abc
-</rollout_ids>
-</oai-mem-citation>`;
+<system-reminder>note</system-reminder>`;
   const r = extractCodexMetaEvents(text);
   assert.equal(r.stripped, 'Answer prose.');
 });
@@ -164,11 +148,13 @@ test('similar-prefix tag (environment_context_x) is not matched as environment_c
   assert.deepEqual(r.events, []);
 });
 
-test('CODEX_TAG_EVENT_TYPES contains exactly the five extracted event types', () => {
-  assert.equal(CODEX_TAG_EVENT_TYPES.size, 5);
+test('CODEX_TAG_EVENT_TYPES contains exactly the four currently-emitted event types', () => {
+  assert.equal(CODEX_TAG_EVENT_TYPES.size, 4);
   assert.ok(CODEX_TAG_EVENT_TYPES.has('codex_environment_context'));
   assert.ok(CODEX_TAG_EVENT_TYPES.has('codex_collaboration_mode'));
   assert.ok(CODEX_TAG_EVENT_TYPES.has('codex_skills_listing'));
   assert.ok(CODEX_TAG_EVENT_TYPES.has('codex_system_reminder'));
-  assert.ok(CODEX_TAG_EVENT_TYPES.has('codex_mem_citation'));
+  // codex_mem_citation is intentionally absent — tag is still stripped from
+  // text, but no dedicated event is emitted while the iOS card is unfinished.
+  assert.ok(!CODEX_TAG_EVENT_TYPES.has('codex_mem_citation'));
 });

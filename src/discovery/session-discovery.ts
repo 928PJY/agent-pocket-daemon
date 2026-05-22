@@ -136,8 +136,8 @@ export interface HistoryMessage {
    * For role='codex_meta' rows: the pre-built ClaudeEvent to emit verbatim.
    * Populated by the Codex tag extractor (`src/utils/codex-tag-extract.ts`).
    * Carries one of CODEX_TAG_EVENT_TYPES (`codex_environment_context`,
-   * `codex_collaboration_mode`, `codex_skills_listing`, `codex_system_reminder`,
-   * `codex_mem_citation`). `content` is left empty for these rows.
+   * `codex_collaboration_mode`, `codex_skills_listing`,
+   * `codex_system_reminder`). `content` is left empty for these rows.
    */
   codexMetaEvent?: import('agent-pocket-protocol').ClaudeEvent;
 }
