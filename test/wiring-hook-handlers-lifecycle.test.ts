@@ -91,6 +91,7 @@ function makeSessionStopDeps(opts: {
       sendToPhone(event: unknown) { harness.sentEvents.push(event); },
       prefs: { showCompletionMetrics: opts.showCompletionMetrics ?? true },
       hasPeerCapability(_name: string) { return opts.phoneHasTurnMetricsCap ?? false; },
+      getSeqTail(_id: string) { return undefined; },
       setTimeoutFn: ((fn: () => void, ms: number) => {
         harness.scheduledTimers.push({ fn, ms });
         return 0 as unknown as ReturnType<typeof setTimeout>;

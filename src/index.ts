@@ -801,6 +801,7 @@ export class AgentPocketDaemon extends EventEmitter {
         sendToPhone: (event) => this.sendToPhone(event),
         prefs: this.phonePreferences,
         hasPeerCapability: (name) => this.hasPeerCapability(name),
+        getSeqTail: (id) => this.seqAllocators.peekTail(id),
       },
       sessionStopFailure: {
         sessionManager: this.sessionManager,
@@ -920,6 +921,8 @@ export class AgentPocketDaemon extends EventEmitter {
         nextCompletionRequestId: (id, ts) => this.nextCompletionRequestId(id, ts),
         getSessionName: (id) => this.getSessionName(id),
         sendNotificationEventToPhone: (e, et, sId, rId, wp) => this.sendNotificationEventToPhone(e, et, sId, rId, wp),
+        hasPeerCapability: (name) => this.hasPeerCapability(name),
+        getSeqTail: (id) => this.seqAllocators.peekTail(id),
       },
       sessionId,
       session,

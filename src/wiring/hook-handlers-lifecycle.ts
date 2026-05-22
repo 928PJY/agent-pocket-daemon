@@ -92,6 +92,14 @@ export interface SessionStopDeps {
    * inline on the assistant_message instead).
    */
   hasPeerCapability(name: string): boolean;
+  /**
+   * Daemon-side tail of the per-session session_seq allocator. Used to stamp
+   * `completion_seq` on the wake_blob when the peer announces
+   * PEER_CAPABILITIES.MESSAGES_COMPLETION_BARRIER. Returns undefined for
+   * sessions the allocator hasn't seen yet (the wake will simply omit the
+   * field — phone falls back to the heuristic clear).
+   */
+  getSeqTail(sessionId: string): number | undefined;
   /** Test seam: defaults to setTimeout. */
   setTimeoutFn?: typeof setTimeout;
   /** Test seam: defaults to readLastTurnSummary from utils. */
@@ -204,7 +212,17 @@ export function registerSessionStopHandler(
       category: 'SESSION_COMPLETED',
       session_id: externalId,
       request_id: completionRequestId,
+      ...(deps.hasPeerCapability(PEER_CAPABILITIES.MESSAGES_COMPLETION_BARRIER)
+        ? { completion_seq: deps.getSeqTail(externalId), completion_ms: firedAt }
+        : {}),
     });
+    if (deps.hasPeerCapability(PEER_CAPABILITIES.MESSAGES_COMPLETION_BARRIER)) {
+      logger.info('daemon', 'Stop wake stamped barrier', {
+        sessionId: externalId,
+        completionSeq: deps.getSeqTail(externalId),
+        completionMs: firedAt,
+      });
+    }
 
     // Legacy completion_metrics session_output — sent ONLY when the phone
     // lacks PEER_CAPABILITIES.MESSAGES_TURN_METRICS. When the phone has the

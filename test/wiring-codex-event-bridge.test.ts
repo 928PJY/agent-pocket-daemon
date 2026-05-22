@@ -59,6 +59,8 @@ function makeSendCodexFixture(opts: {
   lastAssistantMessage?: string | undefined;
   sessionName?: string;
   fixedRequestId?: string;
+  hasBarrierCap?: boolean;
+  seqTail?: number | undefined;
 } = {}): SendCodexFixture {
   let initialDone = opts.initialDone ?? true;
   const notifications: SendCodexFixture['notifications'] = [];
@@ -70,6 +72,8 @@ function makeSendCodexFixture(opts: {
     sendNotificationEventToPhone: (event, eventType, sessionId, requestId, wakePayload) => {
       notifications.push({ event, eventType, sessionId, requestId, wakePayload });
     },
+    hasPeerCapability: () => opts.hasBarrierCap ?? false,
+    getSeqTail: () => opts.seqTail,
   };
   return {
     deps,
@@ -156,6 +160,23 @@ test('sendCodexCompletion: truncates body to 256 utf8 bytes in wake payload', ()
   sendCodexCompletion(f.deps, 'sid', undefined, long);
   const wp = f.notifications[0].wakePayload as { body: string };
   assert.ok(wp.body.length <= 256);
+});
+
+test('sendCodexCompletion: stamps completion_seq/ms when peer announces MESSAGES_COMPLETION_BARRIER', () => {
+  const f = makeSendCodexFixture({ hasBarrierCap: true, seqTail: 42 });
+  const before = Date.now();
+  sendCodexCompletion(f.deps, 'sid', undefined, 'done');
+  const wp = f.notifications[0].wakePayload as { completion_seq?: number; completion_ms?: number };
+  assert.equal(wp.completion_seq, 42);
+  assert.ok(wp.completion_ms !== undefined && wp.completion_ms >= before);
+});
+
+test('sendCodexCompletion: omits completion fields when peer lacks cap', () => {
+  const f = makeSendCodexFixture({ hasBarrierCap: false, seqTail: 42 });
+  sendCodexCompletion(f.deps, 'sid', undefined, 'done');
+  const wp = f.notifications[0].wakePayload as Record<string, unknown>;
+  assert.equal('completion_seq' in wp, false);
+  assert.equal('completion_ms' in wp, false);
 });
 
 // ---------------------------------------------------------------------------
