@@ -831,6 +831,35 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Authoritative turn-completion flip. Called by the Stop-hook path the
+   * moment Claude signals the turn is over — well before the 500 ms
+   * `fs.watchFile` poll in SessionObserver gets a chance to notice the
+   * `end_turn` JSONL line.
+   *
+   * Without this, the in-memory `state.status` stays at RUNNING in the
+   * window between Stop hook and the next observer poll. Any list_sessions
+   * landing in that window serializes `status: 'running'` for a session
+   * the phone has already been told is `ready` — see SessionEvents in the
+   * iOS app for the bug this caused on notification taps.
+   *
+   * Idempotent: a no-op if the session is already READY or HISTORY. The
+   * `state.status !== READY` write also causes the observer's later
+   * `end_turn` `status_change` event to fail its `state.status !== newStatus`
+   * guard at the bottom of `wireObserverEvents`, eliminating the duplicate
+   * READY emission that previously hit the wire.
+   */
+  markTurnComplete(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session.status === SessionStatus.HISTORY) return;
+    if (session.status === SessionStatus.READY) return;
+    if (session.status === SessionStatus.ERROR) return;
+    session.status = SessionStatus.READY;
+    session.lastActivity = Date.now();
+    this.emit('session_status', sessionId, SessionStatus.READY);
+  }
+
+  /**
    * Check if a session is in observer mode (tailing terminal JSONL).
    */
   isObservedSession(sessionId: string): boolean {

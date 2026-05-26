@@ -44,6 +44,7 @@ interface SessionStopHarness {
   sentEvents: unknown[];
   clearedDeliveries: Array<{ et: string; sId: string; rId: string }>;
   clearPendingActionsCalls: string[];
+  markTurnCompleteCalls: string[];
   scheduledTimers: Array<{ fn: () => void; ms: number }>;
 }
 
@@ -64,6 +65,7 @@ function makeSessionStopDeps(opts: {
     sentEvents: [],
     clearedDeliveries: [],
     clearPendingActionsCalls: [],
+    markTurnCompleteCalls: [],
     scheduledTimers: [],
   };
   const externalIdMap = opts.externalIdMap ?? {};
@@ -73,6 +75,7 @@ function makeSessionStopDeps(opts: {
       sessionManager: {
         findByClaudeSessionId(_id: string) { return opts.matchedSession as never; },
         clearPendingActions(id: string) { harness.clearPendingActionsCalls.push(id); },
+        markTurnComplete(id: string) { harness.markTurnCompleteCalls.push(id); },
       },
       resolveExternalSessionId(internalId: string) {
         return externalIdMap[internalId] ?? internalId;
@@ -286,6 +289,7 @@ test('session_stop_failure: clears pending blocking, fires session_status=ready,
     sessionManager: {
       findByClaudeSessionId() { return { sessionId: 'int-1' } as never; },
       clearPendingActions(id: string) { cleared.push(id); },
+      markTurnComplete(_id: string) {},
     },
     resolveExternalSessionId() { return 'ext-1'; },
     pendingBlockingRequests: pending,
@@ -307,6 +311,7 @@ test('session_stop_failure: unmatched session falls back to claudeSessionId, ski
     sessionManager: {
       findByClaudeSessionId() { return undefined as never; },
       clearPendingActions(id: string) { cleared.push(id); },
+      markTurnComplete(_id: string) {},
     },
     resolveExternalSessionId() { return 'unused'; },
     pendingBlockingRequests: new Map(),

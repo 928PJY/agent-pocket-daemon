@@ -370,6 +370,16 @@ export function registerSessionStatusHandler(
   sm: SessionManagerGateway,
   deps: SessionStatusDeps,
 ): void {
+  // Per-session dedupe of the last (effectiveStatus, actionType) tuple we
+  // shipped to the phone. The Stop hook + observer cascade can produce
+  // several identical READY/RUNNING transitions in one CLI turn (each
+  // local_command_invoke/output entry toggles status). Without dedupe the
+  // wire stream carries multiple running/ready pairs per turn, which makes
+  // the phone-side SessionInfo flip visibly. We only dedupe the plain
+  // status stream — completion frames (which carry is_completion=true)
+  // never come through this handler; they go through sendNotificationEventToPhone
+  // directly from the Stop hook with their own completion_request_id.
+  const lastSent = new Map<string, { status: SessionStatus; actionType?: string }>();
   sm.on('session_status', (sessionId: string, status: SessionStatus) => {
     if (!deps.isInitialDiscoveryDone()) return;
 
@@ -412,7 +422,20 @@ export function registerSessionStatusHandler(
       }
     }
 
+    const prev = lastSent.get(externalId);
+    const currActionType = event.action_type as string | undefined;
+    if (prev && prev.status === effectiveStatus && prev.actionType === currActionType) {
+      logger.debug('daemon', 'session_status dedupe', { sessionId: externalId, status: effectiveStatus });
+      return;
+    }
+    lastSent.set(externalId, { status: effectiveStatus, actionType: currActionType });
+
     deps.sendToPhone(event as unknown as PcEvent);
+  });
+
+  sm.on('session_ended', (sessionId: string) => {
+    const externalId = deps.resolveExternalSessionId(sessionId);
+    lastSent.delete(externalId);
   });
 }
 

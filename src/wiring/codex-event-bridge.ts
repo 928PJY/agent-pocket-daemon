@@ -131,8 +131,10 @@ export function attachCodexObserverHandlers(
   });
 
   observer.on('status_change', (status: 'running' | 'ready') => {
-    tracked.status = status as SessionStatus;
+    const newStatus = status as SessionStatus;
     tracked.lastActivity = now();
+    if (tracked.status === newStatus) return;
+    tracked.status = newStatus;
     if (!deps.isInitialDiscoveryDone()) return;
     deps.sendToPhone({
       type: 'session_status',
