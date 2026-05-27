@@ -164,7 +164,9 @@ test('SessionDiscovery reads PID metadata and tolerates malformed files', () => 
     assert.deepEqual(info, {
       pid: process.pid,
       sessionId: 'session-1',
-      cwd: dir,
+      // Live process cwd wins over the (stale) cwd recorded in the PID file
+      // when the process is alive — see issue #85.
+      cwd: process.cwd(),
       entrypoint: 'claude-vscode',
       isAlive: true,
       name: 'VSCode',

@@ -76,6 +76,7 @@ function makeDeps(
     killFn: (pid) => { if (dead.has(pid)) throw new Error('ESRCH'); },
     findTerminalForPid: (pid) => (opts.terminals?.[pid] as never) ?? null,
     isProcessSuspendedOrZombie: (pid) => susp.has(pid),
+    getLiveProcessCwd: () => undefined,
   };
 }
 
