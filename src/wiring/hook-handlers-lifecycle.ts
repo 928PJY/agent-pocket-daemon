@@ -61,7 +61,7 @@ export interface PendingClearInfo {
 export interface SessionStopDeps {
   sessionManager: Pick<
     SessionManager,
-    'findByClaudeSessionId' | 'clearPendingActions'
+    'findByClaudeSessionId' | 'clearPendingActions' | 'markTurnComplete'
   >;
   resolveExternalSessionId(internalId: string): string;
   /** Live reference to the daemon's pending-blocking-request map. */
@@ -155,7 +155,19 @@ export function registerSessionStopHandler(
       logger.info('daemon', `Stop hook cleared ${cleared} stale pending blocking request(s)`, { sessionId: externalId });
     }
     if (session) {
+      // Authoritative turn-complete flip BEFORE we emit the completion
+      // session_status to the phone. This:
+      //   1. Updates in-memory state.status RUNNING→READY so a list_sessions
+      //      landing in the window between Stop hook and the next observer
+      //      JSONL poll (≤500ms) doesn't serialize a stale "running".
+      //   2. Causes the observer's subsequent `end_turn` status_change to
+      //      fail its `state.status !== newStatus` guard, eliminating the
+      //      duplicate READY frame on the wire.
+      // clearPendingActions stays for the PENDING_ACTIONS→READY branch
+      // (markTurnComplete is a no-op when already READY but doesn't handle
+      // pending — we still want both paths flipped here).
       deps.sessionManager.clearPendingActions(session.sessionId);
+      deps.sessionManager.markTurnComplete(session.sessionId);
     }
 
     const event: Record<string, unknown> = {
@@ -255,7 +267,7 @@ export function registerSessionStopHandler(
 // ---------------------------------------------------------------------------
 
 export interface SessionStopFailureDeps {
-  sessionManager: Pick<SessionManager, 'findByClaudeSessionId' | 'clearPendingActions'>;
+  sessionManager: Pick<SessionManager, 'findByClaudeSessionId' | 'clearPendingActions' | 'markTurnComplete'>;
   resolveExternalSessionId(internalId: string): string;
   pendingBlockingRequests: Map<string, PendingBlockingEntry>;
   sendToPhone(event: PcEvent): void;
@@ -285,6 +297,7 @@ export function registerSessionStopFailureHandler(
     }
     if (session) {
       deps.sessionManager.clearPendingActions(session.sessionId);
+      deps.sessionManager.markTurnComplete(session.sessionId);
     }
 
     deps.sendToPhone({
