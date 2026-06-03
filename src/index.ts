@@ -11,6 +11,7 @@ import { SessionManager } from './sessions/session-manager.js';
 import type { SessionConfig } from './sessions/session-manager.js';
 import { getObserverCommands } from './sessions/observer-commands.js';
 import { RelayClient } from './relay/relay-client.js';
+import { startSleepPrevention, stopSleepPrevention } from './relay/sleep-prevention.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
@@ -422,6 +423,10 @@ export class AgentPocketDaemon extends EventEmitter {
    * Start the daemon: wire events and connect to relay.
    */
   async start(): Promise<number> {
+    // Arm sleep prevention before anything else so the OS can't suspend us
+    // mid-startup. macOS-only; no-op elsewhere. (#271 root cause.)
+    startSleepPrevention();
+
     // Start the hook server first so we know the port
     const hookPort = await this.hookServer.start();
 
@@ -528,6 +533,7 @@ export class AgentPocketDaemon extends EventEmitter {
     this.codexObservers.clear();
     await this.sessionManager.shutdown();
     this.seqAllocators.flushAllSync();
+    stopSleepPrevention();
   }
 
   /**
