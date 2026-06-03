@@ -46,9 +46,11 @@ function makeDeps(overrides: Partial<ListSessionsDeps> = {}): ListSessionsDeps {
     discoverSessions: async () => [],
     getRunningAllSessions: () => [],
     getSessionHistory: () => emptyHistory(),
+    getSessionPreview: () => [],
     discoverCodexSessions: () => [],
     discoverCodexLiveSessions: () => new Map(),
     getCodexHistory: () => emptyHistory(),
+    getCodexPreview: () => [],
     resolveCodexTerminalTarget: () => undefined,
     getCodexCapabilities: () => ['observe'],
     getCodexObserver: () => undefined,
@@ -463,11 +465,11 @@ test('handleListSessions sorts active statuses ahead of HISTORY, then by last_ac
   assert.deepEqual(ids, ['active', 'old']);
 });
 
-test('handleListSessions attaches truncated recent_messages and routes Codex history through getCodexHistory', async () => {
+test('handleListSessions attaches truncated recent_messages and routes Codex preview through getCodexPreview', async () => {
   const { ctx, sentEvents } = makeCtx();
   const longContent = 'a'.repeat(500);
-  const claudeHistoryCalls: string[] = [];
-  const codexHistoryCalls: string[] = [];
+  const claudePreviewCalls: string[] = [];
+  const codexPreviewCalls: string[] = [];
 
   const tracked = makeTracked({ sessionId: 'sess-c', claudeSessionId: 'sess-c-claude', lastActivity: 200 });
   const codex = makeCodex({ sessionId: 'codex:t', threadId: 't', updatedAtMs: 100 });
@@ -477,13 +479,13 @@ test('handleListSessions attaches truncated recent_messages and routes Codex his
     makeDeps({
       getAllTrackedSessions: () => [tracked],
       discoverCodexSessions: () => [codex],
-      getSessionHistory: (id) => {
-        claudeHistoryCalls.push(id);
-        return { messages: [{ role: 'user', content: longContent }], totalCount: 1, offset: 0, hasMore: false };
+      getSessionPreview: (id) => {
+        claudePreviewCalls.push(id);
+        return [{ role: 'user', content: longContent }];
       },
-      getCodexHistory: (id) => {
-        codexHistoryCalls.push(id);
-        return { messages: [{ role: 'assistant', content: 'codex out', toolName: 'Bash' }], totalCount: 1, offset: 0, hasMore: false };
+      getCodexPreview: (id) => {
+        codexPreviewCalls.push(id);
+        return [{ role: 'assistant', content: 'codex out', toolName: 'Bash' }];
       },
     }),
     baseCmd(),
@@ -494,8 +496,8 @@ test('handleListSessions attaches truncated recent_messages and routes Codex his
   const claudeMsgs = claudeEntry.recent_messages as Array<{ content: string }>;
   const codexMsgs = codexEntry.recent_messages as Array<{ content: string; tool_name?: string }>;
   assert.equal(claudeMsgs[0].content.length, 200); // truncated
-  assert.deepEqual(claudeHistoryCalls, ['sess-c-claude']);
-  assert.deepEqual(codexHistoryCalls, ['codex:t']);
+  assert.deepEqual(claudePreviewCalls, ['sess-c-claude']);
+  assert.deepEqual(codexPreviewCalls, ['codex:t']);
   assert.equal(codexMsgs[0].tool_name, 'Bash');
 });
 

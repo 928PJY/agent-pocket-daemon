@@ -1336,9 +1336,11 @@ export class AgentPocketDaemon extends EventEmitter {
       discoverSessions: () => this.sessionDiscovery.discoverSessions(),
       getRunningAllSessions: () => this.sessionDiscovery.getRunningAllSessions(),
       getSessionHistory: (id, options) => this.sessionDiscovery.getSessionHistory(id, options),
+      getSessionPreview: (id, limit) => this.sessionDiscovery.getSessionPreview(id, limit),
       discoverCodexSessions: () => this.codexDiscovery.discoverSessions(),
       discoverCodexLiveSessions: (sessions) => this.codexDiscovery.discoverLiveSessions(sessions),
       getCodexHistory: (id, options) => this.codexDiscovery.getSessionHistory(id, options),
+      getCodexPreview: (id, limit) => this.codexDiscovery.getSessionPreview(id, limit),
       resolveCodexTerminalTarget: (id, liveCodex) => this.resolveCodexTerminalTarget(id, liveCodex),
       getCodexCapabilities: (id) => this.getCodexCapabilities(id),
       getCodexObserver: (id) => {
