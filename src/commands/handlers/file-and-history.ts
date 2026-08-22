@@ -187,6 +187,7 @@ export function handleSyncRequest(
     requestId: command.request_id,
     knownSessions: Object.keys(knownSeqs).length,
     activeSessions: targets.size,
+    ts: t0,
   });
 
   // SYNC_ACK: tell the phone immediately that the request landed and how
@@ -208,7 +209,13 @@ export function handleSyncRequest(
       })),
     };
     ctx.sendToPhone(ack);
+    logger.info('daemon', 'sync_ack sent', {
+      requestId: command.request_id,
+      ackMs: Date.now() - t0,
+    });
   }
+
+  const loopStart = Date.now();
 
   const delivered: SyncCompleteEvent['delivered'] = [];
   const perSessionMs: Record<string, number> = {};
@@ -243,6 +250,13 @@ export function handleSyncRequest(
           last_ms: result.tailMs,
         };
         ctx.sendToPhone(done);
+        logger.info('daemon', 'session_history_done emitted', {
+          requestId: command.request_id,
+          sessionId: sessionId.slice(0, 8),
+          tailSeq: result.tailSeq ?? 0,
+          tailMs: result.tailMs,
+          sessionMs: Date.now() - sessionStart,
+        });
       }
     }
   }
@@ -256,6 +270,7 @@ export function handleSyncRequest(
     requestId: command.request_id,
     sessions: delivered.length,
     totalMs: Date.now() - t0,
+    loopMs: Date.now() - loopStart,
     perSessionMs,
   });
   ctx.sendToPhone(event);

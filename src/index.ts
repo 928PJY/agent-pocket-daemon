@@ -1218,6 +1218,10 @@ export class AgentPocketDaemon extends EventEmitter {
         break;
 
       case 'sync_request':
+        logger.info('daemon', 'sync_request dispatch', {
+          requestId: (command as SyncRequestCommand).request_id,
+          ts: Date.now(),
+        });
         this.handleSyncRequest(command);
         break;
 

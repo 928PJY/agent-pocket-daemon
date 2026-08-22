@@ -199,6 +199,24 @@ export function createNotificationBookkeeping(
     const lan = deps.getLanServer();
     const relay = deps.getRelayClient();
 
+    const evType = (event as { type?: string })?.type;
+    const evSid = (event as { session_id?: string })?.session_id;
+    const evReq = (event as { request_id?: string })?.request_id;
+    if (
+      evType === 'sync_ack' ||
+      evType === 'session_history' ||
+      evType === 'session_history_done' ||
+      evType === 'sync_complete'
+    ) {
+      logger.info('daemon', 'sendToPhone enter', {
+        type: evType,
+        sid: evSid?.slice(0, 8),
+        req: evReq?.slice(0, 8),
+        mode,
+        ts: Date.now(),
+      });
+    }
+
     if (mode === 'lan' && lan) {
       lan.send(event);
     } else if (relay) {

@@ -295,6 +295,11 @@ export function sendSessionHistory(
   const limit = Math.min(rawLimit, MAX_SESSION_HISTORY_LIMIT);
   const isFullHistory = !incremental && !options?.offset && limit >= MAX_SESSION_HISTORY_LIMIT;
 
+  // Breakdown timing: (a) JSONL read + parse, (b) filter/serialize,
+  // (c) E2E encrypt + enqueue. Sync-only operations so wall-clock here
+  // equals CPU spent — useful for the per-session sync diagnostics
+  // (#271 sync-slow follow-up).
+  const tRead0 = Date.now();
   const result = isCodexSessionId(claudeSessionId)
     ? deps.codexDiscovery.getSessionHistory(claudeSessionId, {
         offset: options?.offset ?? 0,
@@ -310,7 +315,9 @@ export function sendSessionHistory(
         sinceSeq: options?.sinceSeq,
         sinceMs: options?.sinceMs,
       });
+  const readMs = Date.now() - tRead0;
 
+  const tSer0 = Date.now();
   const truncated = result.messages.map((m) => ({
     ...m,
     content: m.content.slice(0, 5000),
@@ -437,6 +444,31 @@ export function sendSessionHistory(
     tail_ms: result.tailMs,
   };
 
+  const serializeMs = Date.now() - tSer0;
+
+  // Rough wire-size estimate: serialized JSON length of the messages array.
+  // Stringified once, used both for the log and a heuristic for the phone-
+  // side log reconciliation. JSON.stringify on a 200-row claude window is
+  // well under 1ms — fine to measure synchronously here.
+  const wireBytes = (() => {
+    try { return JSON.stringify(wireMessages).length; } catch { return -1; }
+  })();
+
+  const tSend0 = Date.now();
   deps.sendToPhone(event as unknown as PcEvent);
+  const sendMs = Date.now() - tSend0;
+
+  logger.info('history-debug', 'sendSessionHistory timing', {
+    sessionId: claudeSessionId.slice(0, 8),
+    incremental,
+    rawTotal: truncated.length,
+    filteredTotal: filtered.length,
+    wireRows: wireMessages.length,
+    wireBytes,
+    readMs,
+    serializeMs,
+    sendMs,
+    totalMs: readMs + serializeMs + sendMs,
+  });
   return { tailSeq: result.tailSeq, tailMs: result.tailMs };
 }

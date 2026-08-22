@@ -156,12 +156,15 @@ export class CodexDiscovery {
     const registered = this.registeredSessions.get(threadId);
     if (registered && fs.existsSync(registered.rolloutPath)) return registered;
 
+    // Single discoverSessions() call on cache miss. Previously this also
+    // called discoverSessions() a second time on miss as a "retry", which
+    // doubled the worst-case sqlite3 spawn cost (each call has a 2000ms
+    // timeout) for any session not yet in cache. The two calls used the
+    // identical query against the same DB; the second one was guaranteed
+    // to return the same result. Removed — if the first call doesn't find
+    // it, it doesn't exist. (agent-pocket #271 cold-sync slowness.)
     const cached = this.cachedSessions ?? this.discoverSessions();
-    const session = cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
-    if (session) return session;
-
-    const refreshed = this.discoverSessions();
-    return refreshed.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
+    return cached.find((s) => s.threadId === threadId || s.sessionId === threadOrSessionId);
   }
 
   discoverLiveSessions(sessions = this.cachedSessions ?? this.discoverSessions()): Map<string, CodexLiveSession> {
@@ -190,6 +193,28 @@ export class CodexDiscovery {
 
     try {
       const stat = fs.statSync(session.rolloutPath);
+      // mtime short-circuit (agent-pocket #271 cold-sync slowness): if the
+      // phone's since cursor is already at-or-past the file's last write
+      // time, the JSONL cannot contain anything newer. Avoid the full
+      // readFileSync + JSON.parse + triple-sort that would otherwise run
+      // just to return msgs=0. Only applies to incremental requests; the
+      // first-ever sync (sinceMs undefined) still pays the parse so the
+      // historyCache is populated for subsequent calls.
+      if (
+        offset === 0 &&
+        typeof options?.sinceMs === 'number' &&
+        options.sinceMs >= stat.mtimeMs &&
+        !this.historyCache.has(session.threadId)
+      ) {
+        return {
+          messages: [],
+          totalCount: 0,
+          offset,
+          hasMore: false,
+          tailMs: options.sinceMs,
+          tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
+        };
+      }
       const cached = this.historyCache.get(session.threadId);
       let allMessages: HistoryMessage[];
 

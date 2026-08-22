@@ -437,8 +437,22 @@ export class RelayClient extends EventEmitter {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     try {
-      this.ws.send(JSON.stringify(envelope));
-      logger.trace('relay', 'TX envelope', { envelope_nonce: envelope.nonce });
+      const wire = JSON.stringify(envelope);
+      const beforeBuffered = this.ws.bufferedAmount;
+      const t0 = Date.now();
+      this.ws.send(wire);
+      const elapsedMs = Date.now() - t0;
+      // #271: surface backpressure during sync. If bufferedAmount stays high
+      // across many sends, the relay/TCP path is the bottleneck (not daemon
+      // emit speed).
+      logger.info('relay', 'TX envelope', {
+        nonce: envelope.nonce,
+        bytes: wire.length,
+        bufferedBefore: beforeBuffered,
+        bufferedAfter: this.ws.bufferedAmount,
+        sendMs: elapsedMs,
+        ts: t0,
+      });
     } catch (err) {
       logger.error('relay', `Send failed: ${(err as Error).message}`);
       this.emit('error', new Error(`Failed to send message: ${(err as Error).message}`));
