@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   CodexDiscovery,
   codexLiveSessionsFromOpenedRollouts,
@@ -384,6 +385,44 @@ test('CodexDiscovery.getSessionHistory collapses consecutive same-mode codex_col
       return m.role === 'codex_meta' && ev?.type === 'codex_collaboration_mode';
     }) as Array<{ codexMetaEvent: { mode: string } }>;
     assert.deepEqual(modeRows.map((m) => m.codexMetaEvent.mode), ['Default', 'Plan', 'Default']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// discoverSessions must survive large state DBs. Codex stores the full opening
+// prompt in `title`, so a few hundred threads easily exceed Node's default 1MB
+// execFileSync buffer — which used to surface as `spawnSync sqlite3 ENOBUFS`
+// every discovery tick, silently returning zero sessions.
+// ---------------------------------------------------------------------------
+
+test('discoverSessions handles sqlite output larger than the default 1MB buffer', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-big-'));
+  try {
+    const stateDb = path.join(dir, 'state_5.sqlite');
+    const rollout = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(rollout, '');
+
+    // 60 threads x ~40KB of title => ~2.4MB of sqlite3 stdout. Build the rows
+    // with SQL rather than literals so the seed statement stays argv-sized.
+    execFileSync('sqlite3', [stateDb], {
+      input: `CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT,
+           created_at_ms INTEGER, updated_at_ms INTEGER, cli_version TEXT,
+           model TEXT, archived INTEGER);
+         WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 59)
+         INSERT INTO threads (id, rollout_path, cwd, title, created_at_ms,
+           updated_at_ms, cli_version, model)
+         SELECT 'thread-' || n, '${rollout}', '${dir}',
+           replace(hex(zeroblob(20000)), '0', 'x'), 1, 1000 + n, '0.1.0', 'gpt-5'
+         FROM seq;`,
+    });
+
+    const discovery = new CodexDiscovery(dir);
+    const sessions = discovery.discoverSessions();
+
+    assert.equal(sessions.length, 60, 'every thread should survive a >1MB result set');
+    assert.equal(sessions[0].threadId, 'thread-59', 'ordered by updated_at_ms desc');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

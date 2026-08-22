@@ -44,6 +44,13 @@ export function isCodexSessionId(sessionId: string): boolean {
   return sessionId.startsWith(CODEX_PREFIX);
 }
 
+// Codex stores the whole opening prompt in `threads.title`, so a few hundred
+// rows blow past Node's 1MB execFileSync default and the spawn dies with
+// ENOBUFS — every discovery tick, silently yielding zero sessions. Truncate the
+// one unbounded column at the SQL level and keep a wide ceiling for the rest.
+const TITLE_MAX_CHARS = 200;
+const DISCOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+
 export function codexExternalSessionId(threadId: string): string {
   return `${CODEX_PREFIX}${threadId}`;
 }
@@ -77,7 +84,7 @@ export class CodexDiscovery {
         ifnull(id, ''),
         ifnull(rollout_path, ''),
         ifnull(cwd, ''),
-        ifnull(title, ''),
+        substr(ifnull(title, ''), 1, ${TITLE_MAX_CHARS}),
         ifnull(created_at_ms, 0),
         ifnull(updated_at_ms, 0),
         ifnull(cli_version, ''),
@@ -92,6 +99,7 @@ export class CodexDiscovery {
       const out = execFileSync('sqlite3', [codexStateDbReadonlyUri(stateDb), '-separator', FIELD_SEP, query], {
         encoding: 'utf-8',
         timeout: 2000,
+        maxBuffer: DISCOVERY_MAX_BUFFER_BYTES,
       });
       const sessions = out.split('\n')
         .filter((line) => line.trim().length > 0)
