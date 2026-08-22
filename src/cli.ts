@@ -401,14 +401,6 @@ async function runDaemon(flags: Record<string, string>): Promise<void> {
   installClaudeHooks(hookPort);
   installCodexHooks(hookPort);
 
-  // Prevent idle sleep
-  const caffeinated = spawn('caffeinate', ['-i', '-w', String(process.pid)], {
-    stdio: 'ignore',
-    detached: true,
-  });
-  caffeinated.unref();
-  logger.info('cli', `Started caffeinate (PID ${caffeinated.pid})`);
-
   // Graceful shutdown
   let isShuttingDown = false;
   async function shutdown(signal: string): Promise<void> {

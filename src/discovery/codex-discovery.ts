@@ -9,6 +9,7 @@ import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import { logger } from '../logger.js';
 import { detectInterruptText, interruptMessageText } from '../utils/interrupt-messages.js';
 import { extractCodexMetaEvents } from '../utils/codex-tag-extract.js';
+import { getSessionPreview as readPreviewFromTail, type PreviewMessage, type PreviewRowParser } from './preview-cache.js';
 
 const FIELD_SEP = '\x1f';
 const CODEX_PREFIX = 'codex:';
@@ -181,6 +182,16 @@ export class CodexDiscovery {
     }
 
     return live;
+  }
+
+  /**
+   * Fast preview for list_sessions — see preview-cache.ts. Codex JSONL rows
+   * differ from Claude's, so this delegates to `parseCodexHistoryEntry`.
+   */
+  getSessionPreview(sessionId: string, limit = 3): PreviewMessage[] {
+    const session = this.getSession(sessionId);
+    if (!session) return [];
+    return readPreviewFromTail(session.rolloutPath, CODEX_PREVIEW_PARSER, limit);
   }
 
   getSessionHistory(sessionId: string, options?: { offset?: number; limit?: number; since?: string; sinceSeq?: number; sinceMs?: number }): HistoryPage {
@@ -538,6 +549,14 @@ export function parseCodexHistoryEntry(entry: Record<string, unknown>): HistoryM
 
   return [];
 }
+
+/** Preview projector for Codex rollouts — see preview-cache.ts. */
+export const CODEX_PREVIEW_PARSER: PreviewRowParser = (entry) =>
+  parseCodexHistoryEntry(entry).map((m) => ({
+    role: m.role,
+    content: m.content,
+    toolName: m.toolName,
+  }));
 
 export function parseCodexLifecycleEntry(entry: Record<string, unknown>): CodexLifecycleEvent | null {
   const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;

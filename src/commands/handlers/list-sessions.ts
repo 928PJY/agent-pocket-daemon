@@ -24,6 +24,7 @@ import type { CommandContext } from '../command-context.js';
 import { isCodexSessionId } from '../../discovery/codex-discovery.js';
 import type { CodexSession, CodexLiveSession } from '../../discovery/codex-discovery.js';
 import type { DiscoveredSession, HistoryPage, RunningCliSession } from '../../discovery/session-discovery.js';
+import type { PreviewMessage } from '../../discovery/preview-cache.js';
 import type { SessionState } from '../../sessions/session-manager.js';
 import type { CodexTerminalTargetEntry } from '../../codex/codex-handler.js';
 import { getLatestSessionMapEntryForPid } from '../../utils/session-map.js';
@@ -47,11 +48,18 @@ export interface ListSessionsDeps {
   discoverSessions(): Promise<DiscoveredSession[]>;
   getRunningAllSessions(): RunningCliSession[];
   getSessionHistory(sessionId: string, options?: { limit?: number }): HistoryPage;
+  /** Fast tail-only preview for `list_sessions` (3 messages). Skips the
+   *  subagent walk / seq allocator / ts normalisation that
+   *  `getSessionHistory` runs, so it doesn't block the event loop when
+   *  many sessions are previewed in sequence. */
+  getSessionPreview(sessionId: string, limit?: number): PreviewMessage[];
 
   // ── Codex ────────────────────────────────────────────────────────────────
   discoverCodexSessions(): CodexSession[];
   discoverCodexLiveSessions(sessions: CodexSession[]): Map<string, CodexLiveSession>;
   getCodexHistory(sessionId: string, options?: { limit?: number }): HistoryPage;
+  /** Codex-side counterpart of `getSessionPreview`. */
+  getCodexPreview(sessionId: string, limit?: number): PreviewMessage[];
   resolveCodexTerminalTarget(sessionId: string, liveCodex: CodexLiveSession | null): CodexTerminalTargetEntry | undefined;
   getCodexCapabilities(sessionId: string): string[];
   getCodexObserver(sessionId: string): CodexObserverInfo | undefined;
@@ -143,14 +151,14 @@ export async function handleListSessions(
     const pageSlice = allSessions.slice(offset, offset + limit);
 
     const sessions = pageSlice.map(({ entry, historyKey }) => {
-      const historyPage = isCodexSessionId(historyKey)
-        ? deps.getCodexHistory(historyKey, { limit: 3 })
-        : deps.getSessionHistory(historyKey, { limit: 3 });
+      const previewMessages = isCodexSessionId(historyKey)
+        ? deps.getCodexPreview(historyKey, 3)
+        : deps.getSessionPreview(historyKey, 3);
       const tailSeq = deps.getSeqTail(historyKey);
       return {
         ...entry,
         ...(tailSeq !== undefined ? { tail_seq: tailSeq } : {}),
-        recent_messages: historyPage.messages.map((m) => ({
+        recent_messages: previewMessages.map((m) => ({
           role: m.role,
           content: m.content.slice(0, 200),
           tool_name: m.toolName,

@@ -10,6 +10,7 @@ import { detectInterruptText } from '../utils/interrupt-messages.js';
 import { logger } from '../logger.js';
 import { parseHistoryEntry } from './jsonl-parser.js';
 import { getSubagentHistory } from './subagent-history.js';
+import { getSessionPreview as readPreviewFromTail, CLAUDE_PREVIEW_PARSER, type PreviewMessage } from './preview-cache.js';
 import { PREFETCH_CWD } from '../sessions/observer-commands.js';
 import { SessionSeqAllocatorManager } from './seq-allocator.js';
 import {
@@ -306,6 +307,26 @@ export class SessionDiscovery {
       // Permission error
     }
     return null;
+  }
+
+  /**
+   * Fast preview snippet for `list_sessions`. Reads the JSONL tail and
+   * returns the last `limit` messages without triggering the full normalise
+   * pipeline (no subagent walk, no seq allocator touch, no ts cursoring).
+   * See `preview-cache.ts` for the why.
+   */
+  getSessionPreview(sessionId: string, limit = 3): PreviewMessage[] {
+    const cached = this.cachedSessions;
+    let filePath: string | null = null;
+    if (cached) {
+      const match = cached.find((s) => s.sessionId === sessionId);
+      if (match) filePath = match.filePath;
+    }
+    if (!filePath) {
+      filePath = this.findSessionFile(path.join(this.claudeDir, 'projects'), sessionId);
+    }
+    if (!filePath) return [];
+    return readPreviewFromTail(filePath, CLAUDE_PREVIEW_PARSER, limit);
   }
 
   /**
