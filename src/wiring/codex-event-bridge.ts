@@ -34,10 +34,26 @@ import type { NotificationDeliveryEventType } from '../relay/phone-transport.js'
 import { truncateUtf8 } from '../utils/truncate-utf8.js';
 import { logger } from '../logger.js';
 
+// Codex has no notion of a user-authored session title: `threads.title` is
+// seeded from the opening prompt, which for tool-driven sessions is a wall of
+// system-prompt text ("The following is the Codex agent history whose request
+// action you are assessing…"). Anything that long is prompt spill, not a
+// title — notifications are better off naming the project directory, which is
+// also what Claude sessions show.
+const CODEX_TITLE_MAX_CHARS = 60;
+
+export function codexSessionName(
+  session: Pick<CodexSession, 'title' | 'cwd'> | undefined,
+  fallback: () => string,
+): string {
+  const title = session?.title?.trim();
+  if (title && title.length <= CODEX_TITLE_MAX_CHARS) return title;
+  return session?.cwd ? path.basename(session.cwd) : fallback();
+}
+
 // ---------------------------------------------------------------------------
 // nextCompletionRequestId — closure factory
 // ---------------------------------------------------------------------------
-
 export function createCompletionRequestIdGenerator(): (sessionId: string, timestamp?: number) => string {
   let counter = 0;
   return (sessionId: string, timestamp: number = Date.now()) => {
@@ -86,7 +102,7 @@ export function sendCodexCompletion(
     completion_body: body,
   } as unknown as PcEvent, 'session_completed', sessionId, completionRequestId, {
     type: 'session_completed',
-    session_name: session?.title ?? (session?.cwd ? path.basename(session.cwd) : deps.getSessionName(sessionId)),
+    session_name: codexSessionName(session, () => deps.getSessionName(sessionId)),
     body: truncateUtf8(body, 256),
     sound: 'completion.caf',
     category: 'SESSION_COMPLETED',
@@ -162,7 +178,7 @@ export function attachCodexObserverHandlers(
       status: SessionStatus.ERROR,
     } as unknown as PcEvent, true, {
       type: 'session_error',
-      session_name: session.title ?? path.basename(session.cwd),
+      session_name: codexSessionName(session, () => path.basename(session.cwd)),
       body: truncateUtf8(err.message || 'Codex turn failed', 256),
       sound: 'default',
       category: 'SESSION_ERROR',
