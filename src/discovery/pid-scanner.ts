@@ -135,6 +135,9 @@ function projectRunning(
   const out: RunningCliSession[] = [];
   for (const { data, pid } of rows) {
     if (opts.entrypointFilter !== undefined && data.entrypoint !== opts.entrypointFilter) continue;
+    // Claude Code parks warm spare processes (kind: 'bg') that share a
+    // session's name but accept no input. Rows predating `kind` have none.
+    if (data.kind === 'bg') continue;
     if (isSusp(pid)) continue;
 
     const entrypoint = opts.forceCliEntrypoint
@@ -150,7 +153,33 @@ function projectRunning(
       name: typeof data.name === 'string' ? (data.name as string) : undefined,
     });
   }
-  return out;
+  return dedupeBySessionId(out);
+}
+
+/**
+ * One row per sessionId, preferring the PID a message can actually be sent to.
+ *
+ * A session can have several live PID files: a wrapper (Omnara, an IDE agent)
+ * registers itself under the same sessionId as the interactive CLI the user is
+ * typing in. Only the latter holds a tty, so picking by iteration order left
+ * `terminalTarget` undefined and send_message failed with "terminal not
+ * detected" even though a perfectly good terminal was open.
+ */
+function dedupeBySessionId(sessions: RunningCliSession[]): RunningCliSession[] {
+  const best = new Map<string, RunningCliSession>();
+  const anonymous: RunningCliSession[] = [];
+
+  for (const session of sessions) {
+    if (!session.sessionId) {
+      anonymous.push(session);
+      continue;
+    }
+    const incumbent = best.get(session.sessionId);
+    if (!incumbent || (!incumbent.terminalTarget && session.terminalTarget)) {
+      best.set(session.sessionId, session);
+    }
+  }
+  return [...best.values(), ...anonymous];
 }
 
 export function getRunningCliSessions(

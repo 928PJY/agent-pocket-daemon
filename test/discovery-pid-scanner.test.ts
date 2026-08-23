@@ -50,6 +50,7 @@ interface PidFile {
   cwd?: string;
   entrypoint?: string;
   name?: unknown;
+  kind?: string;
 }
 
 function setup(files: Record<string, PidFile | string>) {
@@ -311,4 +312,52 @@ test('default fsImpl + killFn are usable (smoke against real fs miss)', () => {
   assert.deepEqual(getRunningCliSessions('/nonexistent/.claude'), []);
   assert.deepEqual(getRunningAllSessions('/nonexistent/.claude'), []);
   assert.equal(getRunningSessionEntrypoints('/nonexistent/.claude').size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Claude Code keeps warm `bg-spare` processes around (kind: 'bg') and, when a
+// session is driven by a wrapper like Omnara, a second PID file points at the
+// same sessionId with no terminal. Neither can accept an injected message, so
+// they must not shadow the interactive PID that can.
+// ---------------------------------------------------------------------------
+
+test('getRunningCliSessions: drops bg-spare processes', () => {
+  const state = setup({
+    '100.json': { pid: 100, sessionId: 's-real', cwd: '/w', entrypoint: 'cli', kind: 'interactive' },
+    '101.json': { pid: 101, sessionId: 's-spare', cwd: '/w', entrypoint: 'cli', kind: 'bg' },
+  });
+  const out = getRunningCliSessions(CLAUDE_DIR, makeDeps(state, { terminals: { 100: { tmux: 'w:0.0' } } }));
+  assert.deepEqual(out.map((s) => s.pid), [100]);
+});
+
+test('getRunningCliSessions: keeps rows written before kind existed', () => {
+  const state = setup({
+    '100.json': { pid: 100, sessionId: 's-legacy', cwd: '/w', entrypoint: 'cli' },
+  });
+  const out = getRunningCliSessions(CLAUDE_DIR, makeDeps(state));
+  assert.deepEqual(out.map((s) => s.pid), [100]);
+});
+
+test('getRunningCliSessions: prefers the injectable PID when one sessionId has several', () => {
+  // Omnara-style: the wrapper's PID file is read first and has no terminal;
+  // the interactive CLI holding the tty must still win.
+  const state = setup({
+    '100.json': { pid: 100, sessionId: 's-dup', cwd: '/w', entrypoint: 'cli', kind: 'interactive' },
+    '200.json': { pid: 200, sessionId: 's-dup', cwd: '/w', entrypoint: 'cli', kind: 'interactive' },
+  });
+  const out = getRunningCliSessions(CLAUDE_DIR, makeDeps(state, { terminals: { 200: { tmux: 'w:0.0' } } }));
+  const dup = out.filter((s) => s.sessionId === 's-dup');
+  assert.equal(dup.length, 1, 'one row per sessionId');
+  assert.equal(dup[0].pid, 200, 'the PID with a terminal target wins');
+});
+
+test('getRunningAllSessions: same preference across entrypoints', () => {
+  const state = setup({
+    '100.json': { pid: 100, sessionId: 's-dup', cwd: '/w', entrypoint: 'sdk-ts', kind: 'interactive' },
+    '200.json': { pid: 200, sessionId: 's-dup', cwd: '/w', entrypoint: 'cli', kind: 'interactive' },
+  });
+  const out = getRunningAllSessions(CLAUDE_DIR, makeDeps(state, { terminals: { 200: { tmux: 'w:0.0' } } }));
+  const dup = out.filter((s) => s.sessionId === 's-dup');
+  assert.equal(dup.length, 1);
+  assert.equal(dup[0].pid, 200);
 });
