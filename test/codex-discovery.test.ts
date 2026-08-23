@@ -427,3 +427,88 @@ test('discoverSessions handles sqlite output larger than the default 1MB buffer'
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Codex spawns internal "guardian" subagent threads to judge each planned
+// action; their transcript is a one-turn {"outcome":"allow"} exchange. They
+// carry thread_source='subagent' and are not sessions a user drives, so
+// surfacing them means a completion notification per approval.
+// ---------------------------------------------------------------------------
+
+test('discoverSessions skips subagent threads but keeps user and legacy rows', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-sub-'));
+  try {
+    const stateDb = path.join(dir, 'state_5.sqlite');
+    const rollout = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(rollout, '');
+
+    execFileSync('sqlite3', [stateDb], {
+      input: `CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT,
+           created_at_ms INTEGER, updated_at_ms INTEGER, cli_version TEXT,
+           model TEXT, archived INTEGER, thread_source TEXT, source TEXT);
+         INSERT INTO threads (id, rollout_path, cwd, title, created_at_ms,
+           updated_at_ms, cli_version, model, thread_source, source) VALUES
+           ('t-user',   '${rollout}', '${dir}', 'real work', 1, 300, '0.1.0', 'gpt-5', 'user',     NULL),
+           ('t-legacy', '${rollout}', '${dir}', 'older cli', 1, 200, '0.1.0', 'gpt-5', NULL,       NULL),
+           ('t-guard',  '${rollout}', '${dir}', 'judging',   1, 100, '0.1.0', 'gpt-5', 'subagent', NULL),
+           -- transitional build: source set, thread_source still null
+           ('t-guard2', '${rollout}', '${dir}', 'judging',   1,  50, '0.1.0', 'gpt-5', NULL,       '{"subagent":{"other":"guardian"}}');`,
+    });
+
+    const ids = new CodexDiscovery(dir).discoverSessions().map((s) => s.threadId);
+    assert.deepEqual(ids, ['t-user', 't-legacy'], 'guardian subagent must not surface');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discoverSessions still excludes archived rows once subagents are filtered', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-arch-'));
+  try {
+    const stateDb = path.join(dir, 'state_5.sqlite');
+    const rollout = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(rollout, '');
+
+    execFileSync('sqlite3', [stateDb], {
+      input: `CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT,
+           created_at_ms INTEGER, updated_at_ms INTEGER, cli_version TEXT,
+           model TEXT, archived INTEGER, thread_source TEXT);
+         INSERT INTO threads (id, rollout_path, cwd, title, created_at_ms,
+           updated_at_ms, cli_version, model, archived, thread_source) VALUES
+           ('t-live',     '${rollout}', '${dir}', 'live', 1, 200, '0.1.0', 'gpt-5', 0, 'user'),
+           ('t-archived', '${rollout}', '${dir}', 'gone', 1, 100, '0.1.0', 'gpt-5', 1, 'user');`,
+    });
+
+    const ids = new CodexDiscovery(dir).discoverSessions().map((s) => s.threadId);
+    assert.deepEqual(ids, ['t-live'], 'archived filter must survive the added predicate');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discoverSessions falls back when the state DB predates thread_source', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-old-'));
+  try {
+    const stateDb = path.join(dir, 'state_5.sqlite');
+    const rollout = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(rollout, '');
+
+    // Schema as shipped before Codex added thread_source — the filtered
+    // query fails at prepare time, which must not zero out discovery.
+    execFileSync('sqlite3', [stateDb], {
+      input: `CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT,
+           created_at_ms INTEGER, updated_at_ms INTEGER, cli_version TEXT,
+           model TEXT, archived INTEGER);
+         INSERT INTO threads (id, rollout_path, cwd, title, created_at_ms,
+           updated_at_ms, cli_version, model) VALUES
+           ('t-old', '${rollout}', '${dir}', 'legacy', 1, 100, '0.1.0', 'gpt-5');`,
+    });
+
+    const discovery = new CodexDiscovery(dir);
+    assert.deepEqual(discovery.discoverSessions().map((s) => s.threadId), ['t-old']);
+    // Second call takes the remembered no-filter path.
+    assert.deepEqual(discovery.discoverSessions().map((s) => s.threadId), ['t-old']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

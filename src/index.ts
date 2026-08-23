@@ -12,6 +12,8 @@ import type { SessionConfig } from './sessions/session-manager.js';
 import { getObserverCommands } from './sessions/observer-commands.js';
 import { RelayClient } from './relay/relay-client.js';
 import { startSleepPrevention, stopSleepPrevention } from './relay/sleep-prevention.js';
+import { startAppNapKeepAlive, stopAppNapKeepAlive } from './relay/app-nap-keepalive.js';
+import { startEventLoopWatchdog, stopEventLoopWatchdog } from './relay/event-loop-watchdog.js';
 import { CryptoEngine } from './crypto/crypto-engine.js';
 import { rawEd25519ToSpki } from './crypto/key-format.js';
 import { SessionDiscovery } from './discovery/session-discovery.js';
@@ -216,6 +218,7 @@ export interface DaemonConfig {
   maxConcurrentSessions?: number;
   connectionMode?: ConnectionMode;
   lanPort?: number;
+  sleepPrevention?: boolean; // hold a caffeinate assertion at startup (default true; --no-sleep-prevention disables)
   phoneIdentityPublicKey?: string; // base64 Ed25519 public key of paired phone (for LAN auth)
   // E2E encryption session keys (base64)
   sessionSendKey?: string;
@@ -423,9 +426,26 @@ export class AgentPocketDaemon extends EventEmitter {
    * Start the daemon: wire events and connect to relay.
    */
   async start(): Promise<number> {
-    // Arm sleep prevention before anything else so the OS can't suspend us
-    // mid-startup. macOS-only; no-op elsewhere. (#271 root cause.)
-    startSleepPrevention();
+    // Sleep/throttle prevention is two halves of one mechanism: caffeinate
+    // (-i -s) blocks idle/system sleep, and the App Nap keep-alive pulses a
+    // UserIsActive assertion to stop the per-process QoS throttle. Both are
+    // gated by the same flag so `--no-sleep-prevention` disables the whole
+    // thing coherently (disabling only one half would be inconsistent and the
+    // logs would mislead a future App-Nap investigation). Default on.
+    if (this.config.sleepPrevention !== false) {
+      // Arm before anything else so the OS can't suspend us mid-startup.
+      // macOS-only; no-op elsewhere. (#271 root cause.)
+      startSleepPrevention();
+      startAppNapKeepAlive();
+    } else {
+      logger.info('sleep', 'Sleep prevention disabled by --no-sleep-prevention (display may sleep; daemon may be throttled by App Nap)');
+    }
+
+    // Watch our own event loop for severe (>4s) drift. With App Nap held off
+    // by the keep-alive pulse, drift should stay at baseline; if it spikes
+    // anyway, the watchdog ticks land late by the same amount that WS
+    // callbacks lag — logged as automatic evidence for the next bad spike.
+    startEventLoopWatchdog();
 
     // Start the hook server first so we know the port
     const hookPort = await this.hookServer.start();
@@ -534,6 +554,8 @@ export class AgentPocketDaemon extends EventEmitter {
     await this.sessionManager.shutdown();
     this.seqAllocators.flushAllSync();
     stopSleepPrevention();
+    stopAppNapKeepAlive();
+    stopEventLoopWatchdog();
   }
 
   /**

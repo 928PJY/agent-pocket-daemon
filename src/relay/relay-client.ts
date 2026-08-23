@@ -59,6 +59,7 @@ export class RelayClient extends EventEmitter {
   private messageNonce: number = 0;
   private phonePeerOnline: boolean = false;
   private consecutiveDecryptFailures: number = 0;
+  private lastRxTs: number = 0;
   // Wire negotiation state, populated when the relay sends `hello`.
   private negotiatedWireVersion: number | null = null;
   private relayWireRange: { min: number; max: number } | null = null;
@@ -311,6 +312,15 @@ export class RelayClient extends EventEmitter {
   }
 
   private handleMessage(data: WebSocket.Data): void {
+    const rxTs = Date.now();
+    // Idle gap between RX events on this socket. A long gap with no TX in
+    // between is normal (nothing to do); a long gap straddling an event the
+    // peer says it sent earlier means the bytes arrived during the gap and
+    // we only just woke up to read them. Pair against relay log's
+    // `Relay hop flushed phone_to_pc` timestamp to confirm. (#271 Iter 7.)
+    const sinceLastRxMs = this.lastRxTs > 0 ? rxTs - this.lastRxTs : -1;
+    this.lastRxTs = rxTs;
+
     let raw: string;
     if (Buffer.isBuffer(data)) {
       raw = data.toString('utf-8');
@@ -322,7 +332,7 @@ export class RelayClient extends EventEmitter {
       raw = data.toString();
     }
 
-    logger.trace('relay', `RX ${raw.length} bytes`);
+    logger.info('relay', 'RX raw', { bytes: raw.length, ts: rxTs, sinceLastRxMs });
 
     let envelope: RelayEnvelope;
     try {
@@ -429,30 +439,61 @@ export class RelayClient extends EventEmitter {
     }
 
     const cmdType = (payload as { type?: string })?.type;
-    logger.trace('relay', `RX decoded`, { type: cmdType, envelope_nonce: envelope.nonce });
+    const decodedMs = Date.now() - rxTs;
+    logger.info('relay', 'RX decoded', {
+      type: cmdType,
+      envelope_nonce: envelope.nonce,
+      bytes: raw.length,
+      decodedMs,
+      rxTs,
+    });
     this.emit('message', payload);
   }
 
   private sendEnvelope(envelope: RelayEnvelope): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
+    const txStart = Date.now();
+    const serialized = JSON.stringify(envelope);
+    const bytes = Buffer.byteLength(serialized, 'utf-8');
+    // bufferedAmount BEFORE write — if this is consistently nonzero across
+    // calls, the kernel/relay TCP buffer is full and ws.send() is queueing
+    // instead of flushing, which would explain a multi-second TX latency.
+    const bufferedBefore = (this.ws as unknown as { bufferedAmount?: number }).bufferedAmount ?? -1;
     try {
-      const wire = JSON.stringify(envelope);
-      const beforeBuffered = this.ws.bufferedAmount;
-      const t0 = Date.now();
-      this.ws.send(wire);
-      const elapsedMs = Date.now() - t0;
-      // #271: surface backpressure during sync. If bufferedAmount stays high
-      // across many sends, the relay/TCP path is the bottleneck (not daemon
-      // emit speed).
-      logger.info('relay', 'TX envelope', {
-        nonce: envelope.nonce,
-        bytes: wire.length,
-        bufferedBefore: beforeBuffered,
-        bufferedAfter: this.ws.bufferedAmount,
-        sendMs: elapsedMs,
-        ts: t0,
+      this.ws.send(serialized, (err) => {
+        if (err) {
+          logger.warn('relay', 'TX flush error', { envelope_nonce: envelope.nonce, err: err.message });
+          return;
+        }
+        const flushMs = Date.now() - txStart;
+        if (flushMs >= 200 || bytes >= 4000) {
+          // Log either a noteworthy flush (≥200ms) or a noteworthy payload (≥4KB).
+          // Below those thresholds we'd flood the log on every keepalive.
+          const bufferedAfter = (this.ws as unknown as { bufferedAmount?: number }).bufferedAmount ?? -1;
+          logger.info('relay', 'TX flushed', {
+            envelope_nonce: envelope.nonce,
+            bytes,
+            flushMs,
+            bufferedBefore,
+            bufferedAfter,
+            startTs: txStart,
+          });
+        }
       });
+      const callReturnMs = Date.now() - txStart;
+      if (callReturnMs >= 50 || bytes >= 4000) {
+        // ws.send is supposed to return ~instantly (just enqueues). If this
+        // is nonzero, the synchronous path itself is slow — Node main-loop
+        // contention or a giant JSON.stringify.
+        logger.info('relay', 'TX call', {
+          envelope_nonce: envelope.nonce,
+          bytes,
+          callReturnMs,
+          bufferedBefore,
+          startTs: txStart,
+        });
+      }
     } catch (err) {
       logger.error('relay', `Send failed: ${(err as Error).message}`);
       this.emit('error', new Error(`Failed to send message: ${(err as Error).message}`));

@@ -222,6 +222,7 @@ Start options:
   --foreground             Run in foreground (don't daemonize)
   --debug                  Show debug-level logs (between info and trace)
   --trace                  Enable verbose trace logging (writes to daemon-trace.log)
+  --no-sleep-prevention    Don't hold a caffeinate assertion (display may sleep; daemon may be throttled by App Nap)
   --relay-url <url>        Relay server URL
   --lan                    Use LAN direct connection mode
 
@@ -300,6 +301,7 @@ async function cmdStart(flags: Record<string, string>): Promise<void> {
   const args = [scriptPath, 'start', '--daemon-process'];
   if (isTrace) args.push('--trace');
   if (isDebug) args.push('--debug');
+  if (flags['no-sleep-prevention'] === 'true') args.push('--no-sleep-prevention');
 
   // Pass through connection flags
   for (const key of ['relay-url', 'pair-id', 'auth-token', 'lan', 'port']) {
@@ -391,6 +393,7 @@ async function runDaemon(flags: Record<string, string>): Promise<void> {
     authToken,
     connectionMode,
     lanPort,
+    sleepPrevention: flags['no-sleep-prevention'] !== 'true',
     phoneIdentityPublicKey,
     sessionSendKey,
     sessionRecvKey,

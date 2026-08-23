@@ -19,9 +19,12 @@
 //   -i  prevent idle sleep (system-wide; equivalent to PreventUserIdleSystemSleep)
 //   -s  prevent sleep while on AC power (system-wide; equivalent to PreventSystemSleep)
 //   -w  release the assertion when the watched pid exits
-// We deliberately do NOT pass -d (display sleep is fine; the user can close
-// their laptop lid metaphorically — only `-s` on AC keeps the whole system
-// awake, and that's acceptable for a daemon the user explicitly chose to run).
+// We deliberately do NOT pass -d: the display is free to sleep on its own
+// schedule. -i / -s alone do not exempt the process from macOS App Nap, so the
+// App-Nap throttle is handled separately by app-nap-keepalive.ts (a pulsed
+// UserIsActive assertion that resets App Nap's idle timer without lighting the
+// screen). See #271 for why App Nap, not idle/system sleep, was the stall root
+// cause.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { logger } from '../logger.js';

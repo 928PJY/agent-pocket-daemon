@@ -51,6 +51,14 @@ export function isCodexSessionId(sessionId: string): boolean {
 const TITLE_MAX_CHARS = 200;
 const DISCOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
+// Codex spawns internal threads to judge each planned action (`thread_source`
+// = 'subagent', `source` = {"subagent": {"other": "guardian"}}). Their whole
+// transcript is one prompt and one `{"outcome":"allow"}` reply, so surfacing
+// them means the phone gets a completion notification per approval. Both
+// columns are checked: a transitional Codex build wrote `source` while
+// leaving `thread_source` null. Rows written by older CLIs have neither —
+// keep those.
+
 export function codexExternalSessionId(threadId: string): string {
   return `${CODEX_PREFIX}${threadId}`;
 }
@@ -65,6 +73,9 @@ export class CodexDiscovery {
   private registeredSessions: Map<string, CodexSession> = new Map();
   private historyCache: Map<string, { messages: HistoryMessage[]; mtime: number }> = new Map();
   private readonly seqAllocators: SessionSeqAllocatorManager;
+  /** Undefined until the first query tells us whether this Codex build's
+   *  schema has `thread_source`. */
+  private hasThreadSourceColumn: boolean | undefined;
 
   constructor(codexDir?: string, seqAllocators?: SessionSeqAllocatorManager) {
     this.codexDir = codexDir ?? path.join(os.homedir(), '.codex');
@@ -79,7 +90,7 @@ export class CodexDiscovery {
     const stateDb = path.join(this.codexDir, 'state_5.sqlite');
     if (!fs.existsSync(stateDb)) return [];
 
-    const query = `
+    const buildQuery = (filterSubagents: boolean) => `
       select
         ifnull(id, ''),
         ifnull(rollout_path, ''),
@@ -90,17 +101,38 @@ export class CodexDiscovery {
         ifnull(cli_version, ''),
         ifnull(model, '')
       from threads
-      where archived is null or archived = 0
+      where (archived is null or archived = 0)
+        ${filterSubagents ? `and ifnull(thread_source, '') != 'subagent'
+        and ifnull(source, '') not like '%"subagent"%'` : ''}
       order by updated_at_ms desc
       limit ${Math.max(1, Math.min(limit, 500))};
     `;
 
-    try {
-      const out = execFileSync('sqlite3', [codexStateDbReadonlyUri(stateDb), '-separator', FIELD_SEP, query], {
+    const runQuery = (filterSubagents: boolean): string =>
+      execFileSync('sqlite3', [codexStateDbReadonlyUri(stateDb), '-separator', FIELD_SEP, buildQuery(filterSubagents)], {
         encoding: 'utf-8',
         timeout: 2000,
         maxBuffer: DISCOVERY_MAX_BUFFER_BYTES,
       });
+
+    try {
+      let out: string;
+      if (this.hasThreadSourceColumn === false) {
+        out = runQuery(false);
+      } else {
+        try {
+          out = runQuery(true);
+          this.hasThreadSourceColumn = true;
+        } catch (err) {
+          // Pre-thread_source schemas fail at prepare time, which would
+          // otherwise zero out discovery entirely. Fall back once and
+          // remember, so the retry isn't paid on every tick.
+          if (!/no such column/i.test((err as Error).message)) throw err;
+          this.hasThreadSourceColumn = false;
+          logger.info('codex-discovery', 'state DB predates thread_source; subagent threads cannot be filtered');
+          out = runQuery(false);
+        }
+      }
       const sessions = out.split('\n')
         .filter((line) => line.trim().length > 0)
         .map((line): CodexSession | null => {
