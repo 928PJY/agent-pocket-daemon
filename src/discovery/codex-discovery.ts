@@ -367,13 +367,23 @@ export class CodexDiscovery {
       } else {
         nextOffset = start > 0 ? offset + (end - start) : undefined;
       }
+
+      // tailSeq must reflect what the JSONL filter can actually serve, not
+      // the allocator counter — see issue #74. Anonymous live emits bump
+      // the counter without ever appearing on a parsed history row, so a
+      // counter-derived tail produces unreachable gap-fill targets.
+      let maxSeq = 0;
+      for (const m of allMessages) {
+        const s = m.seq ?? 0;
+        if (s > maxSeq) maxSeq = s;
+      }
       return {
         messages: pageMessages,
         totalCount: total,
         offset,
         hasMore: start > 0,
         nextOffset,
-        tailSeq: this.seqAllocators.for(session.threadId).tail() || undefined,
+        tailSeq: maxSeq > 0 ? maxSeq : undefined,
         // tailMs is the FILTERED-SET tail (not page tail) — see
         // session-discovery.ts for the rationale. Verify/divergence cursors
         // must reflect "everything we can deliver", independent of paging.
