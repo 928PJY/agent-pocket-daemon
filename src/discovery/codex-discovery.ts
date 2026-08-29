@@ -50,6 +50,9 @@ export function isCodexSessionId(sessionId: string): boolean {
 // one unbounded column at the SQL level and keep a wide ceiling for the rest.
 const TITLE_MAX_CHARS = 200;
 const DISCOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+/** Ceiling on how far we'll scan for the end of `session_meta`. Observed
+ *  lines run ~19KB because `base_instructions` is inlined. */
+const MAX_SESSION_META_BYTES = 1024 * 1024;
 
 // Codex spawns internal threads to judge each planned action (`thread_source`
 // = 'subagent', `source` = {"subagent": {"other": "guardian"}}). Their whole
@@ -61,6 +64,53 @@ const DISCOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
 export function codexExternalSessionId(threadId: string): string {
   return `${CODEX_PREFIX}${threadId}`;
+}
+
+/**
+ * True when a rollout's `session_meta` marks it as an internal subagent
+ * (Codex's guardian threads that judge each planned action). Mirrors the
+ * sqlite-side predicate in `discoverSessions`. Rollouts written before the
+ * markers existed, or that can't be read, are treated as user threads.
+ */
+function isSubagentRollout(rolloutPath: string): boolean {
+  let firstLine = '';
+  try {
+    const fd = fs.openSync(rolloutPath, 'r');
+    try {
+      // session_meta is the first line, but it embeds `base_instructions` —
+      // ~19KB in practice. Read in chunks until the newline shows up rather
+      // than guessing a window; a truncated line fails JSON.parse and the
+      // guardian sails through.
+      const buf = Buffer.alloc(64 * 1024);
+      let offset = 0;
+      while (offset < MAX_SESSION_META_BYTES) {
+        const read = fs.readSync(fd, buf, 0, buf.length, offset);
+        if (read <= 0) break;
+        const chunk = buf.subarray(0, read).toString('utf-8');
+        const newline = chunk.indexOf('\n');
+        if (newline >= 0) {
+          firstLine += chunk.slice(0, newline);
+          break;
+        }
+        firstLine += chunk;
+        offset += read;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+
+  if (!firstLine) return false;
+  try {
+    const entry = JSON.parse(firstLine) as { type?: string; payload?: Record<string, unknown> };
+    if (entry.type !== 'session_meta' || !entry.payload) return false;
+    if (entry.payload.thread_source === 'subagent') return true;
+    return JSON.stringify(entry.payload.source ?? '').includes('"subagent"');
+  } catch {
+    return false;
+  }
 }
 
 export function codexThreadIdFromSessionId(sessionId: string): string {
@@ -167,6 +217,10 @@ export class CodexDiscovery {
   registerSessionFromRollout(input: { sessionId?: string; threadId?: string; rolloutPath: string; cwd?: string; cliVersion?: string; title?: string }): CodexSession | undefined {
     const rolloutPath = normalizePath(input.rolloutPath);
     if (!fs.existsSync(rolloutPath)) return undefined;
+    // Hooks reach this path directly, so the sqlite-side subagent filter never
+    // ran. session_meta carries the same markers — without this, guardian
+    // threads still surface and every approval becomes a notification.
+    if (isSubagentRollout(rolloutPath)) return undefined;
 
     const threadId = extractThreadIdFromRolloutPath(rolloutPath)
       ?? (input.threadId ? codexThreadIdFromSessionId(input.threadId) : undefined)

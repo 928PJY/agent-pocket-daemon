@@ -92,7 +92,7 @@ test('CodexObserver buffers partial lines and handles lifecycle entries', () => 
   }
 });
 
-test('CodexObserver reports file read errors while active', () => {
+test('CodexObserver stays quiet when the rollout is missing (ENOENT is not a session error)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-codex-observer-'));
   const rolloutPath = join(dir, 'missing.jsonl');
   const observer = new CodexObserver('codex:thread-1', rolloutPath);
@@ -103,8 +103,34 @@ test('CodexObserver reports file read errors while active', () => {
     observer.start(false);
     (observer as CodexObserverInternals).readNewEntries();
 
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /ENOENT/);
+    assert.deepEqual(errors, []);
+    assert.equal(observer.isActive(), false, 'a gone rollout detaches the watcher');
+  } finally {
+    observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CodexObserver still reports non-ENOENT read failures', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-codex-observer-'));
+  const rolloutPath = join(dir, 'rollout.jsonl');
+  writeFileSync(rolloutPath, 'x');
+  const observer = new CodexObserver('codex:thread-1', rolloutPath);
+  const errors: string[] = [];
+  observer.on('error', (err) => errors.push(err.message));
+
+  try {
+    // Point at a directory: statSync succeeds, the read throws EISDIR — a real
+    // fault, not a vanished file. Set `active` directly instead of start() so
+    // no fs.watchFile is registered on a directory (that never settles).
+    const internals = observer as unknown as { rolloutPath: string; offset: number; active: boolean };
+    internals.rolloutPath = dir;
+    internals.offset = 0;
+    internals.active = true;
+    (observer as CodexObserverInternals).readNewEntries();
+
+    assert.equal(errors.length, 1, 'real read faults must still surface');
+    assert.doesNotMatch(errors[0], /ENOENT/);
   } finally {
     observer.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -156,6 +182,35 @@ test('CodexObserver collapses same-mode codex_collaboration_mode rows; only tran
     assert.equal(modeEvents[1].sdkUuid, 'codex_collaboration_mode:t3');
   } finally {
     observer.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A rollout can vanish under the watcher (Codex rotates/archives them, or the
+// user prunes ~/.codex). The read then throws ENOENT, which used to be
+// re-emitted as a session error and reached the phone as
+// "ERROR / ENOENT: no such file or directory" — a filesystem detail the user
+// can't act on, about a session that is merely gone.
+// ---------------------------------------------------------------------------
+
+test('CodexObserver does not report a vanished rollout as a session error', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-pocket-codex-gone-'));
+  try {
+    const rolloutPath = join(dir, 'rollout.jsonl');
+    writeFileSync(rolloutPath, '');
+
+    const observer = new CodexObserver('codex:gone', rolloutPath);
+    const errors: Error[] = [];
+    observer.on('error', (err: Error) => errors.push(err));
+    observer.start();
+
+    rmSync(rolloutPath, { force: true });
+    (observer as unknown as { readNewEntries: () => void }).readNewEntries();
+    observer.stop();
+
+    assert.deepEqual(errors.map((e) => e.message), [], 'ENOENT must stay in the log, not become a notification');
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

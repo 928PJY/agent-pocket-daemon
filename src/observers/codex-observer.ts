@@ -86,9 +86,21 @@ export class CodexObserver extends EventEmitter {
         }
       }
     } catch (err) {
-      if (this.active) {
-        this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      if (!this.active) return;
+      // A rollout that disappears (Codex rotates or archives it, or the user
+      // prunes ~/.codex) is not a session failure the user can act on —
+      // surfacing it pushed "ERROR / ENOENT: no such file or directory" to the
+      // phone. Log it and stop watching instead.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT') {
+        logger.info('codex-observer', 'Rollout disappeared; detaching observer', {
+          sessionId: this.sessionId,
+          rolloutPath: this.rolloutPath,
+        });
+        this.stop();
+        return;
       }
+      this.emit('error', err instanceof Error ? err : new Error(String(err)));
     }
   }
 
