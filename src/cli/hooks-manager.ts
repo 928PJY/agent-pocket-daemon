@@ -371,16 +371,25 @@ export function installCodexHooks(hookPort: number, paths: HooksManagerPaths): v
     ? config.hooks as Record<string, unknown[]>
     : {};
   const codexHookScript = codexHookScriptPath(paths);
+  // No PermissionRequest hook for Codex: approvals stay in Codex's own UI.
+  // Installing one parks the turn for 600s waiting on a phone approval the
+  // daemon can't currently deliver for Codex sessions.
   const managed: Record<string, Record<string, unknown>> = {
     SessionStart: codexManagedGroup(`${codexHookScript} session-start`, 5),
     UserPromptSubmit: codexManagedGroup(`${codexHookScript} user-prompt-submit`, 5),
-    PermissionRequest: codexManagedGroup(`${codexHookScript} permission-request`, 600, 'Waiting for Agent Pocket approval'),
     Stop: codexManagedGroup(`${codexHookScript} stop`, 10),
   };
 
   for (const [event, entry] of Object.entries(managed)) {
     const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
     hooks[event] = [...existing.filter(e => !isCodexManagedGroup(e, codexHookScript)), entry];
+  }
+
+  // Drop a PermissionRequest group left behind by an earlier install.
+  if (Array.isArray(hooks.PermissionRequest)) {
+    const kept = hooks.PermissionRequest.filter(e => !isCodexManagedGroup(e, codexHookScript));
+    if (kept.length > 0) hooks.PermissionRequest = kept;
+    else delete hooks.PermissionRequest;
   }
 
   config.hooks = hooks;

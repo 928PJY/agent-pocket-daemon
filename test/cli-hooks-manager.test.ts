@@ -320,7 +320,7 @@ test('installClaudeHooks: starts fresh when settings file is unparseable', () =>
 // installCodexHooks
 // ---------------------------------------------------------------------------
 
-test('installCodexHooks: writes hooks.json with 4 events + enables feature', () => {
+test('installCodexHooks: writes hooks.json with 3 events + enables feature', () => {
   const paths = makePaths();
   installCodexHooks(4444, paths);
   // Script written
@@ -330,14 +330,14 @@ test('installCodexHooks: writes hooks.json with 4 events + enables feature', () 
   // hooks.json
   const cfg = readJson(paths.codexHooksFile);
   const hooks = cfg.hooks as Record<string, unknown[]>;
-  for (const ev of ['SessionStart', 'UserPromptSubmit', 'PermissionRequest', 'Stop']) {
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
     assert.ok(Array.isArray(hooks[ev]), `${ev} array`);
     assert.equal(hooks[ev].length, 1);
   }
-  // PermissionRequest carries statusMessage
-  const pr = hooks.PermissionRequest[0] as Record<string, unknown>;
-  const prHook = (pr.hooks as Array<Record<string, unknown>>)[0];
-  assert.equal(prHook.statusMessage, 'Waiting for Agent Pocket approval');
+  // Codex approvals stay in Codex's own UI — installing a PermissionRequest
+  // hook would block the turn for 600s waiting on a phone that isn't wired
+  // up to answer it.
+  assert.equal(hooks.PermissionRequest, undefined, 'no PermissionRequest hook for Codex');
   // Commands include the codex-hook.sh path
   const ss = hooks.SessionStart[0] as Record<string, unknown>;
   const ssHook = (ss.hooks as Array<Record<string, unknown>>)[0];
@@ -484,4 +484,48 @@ test('removeCodexHooks: no-op when hooks key missing or non-object', () => {
   fs.writeFileSync(paths.codexHooksFile, JSON.stringify({}), 'utf-8');
   removeCodexHooks(paths);
   assert.deepEqual(readJson(paths.codexHooksFile), {});
+});
+
+test('installCodexHooks: clears a PermissionRequest group left by an older install', () => {
+  const paths = makePaths();
+  installCodexHooks(4444, paths);
+
+  // Simulate the pre-existing state on a machine that ran the old installer.
+  const cfg = readJson(paths.codexHooksFile);
+  const hooks = cfg.hooks as Record<string, unknown[]>;
+  hooks.PermissionRequest = [{
+    matcher: '*',
+    _managedBy: 'agent-pocket',
+    hooks: [{
+      type: 'command',
+      command: `${path.join(paths.hooksDir, 'codex-hook.sh')} permission-request`,
+      timeout: 600,
+      _managedBy: 'agent-pocket',
+    }],
+  }];
+  fs.writeFileSync(paths.codexHooksFile, JSON.stringify(cfg, null, 2), 'utf-8');
+
+  installCodexHooks(4444, paths);
+
+  const after = (readJson(paths.codexHooksFile).hooks as Record<string, unknown[]>);
+  assert.equal(after.PermissionRequest, undefined, 'stale group must be removed on reinstall');
+  assert.ok(Array.isArray(after.Stop), 'other events survive');
+});
+
+test('installCodexHooks: leaves a foreign PermissionRequest hook alone', () => {
+  const paths = makePaths();
+  installCodexHooks(4444, paths);
+
+  const cfg = readJson(paths.codexHooksFile);
+  const hooks = cfg.hooks as Record<string, unknown[]>;
+  hooks.PermissionRequest = [{
+    matcher: '*',
+    hooks: [{ type: 'command', command: '/opt/other-tool/hook.sh approve' }],
+  }];
+  fs.writeFileSync(paths.codexHooksFile, JSON.stringify(cfg, null, 2), 'utf-8');
+
+  installCodexHooks(4444, paths);
+
+  const after = (readJson(paths.codexHooksFile).hooks as Record<string, unknown[]>);
+  assert.equal(after.PermissionRequest?.length, 1, 'someone else\'s hook is not ours to delete');
 });

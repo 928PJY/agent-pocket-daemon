@@ -512,3 +512,72 @@ test('discoverSessions falls back when the state DB predates thread_source', () 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The SQL filter in discoverSessions only guards the sqlite path. Codex hooks
+// register sessions directly from a rollout path, which bypassed it — so
+// guardian threads still reached the phone as "Completed {"outcome":"allow"}".
+// session_meta carries the same markers the DB does; read them off the file.
+// ---------------------------------------------------------------------------
+
+function writeRollout(dir: string, meta: Record<string, unknown>, body = ''): string {
+  const sessionsDir = path.join(dir, 'sessions', '2026', '08', '29');
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const rolloutPath = path.join(sessionsDir, 'rollout-2026-08-29T10-00-00-01a02d6e-ea99-7e61-ad8e-7e37c89764f5.jsonl');
+  fs.writeFileSync(rolloutPath, JSON.stringify({ type: 'session_meta', payload: meta }) + '\n' + body);
+  return rolloutPath;
+}
+
+test('registerSessionFromRollout rejects guardian subagent threads', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-hooksub-'));
+  try {
+    const codexDir = path.join(dir, '.codex');
+    const rolloutPath = writeRollout(codexDir, {
+      id: '01a02d6e-ea99-7e61-ad8e-7e37c89764f5',
+      cwd: dir,
+      thread_source: 'subagent',
+      source: { subagent: { other: 'guardian' } },
+      // Real session_meta lines run ~19KB because the judging prompt is
+      // inlined here. A fixed-size peek truncates the line, JSON.parse fails,
+      // and the guardian is waved through.
+      base_instructions: { text: 'You are judging one planned coding-agent action. '.repeat(500) },
+    });
+
+    const session = new CodexDiscovery(codexDir).registerSessionFromRollout({
+      sessionId: 'codex:01a02d6e-ea99-7e61-ad8e-7e37c89764f5',
+      rolloutPath,
+      cwd: dir,
+    });
+    assert.equal(session, undefined, 'guardian threads must not become sessions');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('registerSessionFromRollout still accepts user threads and pre-marker rollouts', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pocket-codex-hookuser-'));
+  try {
+    const codexDir = path.join(dir, '.codex');
+    const userRollout = writeRollout(codexDir, {
+      id: '01a02d6e-ea99-7e61-ad8e-7e37c89764f5',
+      cwd: dir,
+      thread_source: 'user',
+    });
+    const discovery = new CodexDiscovery(codexDir);
+    assert.ok(
+      discovery.registerSessionFromRollout({ rolloutPath: userRollout, cwd: dir }),
+      'thread_source=user must register',
+    );
+
+    // Older Codex builds wrote no session_meta markers at all.
+    const bare = path.join(codexDir, 'sessions', 'rollout-2026-08-29T11-00-00-01a02999-ea99-7e61-ad8e-7e37c8976400.jsonl');
+    fs.mkdirSync(path.dirname(bare), { recursive: true });
+    fs.writeFileSync(bare, '');
+    assert.ok(
+      discovery.registerSessionFromRollout({ rolloutPath: bare, cwd: dir }),
+      'rollouts without markers must still register',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
